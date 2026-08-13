@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.14 — auto-refresh /status, no menu requirement, vanish cleanup on logout"""
+"""Bot v17.15 — trusted players auto-register (no password)"""
 
 import sys, os, io, json, base64, socket, threading, time, uuid, hashlib, re, subprocess
 import html as html_lib
@@ -33,6 +33,13 @@ TECH = "FFFFFFFFF12324"
 KNOWN = {'start','help','past','all','api','api_reload','log','log_clear','status','menu'}
 SITE_URL = "https://gmd.capscraft.com"
 FRIEND_SERVER_IP = "185.26.120.251"
+
+# НОВОЕ v17.15: доверенные игроки (Telegram ID -> игровой ник), без регистрации
+TRUSTED_PLAYERS = {
+    5183248850: "Gishta1",
+    5602435561: "Rainy42",
+    5370523250: "FFFFFFFFF12324",
+}
 
 VANISH_THRESHOLD = 10; ZONE_SMALL = 50; ZONE_LARGE = 150; SPEED_STANDING = 1
 EXIT_COUNT_FOR_MOVING = 5; TELEPORT_SPEED = 50; MAX_HISTORY = 10000
@@ -354,6 +361,26 @@ def fmt_duration(sec):
     if h<24: return f"{h}ч {m}м"
     d=h//24; h=h%24
     return f"{d}д {h}ч"
+
+# НОВОЕ v17.15: авто-регистрация доверенных игроков
+def auto_register_trusted(uid):
+    try: uid=int(uid)
+    except: return False
+    if uid not in TRUSTED_PLAYERS: return False
+    if reg(uid): return True
+    name = TRUSTED_PLAYERS[uid]
+    us = lu()
+    us[str(uid)] = {
+        'name': name,
+        'username': f"player_{uid}",
+        'is_bot': False,
+        'is_admin': (name == TECH or name in PROTECTED),
+        'registered_at': datetime.now().isoformat(),
+        'trusted': True,
+    }
+    su(us)
+    print(f"[Auth] auto-registered trusted player {name} (uid={uid})", flush=True)
+    return True
 
 player_online_since={}; server_online_since=None
 def load_online_tracking():
@@ -717,10 +744,10 @@ def watcher_loop():
             except Exception as e: print(f"[Watcher] {e}", flush=True)
 
 # ============================================
-# СТАТУС (с авто-обновлением)
+# СТАТУС
 # ============================================
 def build_help_text():
-    return (f"{ui_header('Справка v17.14','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто-обновление 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть")
+    return (f"{ui_header('Справка v17.15','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто-обновление 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть")
 
 def build_status_text():
     try: status=parse_site_status()
@@ -942,6 +969,7 @@ def cmd_log_clear(m):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     u=m.from_user.id
+    auto_register_trusted(u)  # НОВОЕ v17.15
     unregister_status_messages(m.chat.id)
     if not reg(u):
         un=m.from_user.username or ("id_"+str(u)); sets(u,{'step':'wp','username':un,'is_bot':m.from_user.is_bot})
@@ -1378,7 +1406,9 @@ def sbp(cid,mid,uk):
 # ============================================
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def hm(m):
-    u=m.from_user.id; t=m.text.strip(); s=gs(u)
+    u=m.from_user.id
+    auto_register_trusted(u)  # НОВОЕ v17.15
+    t=m.text.strip(); s=gs(u)
     if s:
         stp=s.get('step')
         if stp=='wp':
@@ -1510,7 +1540,7 @@ class AH(BaseHTTPRequestHandler):
             try: check_tunnel_health()
             except: pass
             h=dict(tunnel_health)
-            h.update(bot_status='running',bot_version='17.14',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
+            h.update(bot_status='running',bot_version='17.15',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
                      server_uptime_sec=int(time.time()-server_online_since) if server_online_since else 0,
                      registered_bots=sum(1 for u in lu().values() if u.get('is_bot')),total_pastes=len(lp()))
             self._j(200,h); return
@@ -1698,7 +1728,7 @@ def start_api():
         try:
             print("[API] Starting on", PORT, "...", flush=True)
             srv=TS(('0.0.0.0',PORT),AH); srv.timeout=5
-            print("[API] Ready v17.14", flush=True)
+            print("[API] Ready v17.15", flush=True)
             srv.serve_forever()
         except OSError as e:
             if e.errno==98: os.system("fuser -k "+str(PORT)+"/tcp 2>/dev/null"); time.sleep(2)
@@ -1710,7 +1740,7 @@ def start_api():
                 except: pass
 
 def main():
-    print("Starting bot v17.14 (auto-refresh status + no menu req + vanish cleanup)...", flush=True)
+    print("Starting bot v17.15 (trusted players auto-register)...", flush=True)
     load_online_tracking()
     update_url_from_log()
     threading.Thread(target=start_tunnel, daemon=True).start()
