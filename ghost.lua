@@ -1,4 +1,4 @@
--- ghost v9.9.2 
+-- ghost v9.9.3 (health-based validation, POST reload, URL integrity check)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -13,6 +13,7 @@ local DEBUG = true
 local GITHUB_URL = "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/ghost.lua"
 local SECRET_CODE = "V2BM-LkUZkBqGd9R8YdE"
 local UPDATE_CODE = "N1AVW1cM"
+local RELAY_USERNAME = "capscraft_relay"
 local service_local = false
 local telegram_service = false
 
@@ -99,7 +100,7 @@ local function note(msg)
 end
 
 -- ============================================
--- SELF-UPDATE (только GitHub)
+-- SELF-UPDATE (GitHub only)
 -- ============================================
 local function do_update()
     glog("UPDATE: start from GitHub")
@@ -319,7 +320,7 @@ local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") en
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
 -- ============================================
--- URL MANAGEMENT (без cancel-подсказок)
+-- URL MANAGEMENT (v9.9.3: health-based + integrity check)
 -- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w")
@@ -340,10 +341,45 @@ local function replace_domain(url, newdomain)
     return scheme .. newdomain .. path
 end
 
+-- НОВОЕ: проверка что URL содержит lhr.life (защита от подмены)
+local function is_valid_tunnel_url(url)
+    if not url or url == "" then return false end
+    if not url:find("^https://") then return false end
+    if not url:find("%.lhr%.life", 1, true) then return false end
+    return true
+end
+
+-- УЛУЧШЕНО: health-based validation с fallback
 local function validate_url(url)
     if not url or url == "" then return false end
-    local ok, h = pcall(http.get, url .. "/api/url", {
-        ["bypass-tunnel-reminder"]="true", 
+    if not is_valid_tunnel_url(url) then
+        glog("validate: invalid URL format: " .. tostring(url))
+        return false
+    end
+    
+    -- Пытаемся /api/health (даёт больше инфы)
+    local ok, h = pcall(http.get, url .. "/api/health", {
+        ["bypass-tunnel-reminder"]="true",
+        ["User-Agent"]="ghost-validator"
+    })
+    if ok and h then
+        local o, resp = pcall(function() return h.readAll() end)
+        pcall(function() if h.close then h.close() end end)
+        if o and resp and resp ~= "" then
+            local o2, data = pcall(textutils.unserializeJSON, resp)
+            if o2 and data then
+                -- Сервер ответил, туннель работает
+                local status = data.status or data.bot_status
+                glog("validate: /api/health OK, status=" .. tostring(status))
+                return true, url
+            end
+        end
+    end
+    
+    -- Fallback: пробуем /api/url
+    glog("validate: /api/health failed, trying /api/url")
+    ok, h = pcall(http.get, url .. "/api/url", {
+        ["bypass-tunnel-reminder"]="true",
         ["User-Agent"]="ghost-validator"
     })
     if not ok or not h then
@@ -369,16 +405,12 @@ local function validate_url(url)
         glog("validate: server error " .. tostring(data.error))
         return false
     end
-    if not data.url then
-        glog("validate: no url in response")
-        return false
-    end
     glog("validate: OK " .. url)
-    return true, data.url
+    return true, url
 end
 
 local function fetch_relay_urls()
-    local url = "https://t.me/s/capscraft_relay"
+    local url = "https://t.me/s/" .. RELAY_USERNAME
     local ok, h = pcall(http.get, url, {
         ["User-Agent"]="Mozilla/5.0",
         ["bypass-tunnel-reminder"]="true"
@@ -414,6 +446,7 @@ local function fetch_relay_urls()
     return urls
 end
 
+-- УЛУЧШЕНО: перебираем все URL, не останавливаемся на первом мёртвом
 local function get_fresh_url()
     local urls = fetch_relay_urls()
     if #urls == 0 then
@@ -468,10 +501,13 @@ refresh_url = function()
     return nil
 end
 
+-- УЛУЧШЕНО: POST вместо GET (не кэшируется)
 reload_tunnel = function()
     if not CURRENT_URL then return false end
-    glog("reload_tunnel: requesting server restart")
-    local ok, h = pcall(http.get, CURRENT_URL .. "/api/reload", {
+    glog("reload_tunnel: requesting server restart via POST")
+    local ok, h = pcall(http.post, CURRENT_URL .. "/api/reload", 
+        textutils.serializeJSON({computer_id = tostring(COMPUTER_ID)}), {
+        ["Content-Type"]="application/json",
         ["bypass-tunnel-reminder"]="true",
         ["User-Agent"]="ghost-reload",
         ["X-Computer-ID"]=tostring(COMPUTER_ID)
@@ -488,7 +524,6 @@ reload_tunnel = function()
     return true
 end
 
--- БЕЗ cancel-подсказок (SECRET_CODE остаётся секретом)
 local function get_valid_url()
     local fresh = get_fresh_url()
     if fresh then
@@ -509,7 +544,6 @@ local function get_valid_url()
             return CURRENT_URL
         else print("Failed") end
     end
-    -- Чистый prompt без cancel-подсказок
     while true do
         write("URL: ")
         local u = read()
@@ -600,7 +634,7 @@ local function save_mode(m)
 end
 
 -- ============================================
--- HTTP
+-- HTTP (с логированием)
 -- ============================================
 local function make_headers(token)
     local h = {}
@@ -609,9 +643,16 @@ local function make_headers(token)
     if token then h["Authorization"] = "Bearer " .. token end
     return h
 end
-local function http_get(url, headers)
-    local ok, h = pcall(http.request, url, nil, headers)
-    if not ok or not h then return nil end
+
+-- УЛУЧШЕНО: возвращает status code
+local function http_request_with_status(url, body, headers, method)
+    local ok, h
+    if method == "POST" then
+        ok, h = pcall(http.request, url, body, headers)
+    else
+        ok, h = pcall(http.request, url, nil, headers)
+    end
+    if not ok or not h then return nil, nil end
     local timer = os.startTimer(15)
     while true do
         local ev, p1, p2 = orig_pullEvent()
@@ -619,47 +660,72 @@ local function http_get(url, headers)
             os.cancelTimer(timer)
             local t = (p2 and p2.readAll and pcall(function() return p2.readAll() end)) or ""
             if type(t) == "table" then t = t[1] or "" end
+            -- Получаем status code (если доступен)
+            local status_code = (p2 and p2.getResponseCode and pcall(function() return p2.getResponseCode() end)) or nil
+            if type(status_code) == "table" then status_code = status_code[1] end
             pcall(function() if p2 and p2.close then p2.close() end end)
-            local o, p = pcall(textutils.unserializeJSON, t or ""); return o and p or nil
+            local o, p = pcall(textutils.unserializeJSON, t or "")
+            return (o and p or nil), status_code
         elseif ev == "http_failure" and p1 == url then
-            os.cancelTimer(timer); pcall(function() if p2 and p2.close then p2.close() end end); return nil
-        elseif ev == "timer" and p1 == timer then return nil end
+            os.cancelTimer(timer)
+            -- Получаем status code при failure
+            local status_code = (p2 and p2.getResponseCode and pcall(function() return p2.getResponseCode() end)) or nil
+            if type(status_code) == "table" then status_code = status_code[1] end
+            pcall(function() if p2 and p2.close then p2.close() end end)
+            return nil, status_code
+        elseif ev == "timer" and p1 == timer then 
+            return nil, nil 
+        end
     end
+end
+
+local function http_get(url, headers)
+    local r, sc = http_request_with_status(url, nil, headers, "GET")
+    return r, sc
 end
 local function http_post(url, data, headers)
     local body = data and textutils.serializeJSON(data) or nil
-    local ok, h = pcall(http.request, url, body, headers)
-    if not ok or not h then return nil end
-    local timer = os.startTimer(15)
-    while true do
-        local ev, p1, p2 = orig_pullEvent()
-        if ev == "http_success" and p1 == url then
-            os.cancelTimer(timer)
-            local t = (p2 and p2.readAll and pcall(function() return p2.readAll() end)) or ""
-            if type(t) == "table" then t = t[1] or "" end
-            pcall(function() if p2 and p2.close then p2.close() end end)
-            local o, p = pcall(textutils.unserializeJSON, t or ""); return o and p or nil
-        elseif ev == "http_failure" and p1 == url then
-            os.cancelTimer(timer); pcall(function() if p2 and p2.close then p2.close() end end); return nil
-        elseif ev == "timer" and p1 == timer then return nil end
-    end
+    local r, sc = http_request_with_status(url, body, headers, "POST")
+    return r, sc
 end
+
+-- УЛУЧШЕНО: пробует refresh_url и возвращает status
 local function http_get_smart(url, headers, token)
-    local r = http_get(url, headers); if r then return r end
+    local r, sc = http_get(url, headers)
+    if r then return r, sc end
+    -- Если 401/403 - токен инвалидный, не refresh'им
+    if sc == 401 or sc == 403 then
+        glog("http_get_smart: auth error " .. tostring(sc))
+        return nil, sc
+    end
     local nu = refresh_url()
     if nu then return http_get(replace_domain(url, extract_domain(nu)), make_headers(token)) end
-    return nil
+    return nil, sc
 end
 local function http_post_smart(url, data, headers, token)
-    local r = http_post(url, data, headers); if r then return r end
+    local r, sc = http_post(url, data, headers)
+    if r then return r, sc end
+    if sc == 401 or sc == 403 then
+        glog("http_post_smart: auth error " .. tostring(sc))
+        return nil, sc
+    end
     local nu = refresh_url()
     if nu then return http_post(replace_domain(url, extract_domain(nu)), data, make_headers(token)) end
-    return nil
+    return nil, sc
 end
 
 send_heartbeat = function(token, pastes)
     local mr = service_local and "service" or (fortress_active and "fortress" or current_mode)
-    http_post_smart(CURRENT_URL .. "/api/heartbeat", {mode = mr, strikes = strikes, scripts_running = #(pastes or {})}, make_headers(token), token)
+    local r, sc = http_post_smart(CURRENT_URL .. "/api/heartbeat", 
+        {mode = mr, strikes = strikes, scripts_running = #(pastes or {})}, 
+        make_headers(token), token)
+    if not r then
+        heartbeat_fails = heartbeat_fails + 1
+        glog("heartbeat: failed, total fails=" .. heartbeat_fails .. ", status=" .. tostring(sc))
+        return false, sc
+    end
+    heartbeat_fails = 0
+    return true, sc
 end
 
 trigger_fortress = function(token)
@@ -726,14 +792,14 @@ local function register_sync(url, pw)
     end
     note("register -> " .. tostring(target))
     
-    local res = http_post_smart(target .. "/api/login", {
+    local res, sc = http_post_smart(target .. "/api/login", {
         password = pw, 
         name = "CC_" .. COMPUTER_ID, 
         computer_id = tostring(COMPUTER_ID)
     }, make_headers(nil), nil)
     
     if not res then 
-        note("register: no response"); 
+        note("register: no response (status=" .. tostring(sc) .. ")"); 
         return nil 
     end
     if res.error then 
@@ -761,7 +827,7 @@ local function register_sync(url, pw)
                 refresh_url()
                 if CURRENT_URL then cu = CURRENT_URL end
             end
-            local sr = http_get(cu .. "/api/check?id=" .. tostring(pid), make_headers(nil))
+            local sr, sc2 = http_get(cu .. "/api/check?id=" .. tostring(pid), make_headers(nil))
             if sr then
                 fc = 0
                 if sr.status == "approved" then 
@@ -774,7 +840,7 @@ local function register_sync(url, pw)
             else
                 fc = fc + 1
                 if fc >= 3 then
-                    note("register: " .. fc .. " check fails, refreshing URL")
+                    note("register: " .. fc .. " check fails (status=" .. tostring(sc2) .. "), refreshing URL")
                     refresh_url()
                     if CURRENT_URL then cu = CURRENT_URL; fc = 0 end
                 end
@@ -793,8 +859,11 @@ check_mode = function(token)
     refresh_url()
     if not CURRENT_URL then return nil end
     if not token then return nil end
-    local r = http_get_smart(CURRENT_URL .. "/api/me", make_headers(token), token)
-    if not r or r.error then return nil end
+    local r, sc = http_get_smart(CURRENT_URL .. "/api/me", make_headers(token), token)
+    if not r or r.error then 
+        glog("check_mode: failed, status=" .. tostring(sc))
+        return nil 
+    end
     local mode = r.mode or "normal"
     save_mode(mode)
     return mode, r.assigned_pastes or {}
@@ -805,7 +874,7 @@ end
 -- ============================================
 local function fetch_paste_code(name, token)
     if not CURRENT_URL then refresh_url(); if not CURRENT_URL then return nil end end
-    local r = http_get_smart(CURRENT_URL .. "/api/paste/" .. name, make_headers(token), token)
+    local r, sc = http_get_smart(CURRENT_URL .. "/api/paste/" .. name, make_headers(token), token)
     if not r or r.error then return nil end
     return r.content
 end
@@ -838,12 +907,13 @@ local function fortress_console()
 end
 
 -- ============================================
--- LOOPS
+-- LOOPS (УЛУЧШЕННЫЙ heartbeat с auto-reload)
 -- ============================================
 local function heartbeat_loop(token)
     glog("heartbeat loop start")
     local fc = 0
     local last_forced_refresh = 0
+    local consecutive_fails = 0
     while true do
         sleep(fc > 3 and 30 or 300)
         local ok, err = pcall(function()
@@ -858,10 +928,11 @@ local function heartbeat_loop(token)
             end
             if not CURRENT_URL then
                 fc = fc + 1
-                if fc >= 5 then
-                    glog("heartbeat: " .. fc .. " fails, requesting tunnel reload")
+                consecutive_fails = consecutive_fails + 1
+                if consecutive_fails >= 5 then
+                    glog("heartbeat: " .. consecutive_fails .. " fails, requesting tunnel reload")
                     reload_tunnel()
-                    fc = 0
+                    consecutive_fails = 0
                 end
                 return
             end
@@ -869,17 +940,30 @@ local function heartbeat_loop(token)
             local mode, pastes = check_mode(token)
             if not mode then
                 fc = fc + 1
-                if fc >= 5 then
-                    glog("heartbeat: mode check failed " .. fc .. "x, reload")
+                consecutive_fails = consecutive_fails + 1
+                if consecutive_fails >= 5 then
+                    glog("heartbeat: mode check failed " .. consecutive_fails .. "x, reload")
                     reload_tunnel()
-                    fc = 0
+                    consecutive_fails = 0
                 end
                 return
             end
-            send_heartbeat(token, pastes)
-            fc = 0
-            heartbeat_fails = 0
-            glog("heartbeat sent, mode=" .. mode)
+            local sent, sc = send_heartbeat(token, pastes)
+            if sent then
+                fc = 0
+                consecutive_fails = 0
+                heartbeat_fails = 0
+                glog("heartbeat sent, mode=" .. mode)
+            else
+                fc = fc + 1
+                consecutive_fails = consecutive_fails + 1
+                glog("heartbeat: send failed, status=" .. tostring(sc) .. ", consecutive=" .. consecutive_fails)
+                if consecutive_fails >= 5 then
+                    glog("heartbeat: " .. consecutive_fails .. " send fails, requesting tunnel reload")
+                    reload_tunnel()
+                    consecutive_fails = 0
+                end
+            end
         end)
         if not ok then
             glog("heartbeat crash: " .. tostring(err))
@@ -909,7 +993,7 @@ local function mode_watcher(token)
 end
 
 -- ============================================
--- REPL (UPDATE_CODE для обновления, SECRET_CODE для service — оба остаются)
+-- REPL
 -- ============================================
 local function repl()
     while true do
@@ -944,10 +1028,10 @@ local function repl()
 end
 
 -- ============================================
--- MAIN (бесконечная регистрация, БЕЗ cancel-подсказок)
+-- MAIN
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.2")
+    glog("ghost start v9.9.3")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
@@ -991,7 +1075,6 @@ local function run_main()
             while not token do
                 attempt = attempt + 1
                 note("registration attempt " .. attempt)
-                -- ЧИСТЫЙ prompt без cancel-подсказок
                 write("Password: ")
                 local pw = read("*")
                 
@@ -1035,7 +1118,6 @@ local function run_main()
                         sleep(5)
                     end
                 else
-                    -- Пустой пароль → снова спросить
                     print("❌ Password cannot be empty")
                     sleep(1)
                 end
