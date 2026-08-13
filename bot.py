@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.13 — unkillable tunnel + secret /log + vanish detection (all admins)"""
+"""Bot v17.14 — auto-refresh /status, no menu requirement, vanish cleanup on logout"""
 
 import sys, os, io, json, base64, socket, threading, time, uuid, hashlib, re, subprocess
 import html as html_lib
@@ -36,10 +36,15 @@ FRIEND_SERVER_IP = "185.26.120.251"
 
 VANISH_THRESHOLD = 10; ZONE_SMALL = 50; ZONE_LARGE = 150; SPEED_STANDING = 1
 EXIT_COUNT_FOR_MOVING = 5; TELEPORT_SPEED = 50; MAX_HISTORY = 10000
-VANISH_GRACE = 30        # НОВОЕ: grace перед детектом ваниша
-VANISH_NOTIFY_CD = 60    # НОВОЕ: кулдаун уведомлений
+VANISH_GRACE = 30
+VANISH_NOTIFY_CD = 60
 MSK = timezone(timedelta(hours=3))
 BOT_START = time.time()
+
+# НОВОЕ: активные сообщения статуса для авто-обновления
+active_status_messages = {}  # chat_id -> message_id
+active_status_lock = threading.Lock()
+STATUS_REFRESH_INTERVAL = 5  # секунд
 
 try: cfg = json.load(open(CFG))
 except Exception as e: print(f"FATAL: config: {e}", flush=True); sys.exit(106)
@@ -114,7 +119,7 @@ def clear_log():
     except: pass
 
 # ============================================
-# ТУННЕЛЬ (unkillable, watchdog only)
+# ТУННЕЛЬ
 # ============================================
 tunnel_process = None
 current_tunnel_url = None
@@ -147,7 +152,6 @@ def post_url_to_channel(url, reason="new", retries=5):
     try:
         with open(FALLBACK_URL_FILE, 'a', encoding='utf-8') as f:
             f.write(f"{now}|{url}|{reason}\n")
-        print(f"[Tunnel] ⚠ saved to fallback", flush=True)
     except: pass
     return False
 
@@ -222,18 +226,12 @@ def force_reload_tunnel(reason="manual"):
                 try:
                     tunnel_process.terminate()
                     tunnel_process.wait(timeout=3)
-                    print(f"[Tunnel-RELOAD] ✓ terminated (graceful)", flush=True)
                 except subprocess.TimeoutExpired:
                     tunnel_process.kill()
-                    print(f"[Tunnel-RELOAD] ✓ killed (forced)", flush=True)
                 except Exception as e:
-                    print(f"[Tunnel-RELOAD] terminate error: {e}, killing...", flush=True)
                     try: tunnel_process.kill()
                     except: pass
-            except Exception as e:
-                print(f"[Tunnel-RELOAD] kill error: {e}", flush=True)
-        else:
-            print(f"[Tunnel-RELOAD] ⚠ no active process", flush=True)
+            except: pass
         tunnel_process = None
     tunnel_last_activity = time.time()
     return True
@@ -248,18 +246,13 @@ def tunnel_watchdog_loop():
                 if p is not None:
                     retcode = p.poll()
                     if retcode is not None:
-                        print(f"[Tunnel-WD] SSH завершился (code={retcode}), ждём рестарт", flush=True)
                         tunnel_last_activity = time.time()
                     else:
                         idle = time.time() - tunnel_last_activity
                         if idle > 60:
-                            print(f"[Tunnel-WD] тишина {int(idle)}с → kill", flush=True)
                             force_reload_tunnel("watchdog_stale")
                             tunnel_last_activity = time.time()
-                        elif idle > 30:
-                            print(f"[Tunnel-WD] тишина {int(idle)}с (скоро kill)", flush=True)
-        except Exception as e:
-            print(f"[Tunnel-WD] {e}", flush=True)
+        except: pass
         time.sleep(15)
 
 def get_current_tunnel_url():
@@ -448,10 +441,10 @@ def na(m):
         except: pass
 
 # ============================================
-# PLAYER TRACKING + ВАНИШ (v17.13)
+# PLAYER TRACKING + ВАНИШ
 # ============================================
 player_positions={}; player_zones={}; player_last_seen={}; player_vanish_since={}; player_file_lines={}
-radar_first_seen={}; vanish_cooldown={}   # НОВОЕ
+radar_first_seen={}; vanish_cooldown={}
 
 def point_in_polygon(x,z,poly):
     n=len(poly); inside=False; j=n-1
@@ -465,13 +458,6 @@ def point_to_segment_dist(px,pz,ax,az,bx,bz):
     if l2==0: return ((px-ax)**2+(pz-az)**2)**0.5
     t=max(0,min(1,((px-ax)*dx+(pz-az)*dz)/l2))
     return ((px-(ax+t*dx))**2+(pz-(az+t*dz))**2)**0.5
-def distance_to_polygon(x,z,poly):
-    md=float('inf'); n=len(poly)
-    for i in range(n):
-        j=(i+1)%n
-        d=point_to_segment_dist(x,z,poly[i]['x'],poly[i]['z'],poly[j]['x'],poly[j]['z'])
-        if d<md: md=d
-    return md
 def load_locations():
     try: return json.load(open(LOCATIONS_FILE))
     except: return {}
@@ -527,7 +513,6 @@ def save_player_history(name,line,important):
     try: (PLAYERS_DIR/f"{name}.txt").write_text('\n'.join(player_file_lines[name]))
     except Exception as e: print(f"[Tracker] {name}: {e}", flush=True)
 
-# ИСПРАВЛЕНО: уведомляем ВСЕХ админов
 def get_vanish_tracking_admins():
     return aia()
 
@@ -554,10 +539,36 @@ def clear_vanish_notifications():
             except: pass
             s.pop('vanish_msg_id',None); sets(a,s)
 
-# ИСПРАВЛЕНО: новая логика ваниша (grace + кулдаун)
+# НОВОЕ: очищает ваниш-статус конкретного игрока (при выходе с сервера)
+def clear_vanish_for_player(name):
+    player_vanish_since.pop(name, None)
+    radar_first_seen.pop(name, None)
+    # очищаем уведомление
+    for a in get_vanish_tracking_admins():
+        s=gs(a) or {}
+        if 'vanish_msg_id' in s:
+            try: bot.delete_message(a, s['vanish_msg_id'])
+            except: pass
+            s.pop('vanish_msg_id', None); sets(a, s)
+
+# ИСПРАВЛЕНО: отслеживает выходы из сервера
 def process_player_data(data):
     now=time.time()
-    for p in data.get('players',[]):
+    players_in_update = data.get('players', [])
+    
+    # НОВОЕ: собираем множество всех кто ЕСТЬ в текущем апдейте
+    current_names = set()
+    for p in players_in_update:
+        name = p.get('name')
+        if name: current_names.add(name)
+    
+    # НОВОЕ: очищаем тех кого НЕТ в апдейте (вышел с сервера)
+    for name in list(player_vanish_since.keys()):
+        if name not in current_names:
+            print(f"[Vanish] игрок {name} вышел с сервера, очищаем", flush=True)
+            clear_vanish_for_player(name)
+    
+    for p in players_in_update:
         name=p.get('name')
         if not name: continue
         x,y,z=p.get('x',0),p.get('y',0),p.get('z',0)
@@ -570,9 +581,9 @@ def process_player_data(data):
         if name not in radar_first_seen: radar_first_seen[name]=ts
         in_tab=is_player_in_tab(name)
 
-        # ВАНИШ: радар видит, таба нет, и прошло >VANISH_GRACE
         if not in_tab and (ts - radar_first_seen.get(name,ts)) > VANISH_GRACE:
-            player_vanish_since[name]=ts
+            if name not in player_vanish_since:
+                player_vanish_since[name]=ts
             if now - vanish_cooldown.get(name,0) > VANISH_NOTIFY_CD:
                 vanish_cooldown[name]=now
                 notify_vanish(name,x,z,dim)
@@ -587,13 +598,10 @@ def process_player_data(data):
         since=get_online_since(name); online_sec=int(now-since) if since else 0
         save_player_history(name,format_history_line(ts,x,y,z,dim,health,maxhealth,eye,yaw,pitch,status,in_tab,vanish,imp,online_sec),imp)
 
-# ИСПРАВЛЕНО: только очистка (без дублей)
 def vanish_checker_loop():
     while True:
         try:
-            for n in list(player_vanish_since.keys()):
-                if is_player_in_tab(n):
-                    player_vanish_since.pop(n,None); radar_first_seen.pop(n,None)
+            # если никто в ванише — очищаем уведомления (на случай если игрок вышел)
             if not player_vanish_since:
                 clear_vanish_notifications()
         except Exception as e: print(f"[VanishChecker] {e}", flush=True)
@@ -655,7 +663,7 @@ def update_url_from_log():
     return None
 
 # ============================================
-# САЙТ + ТРЕКИНГ
+# САЙТ
 # ============================================
 def parse_site_status():
     global server_online_since
@@ -723,10 +731,11 @@ def watcher_loop():
             except Exception as e: print(f"[Watcher] {e}", flush=True)
 
 # ============================================
-# СТАТУС / СПРАВКА (с секцией ВАНИШ)
+# СТАТУС (с авто-обновлением)
 # ============================================
 def build_help_text():
-    return (f"{ui_header('Справка v17.13','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус сервера\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть\n\n<i>• COMP / PASTE = номер или имя</i>")
+    return (f"{ui_header('Справка v17.14','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто-обновление 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить (без требования /past)\n<code>/past delete N</code> — Удалить (без требования /past)\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть\n\n<i>• COMP / PASTE = номер или имя</i>")
+
 def build_status_text():
     try: status=parse_site_status()
     except: status=None
@@ -751,26 +760,89 @@ def build_status_text():
             else: txt+=f"  • <code>{safe(nick)}</code> 📍 нет координат{dur} {v}\n"
         if len(players_list)>30: txt+=f"  <i>... ещё {len(players_list)-30}</i>\n"
     else: txt+="<i>🔇 Никого нет онлайн</i>\n" if status.get('online') else "<i>💤 Сервер оффлайн</i>\n"
-    # НОВОЕ: секция ВАНИШ (радар видит, таба нет)
+    
+    # ВАНИШ: только те кто реально в радаре и не в табе
     onl_low=[p.lower() for p in players_list]
-    vanished=[(n,player_positions[n][-1]) for n in player_vanish_since if n in player_positions and n.lower() not in onl_low]
+    vanished=[(n,player_positions[n][-1]) for n in player_vanish_since 
+              if n in player_positions and player_positions[n] and n.lower() not in onl_low]
     if vanished:
         txt+=f"\n<b>🚨 ВАНИШ ({len(vanished)}):</b>\n"
         for name,c in vanished:
             since=get_online_since(name); dur=f" ⏱{fmt_duration(now-since)}" if since else ""
             txt+=f"  • <code>{safe(name)}</code> [{c['x']:.0f}, {c['y']:.0f}, {c['z']:.0f}]{dur} 🚨\n"
+    
     radar=[(n,p[-1]) for n,p in player_positions.items() if p]
     if radar:
-        txt+=f"\n<b>📡 Радар ({len(radar)}):</b>\n"; onl=[p.lower() for p in players_list]
+        txt+=f"\n<b>📡 Радар ({len(radar)}):</b>\n"
+        onl=[p.lower() for p in players_list]
         for name,c in radar[:20]:
             mark="🟢" if name.lower() in onl else "🚨"
             since=get_online_since(name); dur=f" ⏱{fmt_duration(now-since)}" if since else ""
             txt+=f"  • <code>{safe(name)}</code> [{c['x']:.0f}, {c['y']:.0f}, {c['z']:.0f}]{dur} {mark}\n"
         if len(radar)>20: txt+=f"  <i>... ещё {len(radar)-20}</i>\n"
     else: txt+="\n<b>📡 Радар:</b> <i>нет данных</i>\n"
+    
+    # НОВОЕ: метка времени обновления
+    txt+=f"\n<i>🕐 Обновлено: {msk_now().strftime('%H:%M:%S')} (авто каждые 5с)</i>"
     return txt
+
 def status_keyboard():
-    kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔄 Обновить",callback_data="refresh:status")); kb.add(types.InlineKeyboardButton("🔙 Главное меню",callback_data="menu:main")); return kb
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("🔄 Обновить сейчас",callback_data="refresh:status"),
+           types.InlineKeyboardButton("⏸ Стоп авто-обновление",callback_data="stop_auto_refresh"))
+    kb.add(types.InlineKeyboardButton("🔙 Главное меню",callback_data="menu:main"))
+    return kb
+
+# НОВОЕ: фоновый поток для авто-обновления /status
+def status_auto_refresh_loop():
+    print("[Status] auto-refresh loop started (every 5s)", flush=True)
+    while True:
+        try:
+            time.sleep(STATUS_REFRESH_INTERVAL)
+            with active_status_lock:
+                active_chats = dict(active_status_messages)
+            
+            if not active_chats: continue
+            
+            # генерируем статус один раз для всех
+            txt = build_status_text()
+            if not txt: continue
+            kb = status_keyboard()
+            
+            # обновляем все активные сообщения
+            for chat_id, message_id in active_chats.items():
+                try:
+                    bot.edit_message_text(txt, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+                except Exception as e:
+                    err = str(e)
+                    if "message is not modified" in err:
+                        pass  # содержимое не изменилось, это ок
+                    elif "MESSAGE_EDIT_TIME_LIMIT" in err or "message can't be edited" in err:
+                        # сообщение слишком старое для edit — удаляем из активных
+                        with active_status_lock:
+                            active_status_messages.pop(chat_id, None)
+                        print(f"[Status] removed chat {chat_id} from auto-refresh (edit limit)", flush=True)
+                    elif "chat not found" in err or "user is deactivated" in err or "Forbidden" in err:
+                        with active_status_lock:
+                            active_status_messages.pop(chat_id, None)
+                    else:
+                        # другие ошибки — просто пропускаем этот апдейт
+                        pass
+        except Exception as e:
+            print(f"[Status] auto-refresh error: {e}", flush=True)
+
+def register_status_message(chat_id, message_id):
+    """Регистрирует сообщение для авто-обновления"""
+    with active_status_lock:
+        active_status_messages[chat_id] = message_id
+    print(f"[Status] auto-refresh registered for chat {chat_id}", flush=True)
+
+def unregister_status_message(chat_id):
+    """Убирает чат из авто-обновления"""
+    with active_status_lock:
+        removed = active_status_messages.pop(chat_id, None)
+    if removed:
+        print(f"[Status] auto-refresh stopped for chat {chat_id}", flush=True)
 
 # ============================================
 # КЛАВИАТУРЫ
@@ -858,15 +930,16 @@ def cmd_api_reload(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
     delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)  # стоп авто-обновление
     threading.Thread(target=lambda: force_reload_tunnel("manual_telegram"), daemon=True).start()
     bot.send_message(m.chat.id,"🔄 <b>Перезагрузка туннеля...</b>\n\nСтарый убит. Новый URL появится в канале через <b>2-5 секунд</b>.",parse_mode='HTML')
-    print(f"[API] Tunnel reload requested by {m.from_user.id}", flush=True)
 
 @bot.message_handler(commands=['log'])
 def cmd_log(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
     delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
     status_msg = bot.send_message(m.chat.id, "📄 <b>Собираю логи...</b>", parse_mode='HTML')
     try:
         log_content = get_last_log_lines(max_lines=5000, max_bytes=900_000)
@@ -883,9 +956,7 @@ def cmd_log(m):
         state = gs(m.from_user.id) or {}
         state['last_file_msg_id'] = msg.message_id; state['last_file_chat_id'] = m.chat.id
         sets(m.from_user.id, state)
-        print(f"[LOG] Отправлен лог {m.from_user.id} ({len(log_bytes)} байт)", flush=True)
     except Exception as e:
-        print(f"[LOG] Ошибка: {e}", flush=True)
         try: bot.edit_message_text(f"❌ Ошибка:\n<code>{safe(str(e)[:200])}</code>", m.chat.id, status_msg.message_id, parse_mode='HTML')
         except: bot.send_message(m.chat.id, f"❌ Ошибка:\n<code>{safe(str(e)[:200])}</code>", parse_mode='HTML')
 
@@ -894,18 +965,19 @@ def cmd_log_clear(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
     delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
     try:
         size_before = RUNTIME_LOG.stat().st_size if RUNTIME_LOG.exists() else 0
         clear_log()
         size_after = RUNTIME_LOG.stat().st_size if RUNTIME_LOG.exists() else 0
-        bot.send_message(m.chat.id, f"✅ <b>Лог очищен</b>\n\nБыло: <code>{size_before:,}</code> байт\nСтало: <code>{size_after:,}</code> байт\nБэкап: <code>runtime.log.prev</code>", parse_mode='HTML')
-        print(f"[LOG] Очищен {m.from_user.id} (было {size_before})", flush=True)
+        bot.send_message(m.chat.id, f"✅ <b>Лог очищен</b>\n\nБыло: <code>{size_before:,}</code> байт\nСтало: <code>{size_after:,}</code> байт", parse_mode='HTML')
     except Exception as e:
         bot.send_message(m.chat.id, f"❌ Ошибка:\n<code>{safe(str(e)[:200])}</code>", parse_mode='HTML')
 
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     u=m.from_user.id
+    unregister_status_messages(m.chat.id)
     if not reg(u):
         un=m.from_user.username or ("id_"+str(u)); sets(u,{'step':'wp','username':un,'is_bot':m.from_user.is_bot})
         bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','👋')}\n\n👤 <b>{safe(un)}</b>\n\n🔐 Введите пароль:",parse_mode='HTML')
@@ -915,35 +987,48 @@ def cmd_start(m):
 @bot.message_handler(commands=['menu'])
 def cmd_menu(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start first"); return
-    delete_last_file(m.from_user.id); us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
+    delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
+    us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
     bot.send_message(m.chat.id,f"{ui_header('Главное меню','📱')}\n\n<b>📊 Статистика:</b>\n{ui_row('🤖 Компьютеры',bc)}\n{ui_row('👤 Пользователи',len(us)-bc)}\n{ui_row('📄 Пасты',len(lp()))}\n\nВыберите раздел:",parse_mode='HTML',reply_markup=main_menu_keyboard(m.from_user.id))
 @bot.message_handler(commands=['help'])
 def cmd_help(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start first"); return
     delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
     kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔙 Главное меню",callback_data="menu:main"))
     bot.send_message(m.chat.id,build_help_text(),parse_mode='HTML',reply_markup=kb)
 @bot.message_handler(commands=['api'])
 def cmd_api(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
-    delete_last_file(m.from_user.id); update_url_from_log()
+    delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
+    update_url_from_log()
     try: check_tunnel_health()
     except: pass
     kb=types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel")); kb.add(types.InlineKeyboardButton("🔄 Перезагрузить туннель",callback_data="reload_tunnel")); kb.add(types.InlineKeyboardButton("🔙 Главное меню",callback_data="menu:main"))
     bot.send_message(m.chat.id,build_api_text(),parse_mode='HTML',reply_markup=kb)
+
+# ИСПРАВЛЕНО: /status теперь регистрирует чат для авто-обновления
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
-    delete_last_file(m.from_user.id); txt=build_status_text()
+    delete_last_file(m.from_user.id)
+    txt=build_status_text()
     if not txt: bot.send_message(m.chat.id,"❌ Не удалось получить статус"); return
-    bot.send_message(m.chat.id,txt,parse_mode='HTML',reply_markup=status_keyboard())
+    msg = bot.send_message(m.chat.id,txt,parse_mode='HTML',reply_markup=status_keyboard())
+    # регистрируем для авто-обновления
+    register_status_message(m.chat.id, msg.message_id)
+
 @bot.message_handler(commands=['past'])
 def cmd_past(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
-    delete_last_file(m.from_user.id); pa=m.text.split()[1:]
+    delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
+    pa=m.text.split()[1:]
     if not pa: spm(m.chat.id,0); return
     s=pa[0].lower()
     if s=='add':
@@ -962,7 +1047,7 @@ def cmd_past(m):
             bot.send_message(m.chat.id,f"{ui_header('Паст создан','✅')}\n\n{ui_row('Имя',n)}\n{ui_row('Размер',f'{len(c)} байт')}",parse_mode='HTML')
         else: bot.send_message(m.chat.id,"❓ <code>/past add name [text]</code>",parse_mode='HTML')
     elif s=='edit':
-        if not gs(m.from_user.id).get('past_menu'): bot.send_message(m.chat.id,"🔒 Сначала /past"); return
+        # ИСПРАВЛЕНО: убрано требование past_menu
         if len(pa)<2: bot.send_message(m.chat.id,"❓ /past edit N_or_name"); return
         idx,paste=find_paste_by_arg(pa[1],lp())
         if idx is None: bot.send_message(m.chat.id,f"❌ Паст не найден: {safe(pa[1])}"); return
@@ -972,7 +1057,7 @@ def cmd_past(m):
         sets(m.from_user.id,{'step':'edit_file_wait','idx':idx,'past_menu':True})
         bot.send_message(m.chat.id,f"{ui_header('Редактирование','📝')}\n\n<b>📄 {safe(paste['name'])}</b>\n{ui_divider()}\n<pre>{safe(c[:500])}</pre>\n\n✏️ Отправьте <b>текст</b> или <b>файл</b>\nИли /cancel",parse_mode='HTML')
     elif s=='delete':
-        if not gs(m.from_user.id).get('past_menu'): bot.send_message(m.chat.id,"🔒 Сначала /past"); return
+        # ИСПРАВЛЕНО: убрано требование past_menu
         if len(pa)<2: bot.send_message(m.chat.id,"❓ /past delete N_or_name"); return
         idx,paste=find_paste_by_arg(pa[1],lp())
         if idx is None: bot.send_message(m.chat.id,f"❌ Паст не найден: {safe(pa[1])}"); return
@@ -995,7 +1080,9 @@ def spm(cid,pg,msg_to_edit=None):
 @bot.message_handler(commands=['all'])
 def cmd_all(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
-    delete_last_file(m.from_user.id); us=lu(); my=us.get(str(m.from_user.id))
+    delete_last_file(m.from_user.id)
+    unregister_status_messages(m.chat.id)
+    us=lu(); my=us.get(str(m.from_user.id))
     if not my or my.get('is_bot') or not my.get('name'): bot.send_message(m.chat.id,"⚠️ Только для пользователей"); return
     pa=m.text.split()[1:]
     if not pa: sam(m.chat.id,0); return
@@ -1137,6 +1224,18 @@ def handle_document(m):
 def cb(c):
     try:
         d=c.data
+        # НОВОЕ: кнопка "Стоп авто-обновление"
+        if d=="stop_auto_refresh":
+            unregister_status_messages(c.message.chat.id)
+            bot.answer_callback_query(c.id,"⏸ Авто-обновление остановлено")
+            try:
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton("🔄 Обновить вручную", callback_data="refresh:status"))
+                kb.add(types.InlineKeyboardButton("🔙 Главное меню", callback_data="menu:main"))
+                bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=kb)
+            except: pass
+            return
+        
         if d=="check_tunnel":
             bot.answer_callback_query(c.id,"🔄 Проверяю..."); update_url_from_log()
             try: check_tunnel_health()
@@ -1150,7 +1249,6 @@ def cb(c):
             threading.Thread(target=lambda: force_reload_tunnel("manual_button"), daemon=True).start()
             try: bot.send_message(c.message.chat.id,"🔄 <b>Перезагрузка туннеля...</b>\n\nСтарый убит. Новый URL появится в канале через <b>2-5 секунд</b>.",parse_mode='HTML')
             except: pass
-            print(f"[API] Tunnel reload via button by {c.from_user.id}", flush=True)
             return
         if d=="toggle_vanish":
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌ Только администраторы"); return
@@ -1165,7 +1263,9 @@ def cb(c):
             return
         if d.startswith("menu:"):
             sec=d.split(":")[1]
-            if sec in ["main","all","status","api","help","past"]: delete_last_file(c.from_user.id)
+            if sec in ["main","all","api","help","past"]:
+                delete_last_file(c.from_user.id)
+                unregister_status_messages(c.message.chat.id)
             if sec=="main":
                 us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
                 edit_or_send(c,f"{ui_header('Главное меню','📱')}\n\n<b>📊 Статистика:</b>\n{ui_row('🤖 Компьютеры',bc)}\n{ui_row('👤 Пользователи',len(us)-bc)}\n{ui_row('📄 Пасты',len(lp()))}\n\nВыберите раздел:",main_menu_keyboard(c.from_user.id))
@@ -1173,7 +1273,12 @@ def cb(c):
             elif sec=="all": sam(c.message.chat.id,0,msg_to_edit=c)
             elif sec=="status":
                 txt=build_status_text()
-                if txt: edit_or_send(c,txt,status_keyboard())
+                if txt:
+                    try:
+                        bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard())
+                        # возобновляем авто-обновление
+                        register_status_message(c.message.chat.id, c.message.message_id)
+                    except: pass
                 else: bot.answer_callback_query(c.id,"❌ Ошибка")
             elif sec=="api":
                 update_url_from_log()
@@ -1187,9 +1292,13 @@ def cb(c):
                 edit_or_send(c,build_help_text(),kb)
             bot.answer_callback_query(c.id); return
         if d=="refresh:status":
-            bot.answer_callback_query(c.id,"🔄 Обновление..."); txt=build_status_text()
+            bot.answer_callback_query(c.id,"🔄 Обновление...")
+            txt=build_status_text()
             if txt:
-                try: bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard())
+                try: 
+                    bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard())
+                    # удостоверяемся что в авто-обновлении
+                    register_status_message(c.message.chat.id, c.message.message_id)
                 except: pass
             return
         if d=="noop": bot.answer_callback_query(c.id); return
@@ -1439,13 +1548,12 @@ class AH(BaseHTTPRequestHandler):
             try: check_tunnel_health()
             except: pass
             h=dict(tunnel_health)
-            h.update(bot_status='running',bot_version='17.13',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
+            h.update(bot_status='running',bot_version='17.14',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
                      server_uptime_sec=int(time.time()-server_online_since) if server_online_since else 0,
                      registered_bots=sum(1 for u in lu().values() if u.get('is_bot')),total_pastes=len(lp()))
             self._j(200,h); return
         if p=='/api/reload':
             threading.Thread(target=lambda: force_reload_tunnel("api_request"), daemon=True).start()
-            print("[API] /api/reload called", flush=True)
             self._j(200,{"ok":True,"message":"Tunnel reload requested"}); return
         if p=='/api/url':
             update_url_from_log(); u=tunnel()
@@ -1628,7 +1736,7 @@ def start_api():
         try:
             print("[API] Starting on", PORT, "...", flush=True)
             srv=TS(('0.0.0.0',PORT),AH); srv.timeout=5
-            print("[API] Ready v17.13", flush=True)
+            print("[API] Ready v17.14", flush=True)
             srv.serve_forever()
         except OSError as e:
             if e.errno==98: os.system("fuser -k "+str(PORT)+"/tcp 2>/dev/null"); time.sleep(2)
@@ -1640,7 +1748,7 @@ def start_api():
                 except: pass
 
 def main():
-    print("Starting bot v17.13 (vanish fix + unkillable tunnel)...", flush=True)
+    print("Starting bot v17.14 (auto-refresh status + no menu req + vanish cleanup)...", flush=True)
     load_online_tracking()
     update_url_from_log()
     threading.Thread(target=start_tunnel, daemon=True).start()
@@ -1651,6 +1759,8 @@ def main():
     threading.Thread(target=watcher_loop, daemon=True).start()
     threading.Thread(target=tunnel_health_loop, daemon=True).start()
     threading.Thread(target=vanish_checker_loop, daemon=True).start()
+    # НОВОЕ: поток авто-обновления статуса
+    threading.Thread(target=status_auto_refresh_loop, daemon=True).start()
     print("Bot ready! Relay: @capscraft_relay", flush=True)
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
 
