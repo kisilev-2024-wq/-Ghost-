@@ -1,4 +1,4 @@
--- ghost v9.9.2 (GitHub-only update, secret SECRET_CODE, no cancel hints)
+-- ghost v9.9.2 
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
