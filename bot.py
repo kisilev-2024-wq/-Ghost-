@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.16 — trusted players auto-register + scoped command menus"""
+"""Bot v17.17 — radar stats in /status"""
 
 import sys, os, io, json, base64, socket, threading, time, uuid, hashlib, re, subprocess
 import html as html_lib
@@ -34,7 +34,6 @@ KNOWN = {'start','help','past','all','api','api_reload','log','log_clear','statu
 SITE_URL = "https://gmd.capscraft.com"
 FRIEND_SERVER_IP = "185.26.120.251"
 
-# Доверенные игроки (Telegram ID -> игровой ник), без регистрации
 TRUSTED_PLAYERS = {
     5183248850: "Gishta1",
     5602435561: "Rainy42",
@@ -69,9 +68,6 @@ LIP = lip()
 if PROXY: telebot.apihelper.proxy = {"http": PROXY, "https": PROXY}
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ============================================
-# ЛОГИРОВАНИЕ
-# ============================================
 class TeeLogger:
     def __init__(self, filename, original_stream):
         self.file = open(filename, 'a', encoding='utf-8', buffering=1)
@@ -124,9 +120,6 @@ def clear_log():
             RUNTIME_LOG.write_text(f"[{datetime.now().isoformat()}] Log cleared by admin\n")
     except: pass
 
-# ============================================
-# ТУННЕЛЬ
-# ============================================
 tunnel_process = None
 current_tunnel_url = None
 tunnel_lock = threading.Lock()
@@ -264,9 +257,6 @@ def tunnel_watchdog_loop():
 def get_current_tunnel_url():
     with tunnel_lock: return current_tunnel_url
 
-# ============================================
-# БАЗА
-# ============================================
 def tunnel():
     u = get_current_tunnel_url()
     if u: return u
@@ -362,7 +352,6 @@ def fmt_duration(sec):
     d=h//24; h=h%24
     return f"{d}д {h}ч"
 
-# Авто-регистрация доверенных игроков
 def auto_register_trusted(uid):
     try: uid=int(uid)
     except: return False
@@ -466,9 +455,6 @@ def na(m):
         try: bot.send_message(a,m,parse_mode='HTML')
         except: pass
 
-# ============================================
-# PLAYER TRACKING + ВАНИШ
-# ============================================
 player_positions={}; player_zones={}; player_last_seen={}; player_vanish_since={}; player_file_lines={}
 radar_first_seen={}; vanish_cooldown={}
 
@@ -620,9 +606,6 @@ def vanish_checker_loop():
         except Exception as e: print(f"[VanishChecker] {e}", flush=True)
         time.sleep(5)
 
-# ============================================
-# TUNNEL HEALTH
-# ============================================
 tunnel_health={'status':'unknown','url':None,'last_check':None,'last_ok':None,'errors':[],'checks_total':0,'checks_ok':0,'last_error':None}
 def sanitize_error(e):
     t=re.sub(r'<[^>]+>','',str(e)); return t.replace('<','').replace('>','')[:200]
@@ -675,9 +658,6 @@ def update_url_from_log():
         except: pass
     return None
 
-# ============================================
-# САЙТ
-# ============================================
 def parse_site_status():
     global server_online_since
     try:
@@ -743,11 +723,38 @@ def watcher_loop():
                     if uid in users: del users[uid]; su(users)
             except Exception as e: print(f"[Watcher] {e}", flush=True)
 
-# ============================================
-# СТАТУС
-# ============================================
+# НОВОЕ v17.17: подсчёт статистики радаров
+def get_radar_stats():
+    """Возвращает (total, online, offline) для радаров.
+    Радар = is_bot пользователь у которого в assigned_pastes есть 'radar'.
+    Online = последний heartbeat < 120 секунд назад."""
+    users = lu()
+    heartbeats = lhb()
+    now = datetime.now()
+    total = 0
+    online = 0
+    offline = 0
+    for uid, u in users.items():
+        if not u.get('is_bot'): continue
+        pastes = u.get('assigned_pastes', [])
+        if 'radar' not in pastes: continue
+        total += 1
+        cid = u.get('computer_id')
+        if cid and cid in heartbeats:
+            try:
+                lsv = heartbeats[cid].get('last_seen')
+                if lsv:
+                    delta = (now - datetime.fromisoformat(lsv)).total_seconds()
+                    if delta < 120:
+                        online += 1
+                        continue
+            except Exception as e:
+                print(f"[RadarStats] parse {cid}: {e}", flush=True)
+        offline += 1
+    return total, online, offline
+
 def build_help_text():
-    return (f"{ui_header('Справка v17.16','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто-обновление 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть")
+    return (f"{ui_header('Справка v17.17','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто-обновление 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть")
 
 def build_status_text():
     try: status=parse_site_status()
@@ -781,16 +788,21 @@ def build_status_text():
         for name,c in vanished:
             since=get_online_since(name); dur=f" ⏱{fmt_duration(now-since)}" if since else ""
             txt+=f"  • <code>{safe(name)}</code> [{c['x']:.0f}, {c['y']:.0f}, {c['z']:.0f}]{dur} 🚨\n"
+    
+    # НОВОЕ v17.17: статистика радаров
+    r_total, r_online, r_offline = get_radar_stats()
     radar=[(n,p[-1]) for n,p in player_positions.items() if p]
     if radar:
-        txt+=f"\n<b>📡 Радар ({len(radar)}):</b>\n"
+        txt+=f"\n<b>📡 Радары (всего: {r_total} | 🟢 {r_online} | 🔴 {r_offline}):</b>\n"
         onl=[p.lower() for p in players_list]
         for name,c in radar[:20]:
             mark="🟢" if name.lower() in onl else "🚨"
             since=get_online_since(name); dur=f" ⏱{fmt_duration(now-since)}" if since else ""
             txt+=f"  • <code>{safe(name)}</code> [{c['x']:.0f}, {c['y']:.0f}, {c['z']:.0f}]{dur} {mark}\n"
         if len(radar)>20: txt+=f"  <i>... ещё {len(radar)-20}</i>\n"
-    else: txt+="\n<b>📡 Радар:</b> <i>нет данных</i>\n"
+    else:
+        txt+=f"\n<b>📡 Радары (всего: {r_total} | 🟢 {r_online} | 🔴 {r_offline}):</b> <i>нет данных</i>\n"
+    
     txt+=f"\n<i>🕐 Обновлено: {msk_now().strftime('%H:%M:%S')} (авто каждые 5с)</i>"
     return txt
 
@@ -836,9 +848,6 @@ def unregister_status_messages(chat_id):
     with active_status_lock:
         active_status_messages.pop(chat_id, None)
 
-# ============================================
-# КЛАВИАТУРЫ
-# ============================================
 def main_menu_keyboard(uid):
     u=lu().get(str(uid),{}); em="✅" if u.get('vanish_tracking') else "❌"
     kb=types.InlineKeyboardMarkup(row_width=2)
@@ -909,9 +918,6 @@ def show_paste_profile(c,idx):
     except: bot.send_message(c.message.chat.id,txt,parse_mode='HTML',reply_markup=kb)
     send_paste_file(c.message.chat.id,c_,p['name'],c.from_user.id)
 
-# ============================================
-# КОМАНДЫ (актуальные подсказки в меню "/")
-# ============================================
 PUBLIC_COMMANDS = [
     types.BotCommand("start", "🚀 Пуск"),
     types.BotCommand("menu", "📱 Меню"),
@@ -947,9 +953,14 @@ def update_command_menus():
         except Exception as e: print(f"[Menu] admin {uid}: {e}", flush=True)
     print(f"[Menu] подсказки обновлены: public + {len(admin_chat_ids())} админов", flush=True)
 
-try:
-    update_command_menus()
-except: pass
+# Асинхронное обновление меню (не блокирует запуск)
+import threading as _th
+def _update_menus_async():
+    import time as _t
+    _t.sleep(5)
+    try: update_command_menus()
+    except Exception as e: print(f"[Menu] async err: {e}", flush=True)
+_th.Thread(target=_update_menus_async, daemon=True).start()
 
 @bot.message_handler(commands=['api_reload'])
 def cmd_api_reload(m):
@@ -1209,9 +1220,6 @@ def uan(pid,by,act):
         try: bot.edit_message_text(txt,int(a),mid,parse_mode='HTML')
         except: pass
 
-# ============================================
-# ФАЙЛЫ
-# ============================================
 @bot.message_handler(content_types=['document'])
 def handle_document(m):
     if not reg(m.from_user.id): return
@@ -1244,9 +1252,6 @@ def handle_document(m):
         cs(m.from_user.id)
         bot.send_message(m.chat.id,f"{ui_header('Паст обновлён из файла','✅')}\n\n{ui_row('Имя',ps[idx]['name'])}",parse_mode='HTML')
 
-# ============================================
-# CALLBACK
-# ============================================
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
     try:
@@ -1435,9 +1440,6 @@ def sbp(cid,mid,uk):
     try: bot.edit_message_text(txt,cid,mid,parse_mode='HTML',reply_markup=bbpk(uk))
     except: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=bbpk(uk))
 
-# ============================================
-# TEXT
-# ============================================
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def hm(m):
     u=m.from_user.id
@@ -1511,9 +1513,6 @@ def hm(m):
         bot.send_message(m.chat.id,f"{ui_header('Авторизация','👤')}\n\n👋 Привет, <b>{safe(un)}</b>\n\n🔐 Пароль:",parse_mode='HTML'); return
     bot.send_message(m.chat.id,"💡 <b>Меню</b>\n\n/menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
 
-# ============================================
-# HTTP API
-# ============================================
 class TS(ThreadingMixIn,HTTPServer): daemon_threads=True; allow_reuse_address=True; request_queue_size=128
 class AH(BaseHTTPRequestHandler):
     def log_message(self,f,*a):
@@ -1574,7 +1573,7 @@ class AH(BaseHTTPRequestHandler):
             try: check_tunnel_health()
             except: pass
             h=dict(tunnel_health)
-            h.update(bot_status='running',bot_version='17.16',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
+            h.update(bot_status='running',bot_version='17.17',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
                      server_uptime_sec=int(time.time()-server_online_since) if server_online_since else 0,
                      registered_bots=sum(1 for u in lu().values() if u.get('is_bot')),total_pastes=len(lp()))
             self._j(200,h); return
@@ -1762,7 +1761,7 @@ def start_api():
         try:
             print("[API] Starting on", PORT, "...", flush=True)
             srv=TS(('0.0.0.0',PORT),AH); srv.timeout=5
-            print("[API] Ready v17.16", flush=True)
+            print("[API] Ready v17.17", flush=True)
             srv.serve_forever()
         except OSError as e:
             if e.errno==98: os.system("fuser -k "+str(PORT)+"/tcp 2>/dev/null"); time.sleep(2)
@@ -1774,9 +1773,8 @@ def start_api():
                 except: pass
 
 def main():
-    print("Starting bot v17.16 (scoped command menus)...", flush=True)
+    print("Starting bot v17.17 (radar stats + reboot after register)...", flush=True)
     load_online_tracking()
-    update_command_menus()
     update_url_from_log()
     threading.Thread(target=start_tunnel, daemon=True).start()
     threading.Thread(target=tunnel_watchdog_loop, daemon=True).start()
