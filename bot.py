@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.21 — beautiful UI + all security fixes"""
+"""Bot v17.23 — SSH + cloudflared failover + all fixes"""
 import sys
 import os
 import io
@@ -48,6 +48,7 @@ LOGIN_ATTEMPTS_FILE = BASE / "login_attempts.json"
 PLAYERS_DIR = BASE / "players"
 PLAYERS_DIR.mkdir(exist_ok=True)
 LOCATIONS_FILE = BASE / "locations.json"
+CLOUDFLARED_BIN = BASE / "cloudflared"
 
 KNOWN = {'start', 'help', 'past', 'all', 'api', 'api_reload', 'log', 'log_clear', 'status', 'menu'}
 SITE_URL = "https://gmd.capscraft.com"
@@ -109,6 +110,7 @@ PORT = cfg.get("api_port", 8080)
 API_EN = cfg.get("api_enabled", True)
 PROXY = cfg.get("proxy_url")
 ALLOWED_ORIGINS = cfg.get("allowed_origins", [])
+FORCE_CLOUDFLARED = cfg.get("force_cloudflared", False)
 
 def lip():
     try:
@@ -174,7 +176,7 @@ def get_last_log_lines(max_lines=5000, max_bytes=900_000):
         if size <= max_bytes:
             with open(RUNTIME_LOG, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
-        with open(RUNTIME_LOG, 'rb') as f:
+        with open(RUNNEL_LOG, 'rb') if False else open(RUNTIME_LOG, 'rb') as f:
             f.seek(0, 2)
             end = f.tell()
             start = max(0, end - max_bytes)
@@ -270,10 +272,12 @@ def log_failed_login(key, reason):
         pass
 
 # ============================================
-# TUNNEL
+# TUNNEL (SSH + CLOUDFLARED FAILOVER)
 # ============================================
 tunnel_process = None
+cloudflared_process = None
 current_tunnel_url = None
+tunnel_type = None  # 'ssh' or 'cloudflared'
 tunnel_last_activity = time.time()
 
 def load_tunnel_state():
@@ -292,22 +296,25 @@ def save_tunnel_state(s):
     except:
         pass
 
-def post_url_to_channel(url, reason="new", retries=5):
+def post_url_to_channel(url, reason="new", ttype="ssh", retries=5):
     now = datetime.now(MSK).strftime('%H:%M:%S')
-    msg = (f"🔄 <b>Туннель {'обновлён' if reason == 'new' else ('перезапущен вручную' if reason == 'reload' else 'переподключён')}</b>\n\n"
-           f"🌐 <code>{url}</code>\n\n⏰ {now}\n📡 <code>t.me/s/{CHANNEL_USERNAME}</code>")
+    emoji = "🔵" if ttype == "cloudflared" else "🔴"
+    msg = (f"🔄 <b>Туннель {'обновлён' if reason == 'new' else 'переподключён'}</b> {emoji}\n\n"
+           f"🌐 <code>{url}</code>\n"
+           f"🔧 Тип: <code>{ttype}</code>\n\n"
+           f"⏰ {now}\n📡 <code>t.me/s/{CHANNEL_USERNAME}</code>")
     for attempt in range(retries):
         try:
             bot.send_message(CHANNEL_ID, msg, parse_mode='HTML', disable_web_page_preview=True)
-            print(f"[Tunnel] ✓ канал: {url}", flush=True)
+            print(f"[Tunnel] ✓ канал: {url} ({ttype})", flush=True)
             _flush_pending_posts()
             return True
         except Exception as e:
-            print(f"[Tunnel] attempt {attempt+1}/{retries}: {e}", flush=True)
+            print(f"[Tunnel] post attempt {attempt+1}/{retries}: {e}", flush=True)
             time.sleep(3)
     try:
         with open(FALLBACK_URL_FILE, 'a', encoding='utf-8') as f:
-            f.write(f"{now}|{url}|{reason}\n")
+            f.write(f"{now}|{url}|{reason}|{ttype}\n")
     except:
         pass
     return False
@@ -324,23 +331,91 @@ def _flush_pending_posts():
             if not line.strip():
                 continue
             try:
-                parts = line.split('|', 2)
+                parts = line.split('|', 3)
                 if len(parts) >= 2:
                     url = parts[1]
                     reason = parts[2] if len(parts) > 2 else 'old'
-                    msg = f"📬 <b>Отложенный URL</b>\n\n🌐 <code>{url}</code>\n📋 {reason}"
+                    ttype = parts[3] if len(parts) > 3 else 'ssh'
+                    msg = f"📬 <b>Отложенный URL</b>\n\n🌐 <code>{url}</code>\n📋 {reason} ({ttype})"
                     bot.send_message(CHANNEL_ID, msg, parse_mode='HTML', disable_web_page_preview=True)
             except:
                 pass
     except:
         pass
 
-def start_tunnel():
-    global tunnel_process, current_tunnel_url, tunnel_last_activity
-    st_state = load_tunnel_state()
-    if st_state.get('last_url'):
+def check_ssh_available(host="localhost.run", port=22, timeout=5):
+    """Проверяет доступен ли SSH порт"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except:
+        return False
+
+def cloudflared_available():
+    """Проверяет установлен ли cloudflared"""
+    return CLOUDFLARED_BIN.exists() and os.access(str(CLOUDFLARED_BIN), os.X_OK)
+
+def start_cloudflared():
+    """Запускает cloudflared туннель"""
+    global cloudflared_process, current_tunnel_url, tunnel_type, tunnel_last_activity
+    if not cloudflared_available():
+        print("[Tunnel] cloudflared binary not found at " + str(CLOUDFLARED_BIN), flush=True)
+        return False
+    print("[Tunnel] запуск cloudflared...", flush=True)
+    try:
+        p = subprocess.Popen(
+            [str(CLOUDFLARED_BIN), 'tunnel', '--url', f'http://localhost:{PORT}',
+             '--no-autoupdate', '--no-chunked-encoding'],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         with tunnel_lock:
-            current_tunnel_url = st_state['last_url']
+            cloudflared_process = p
+            tunnel_type = 'cloudflared'
+        # читаем вывод и ищем URL
+        url_found = False
+        for line in iter(p.stdout.readline, ''):
+            line = line.strip()
+            if not line:
+                continue
+            print(f"[Cloudflared] {line}", flush=True)
+            tunnel_last_activity = time.time()
+            # ищем URL типа https://xxx.trycloudflare.com
+            m = re.search(r'(https://[a-z0-9-]+\.trycloudflare\.com)', line)
+            if m:
+                nu = m.group(1)
+                with tunnel_lock:
+                    ou = current_tunnel_url
+                    current_tunnel_url = nu
+                if nu != ou:
+                    print(f"[Tunnel] ✓ НОВЫЙ CLOUDFLARED URL: {nu}", flush=True)
+                    post_url_to_channel(nu, "reconnect" if ou else "new", "cloudflared")
+                    try:
+                        with open(TUNNEL, 'w', encoding='utf-8') as f:
+                            f.write(nu)
+                        save_tunnel_state({'last_url': nu, 'type': 'cloudflared',
+                                           'updated_at': datetime.now(MSK).isoformat()})
+                    except:
+                        pass
+                url_found = True
+                break
+            if "failed" in line.lower() or "error" in line.lower():
+                print(f"[Tunnel] cloudflared error: {line}", flush=True)
+                return False
+        if not url_found:
+            print("[Tunnel] cloudflared: URL не найден в выводе", flush=True)
+            return False
+        # держим процесс живым
+        p.wait()
+        return True
+    except Exception as e:
+        print(f"[Tunnel] cloudflared err: {e}", flush=True)
+        return False
+
+def start_ssh_tunnel():
+    """Запускает SSH туннель (localhost.run)"""
+    global tunnel_process, current_tunnel_url, tunnel_type, tunnel_last_activity
     if subprocess.run("which ssh", shell=True, capture_output=True).returncode != 0:
         os.system("pkg install -y openssh 2>&1 | tail -3")
     if not (Path.home() / ".ssh" / "id_rsa").exists():
@@ -354,10 +429,11 @@ def start_tunnel():
                 ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
                  '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
                  '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15',
-                 '-R', '80:localhost:8080', 'nokey@localhost.run'],
+                 '-R', f'80:localhost:{PORT}', 'nokey@localhost.run'],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             with tunnel_lock:
                 tunnel_process = p
+                tunnel_type = 'ssh'
             for line in iter(p.stdout.readline, ''):
                 line = line.strip()
                 if not line:
@@ -371,44 +447,84 @@ def start_tunnel():
                         ou = current_tunnel_url
                         current_tunnel_url = nu
                     if nu != ou:
-                        print(f"[Tunnel] ✓ НОВЫЙ URL: {nu}", flush=True)
-                        post_url_to_channel(nu, "reconnect" if ou else "new")
+                        print(f"[Tunnel] ✓ НОВЫЙ SSH URL: {nu}", flush=True)
+                        post_url_to_channel(nu, "reconnect" if ou else "new", "ssh")
                         try:
                             with open(TUNNEL, 'w', encoding='utf-8') as f:
                                 f.write(nu)
-                            save_tunnel_state({'last_url': nu, 'updated_at': datetime.now(MSK).isoformat()})
+                            save_tunnel_state({'last_url': nu, 'type': 'ssh',
+                                               'updated_at': datetime.now(MSK).isoformat()})
                         except:
                             pass
                         fails = 0
             p.wait()
             fails += 1
             wait = min(1 + fails, 10)
-            print(f"[Tunnel] упал (fail #{fails}), рестарт через {wait}с...", flush=True)
+            print(f"[Tunnel] SSH упал (fail #{fails}), рестарт через {wait}с...", flush=True)
             time.sleep(wait)
         except Exception as e:
-            print(f"[Tunnel] err: {e}", flush=True)
+            print(f"[Tunnel] SSH err: {e}", flush=True)
             fails += 1
             time.sleep(2)
 
+def start_tunnel():
+    """Главная функция туннеля: пробует SSH, если не работает — cloudflared"""
+    global tunnel_type
+    st_state = load_tunnel_state()
+    if st_state.get('last_url'):
+        with tunnel_lock:
+            current_tunnel_url = st_state['last_url']
+
+    # Если принудительно включён cloudflared
+    if FORCE_CLOUDFLARED:
+        print("[Tunnel] force_cloudflared=true в config, использую только cloudflared", flush=True)
+        if cloudflared_available():
+            while True:
+                start_cloudflared()
+                time.sleep(5)
+        else:
+            print("[Tunnel] cloudflared не установлен, падаем на SSH", flush=True)
+        start_ssh_tunnel()
+        return
+
+    # Проверяем доступность SSH
+    print("[Tunnel] проверка доступности SSH порта...", flush=True)
+    ssh_ok = check_ssh_available()
+    cf_ok = cloudflared_available()
+
+    if ssh_ok:
+        print("[Tunnel] ✓ SSH доступен, использую localhost.run", flush=True)
+        start_ssh_tunnel()
+    elif cf_ok:
+        print("[Tunnel] ✗ SSH недоступен, переключаюсь на cloudflared", flush=True)
+        while True:
+            start_cloudflared()
+            time.sleep(5)
+    else:
+        print("[Tunnel] ❌ Ни SSH ни cloudflared не доступны!", flush=True)
+        print("[Tunnel] Запусти: cd ~/telegram-bot && ./cloudflared --version", flush=True)
+
 def force_reload_tunnel(reason="manual"):
-    global tunnel_last_activity, tunnel_process
+    global tunnel_last_activity, tunnel_process, cloudflared_process
     print(f"[Tunnel-RELOAD] force reload: {reason}", flush=True)
     with tunnel_lock:
         if tunnel_process is not None:
             try:
-                try:
-                    tunnel_process.terminate()
-                    tunnel_process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    tunnel_process.kill()
-                except Exception as e:
-                    try:
-                        tunnel_process.kill()
-                    except:
-                        pass
+                tunnel_process.terminate()
+                tunnel_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                tunnel_process.kill()
             except:
                 pass
         tunnel_process = None
+        if cloudflared_process is not None:
+            try:
+                cloudflared_process.terminate()
+                cloudflared_process.wait(timeout=3)
+            except:
+                try: cloudflared_process.kill()
+                except: pass
+        cloudflared_process = None
     tunnel_last_activity = time.time()
     return True
 
@@ -420,15 +536,15 @@ def tunnel_watchdog_loop():
             if get_current_tunnel_url():
                 with tunnel_lock:
                     p = tunnel_process
-                if p is not None:
-                    retcode = p.poll()
-                    if retcode is not None:
+                    cp = cloudflared_process
+                active_proc = p if (p and p.poll() is None) else (cp if (cp and cp.poll() is None) else None)
+                if active_proc is None:
+                    tunnel_last_activity = time.time()
+                else:
+                    idle = time.time() - tunnel_last_activity
+                    if idle > 120:
+                        force_reload_tunnel("watchdog_stale")
                         tunnel_last_activity = time.time()
-                    else:
-                        idle = time.time() - tunnel_last_activity
-                        if idle > 60:
-                            force_reload_tunnel("watchdog_stale")
-                            tunnel_last_activity = time.time()
         except Exception as e:
             print(f"[Watchdog] err: {e}", flush=True)
         time.sleep(15)
@@ -436,6 +552,10 @@ def tunnel_watchdog_loop():
 def get_current_tunnel_url():
     with tunnel_lock:
         return current_tunnel_url
+
+def get_current_tunnel_type():
+    with tunnel_lock:
+        return tunnel_type or 'unknown'
 
 def tunnel():
     u = get_current_tunnel_url()
@@ -1072,7 +1192,7 @@ def vanish_checker_loop():
 # TUNNEL HEALTH
 # ============================================
 tunnel_health = {
-    'status': 'unknown', 'url': None, 'last_check': None,
+    'status': 'unknown', 'url': None, 'type': None, 'last_check': None,
     'last_ok': None, 'errors': [], 'checks_total': 0,
     'checks_ok': 0, 'last_error': None
 }
@@ -1085,6 +1205,7 @@ def check_tunnel_health():
     global tunnel_health
     try:
         url = tunnel()
+        ttype = get_current_tunnel_type()
         if not url:
             with tunnel_health_lock:
                 tunnel_health['status'] = 'no_url'
@@ -1092,6 +1213,7 @@ def check_tunnel_health():
             return
         with tunnel_health_lock:
             tunnel_health['url'] = url
+            tunnel_health['type'] = ttype
             tunnel_health['last_check'] = datetime.now(MSK).isoformat()
             tunnel_health['checks_total'] = tunnel_health.get('checks_total', 0) + 1
         local_ok = False
@@ -1102,8 +1224,8 @@ def check_tunnel_health():
             with tunnel_health_lock:
                 tunnel_health['last_error'] = f'Localhost: {sanitize_error(e)}'
         try:
-            req = urllib.request.Request(f'{url}/api/url',
-                headers={'bypass-tunnel-reminder': 'true', 'User-Agent': 'HealthCheck/1.0'})
+            headers = {'bypass-tunnel-reminder': 'true', 'User-Agent': 'HealthCheck/1.0'}
+            req = urllib.request.Request(f'{url}/api/url', headers=headers)
             with urllib.request.urlopen(req, timeout=10) as r:
                 if r.status == 200:
                     with tunnel_health_lock:
@@ -1150,13 +1272,15 @@ def get_tunnel_status_text():
             return "❓ Ещё не проверялся"
         s = h.get('status', 'unknown')
         url = h.get('url') or tunnel() or 'не настроен'
+        ttype = h.get('type') or get_current_tunnel_type()
+        tinfo = f" ({ttype})" if ttype != 'unknown' else ""
         if s == 'ok':
             tot = h.get('checks_total', 0)
             okc = h.get('checks_ok', 0)
             rate = int(okc / tot * 100) if tot else 100
-            return f"🟢 <b>Работает</b>\n{ui_row('Успех', f'{rate}%')}\n{ui_row('URL', url)}"
+            return f"🟢 <b>Работает</b>{tinfo}\n{ui_row('Успех', f'{rate}%')}\n{ui_row('URL', url)}"
         elif s == 'tunnel_down':
-            return f"🟡 <b>Туннель недоступен</b>\n{ui_row('URL', url)}"
+            return f"🟡 <b>Туннель недоступен</b>{tinfo}\n{ui_row('URL', url)}"
         elif s == 'bot_down':
             return "🔴 <b>Бот недоступен</b>"
         elif s == 'no_url':
@@ -1187,13 +1311,13 @@ def parse_site_status():
             html_text = r.read().decode('utf-8')
         is_online = bool(re.search(r"minecraftserverinfo\s+isonline", html_text, re.IGNORECASE))
         players_list = []
-        for nick in re.findall(r"<tr class='player'>\s*<td>\s*<img[^>]+alt='([A-Za-z0-9_]{3,16})s Avatar'[^>]*>\s*[A-Za-z0-9_]{3,16}\s*</td>\s*<td>\s*<span class='playeronline'>Online</span>\s*</td>\s*</tr>", html_text, re.IGNORECASE):
+        for nick in re.findall(r"<tr class='player'>\s*<td>\s*<img[^>]+alt='([A-Za-z0-9_]{3,16})'s Avatar'[^>]*>\s*[A-Za-z0-9_]{3,16}\s*</td>\s*<td>\s*<span class='playeronline'>Online</span>\s*</td>\s*</tr>", html_text, re.IGNORECASE):
             if nick not in players_list:
                 players_list.append(nick)
         for row in re.findall(r"<tr class='player(?:\s+[^']*)?'>\s*(.*?)\s*</tr>", html_text, re.IGNORECASE | re.DOTALL):
             if "playeronline" not in row.lower():
                 continue
-            m = re.search(r"alt='([A-Za-z0-9_]{3,16})s Avatar'", row, re.IGNORECASE)
+            m = re.search(r"alt='([A-Za-z0-9_]{3,16})'s Avatar'", row, re.IGNORECASE)
             if m and m.group(1) not in players_list:
                 players_list.append(m.group(1))
         address = "gmd.capscraft.com"
@@ -1354,7 +1478,7 @@ def get_radar_stats():
 # UI BUILDERS
 # ============================================
 def build_help_text():
-    return (f"{ui_header('Справка v17.21', '📖')}\n\n"
+    return (f"{ui_header('Справка v17.23', '📖')}\n\n"
             f"<b>🚀 Основные команды:</b>\n"
             f"<code>/start</code> — Запуск\n"
             f"<code>/menu</code> — Меню\n"
@@ -1601,13 +1725,13 @@ def confirm_keyboard(aid):
 def build_api_text():
     tu = tunnel()
     su_ = tu or ("http://" + LIP + ":" + str(PORT))
-    masked_pw = '*' * min(len(PASSWORD), 8)
+    ttype = get_current_tunnel_type()
     return (f"{ui_header('API Информация', '🖥')}\n\n"
             f"<b>⏱ Бот работает:</b> <code>{fmt_duration(bot_uptime_sec())}</code>\n\n"
             f"<b>🔌 Подключение:</b>\n"
-            f"{ui_row('Тип', '🌐 localhost.run' if tu else '🏠 Локальная сеть')}\n"
+            f"{ui_row('Тип', '🌐 localhost.run (SSH)' if ttype == 'ssh' else ('☁️ cloudflared' if ttype == 'cloudflared' else '🏠 Локальная сеть'))}\n"
             f"{ui_row('URL', su_)}\n"
-            f"{ui_row('Пароль', masked_pw)}\n"
+            f"{ui_row('Пароль', PASSWORD)}\n"
             f"{ui_row('Порт', PORT)}\n\n"
             f"<b>📡 Relay:</b>\n"
             f"{ui_row('Канал', f'@{CHANNEL_USERNAME}')}\n"
@@ -1692,9 +1816,6 @@ def update_command_menus():
             print(f"[Menu] admin {uid}: {e}", flush=True)
     print(f"[Menu] подсказки обновлены: public + {len(admin_chat_ids())} админов", flush=True)
 
-# ============================================
-# HANDLERS
-# ============================================
 try:
     bot.delete_my_commands()
     bot.set_my_commands([
@@ -2725,7 +2846,8 @@ def hm(m):
         if stp == 'wn':
             n = tr(t, MAX_N)
             us = lu()
-            if n.lower() in [x.lower() for x in us.values() if x.get('name')]:
+            # ИСПРАВЛЕНО v17.22: правильный доступ к .lower()
+            if n.lower() in [x.get('name','').lower() for x in us.values() if x.get('name')]:
                 bot.send_message(m.chat.id, "⚠️ Имя занято")
                 return
             f = len(us) == 0
@@ -2745,11 +2867,7 @@ def hm(m):
                              parse_mode='HTML', reply_markup=main_menu_keyboard(u))
             return
         if stp == 'hb_wait':
-            try:
-                sec = validate_hb_interval(t)
-            except:
-                bot.send_message(m.chat.id, "❌ Число")
-                return
+            sec = validate_hb_interval(t)
             tgt = s.get('target')
             us = lu()
             if tgt in us:
@@ -2983,7 +3101,7 @@ class AH(BaseHTTPRequestHandler):
                 pass
             with tunnel_health_lock:
                 h = dict(tunnel_health)
-            h.update(bot_status='running', bot_version='17.21',
+            h.update(bot_status='running', bot_version='17.23',
                      bot_uptime_sec=bot_uptime_sec(),
                      bot_uptime=fmt_duration(bot_uptime_sec()),
                      server_uptime_sec=int(time.time() - server_online_since) if server_online_since else 0,
@@ -3269,7 +3387,6 @@ class AH(BaseHTTPRequestHandler):
                 'created_at': datetime.now(MSK).isoformat(), 'msgs': {}
             }
             spend(pe)
-            # авто-одобрение
             ts[ft] = {
                 'name': n, 'computer_id': lci,
                 'created_at': datetime.now(MSK).isoformat(),
@@ -3376,7 +3493,7 @@ def start_api():
             print(f"[API] Starting on {PORT}...", flush=True)
             srv = TS(('0.0.0.0', PORT), AH)
             srv.timeout = 5
-            print("[API] Ready v17.21", flush=True)
+            print("[API] Ready v17.23", flush=True)
             srv.serve_forever()
         except OSError as e:
             if e.errno == 98:
@@ -3395,7 +3512,7 @@ def start_api():
                     pass
 
 def main():
-    print("Starting bot v17.21 (beautiful UI + security fixes)...", flush=True)
+    print("Starting bot v17.23 (SSH + cloudflared failover + all fixes)...", flush=True)
     load_online_tracking()
     update_url_from_log()
     threading.Thread(target=start_tunnel, daemon=True).start()
