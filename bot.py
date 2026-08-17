@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.26 — beautiful UI + mobile network (cloudflared) + survivability"""
+"""Bot v17.24 — mobile 5G support + survivability (SSH<->cloudflared auto-failover)"""
 import sys, os, io, json, base64, socket, threading, time, uuid, hashlib, re, subprocess, shutil
 import html as html_lib, urllib.request
 from urllib.parse import unquote
@@ -15,7 +15,8 @@ BASE = Path.home() / "telegram-bot"; BASE.mkdir(parents=True, exist_ok=True)
 CFG=BASE/"config.json"; USERS=BASE/"users.json"; PASTES=BASE/"pastes.json"
 STATES=BASE/"user_states.json"; TOKENS=BASE/"api_tokens.json"; PENDING=BASE/"pending_tokens.json"
 TUNNEL=BASE/"tunnel_url.txt"; HB=BASE/"heartbeats.json"; SITE_STATUS_FILE=BASE/"site_status.json"
-TUNNEL_HEALTH_FILE=BASE/"tunnel_health.json"; ONLINE_TRACK_FILE=BASE/"online_tracking.json"
+TUNNEL_HEALTH_FILE=BASE/"tunnel_health.json"; TUNNEL_STATE_FILE=BASE/"tunnel_state.json"
+ONLINE_TRACK_FILE=BASE/"online_tracking.json"; FALLBACK_URL_FILE=BASE/"pending_url_post.txt"
 RUNTIME_LOG=BASE/"runtime.log"; PLAYERS_DIR=BASE/"players"; PLAYERS_DIR.mkdir(exist_ok=True)
 LOCATIONS_FILE=BASE/"locations.json"
 
@@ -79,99 +80,7 @@ def clear_log():
         with open(RUNTIME_LOG,'w',encoding='utf-8') as f: f.write(f"[{datetime.now(MSK).isoformat()}] cleared\n")
     except: pass
 
-# ===================== ТУННЕЛЬ: SSH + cloudflared (мобильная сеть) =====================
-tunnel_process=None; current_tunnel_url=None; tunnel_lock=threading.Lock(); tunnel_last_activity=time.time()
-def set_url(u):
-    global current_tunnel_url
-    with tunnel_lock: old=current_tunnel_url; current_tunnel_url=u
-    if u!=old:
-        post_url_to_channel(u)
-        try: TUNNEL.write_text(u)
-        except: pass
-def post_url_to_channel(url,retries=5):
-    now=datetime.now(MSK).strftime('%H:%M:%S')
-    msg=f"🔄 <b>Туннель</b>\n🌐 <code>{url}</code>\n⏰ {now}\n📡 <code>t.me/s/capscraft_relay</code>"
-    for _ in range(retries):
-        try:
-            bot.send_message(-1004388932854,msg,parse_mode='HTML',disable_web_page_preview=True); return True
-        except: time.sleep(3)
-    return False
-def run_ssh_once():
-    global tunnel_process,tunnel_last_activity
-    try:
-        p=subprocess.Popen(['ssh','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null',
-            '-o','ServerAliveInterval=15','-o','ServerAliveCountMax=2','-o','ConnectTimeout=12',
-            '-R',f'80:localhost:{PORT}','nokey@localhost.run'],
-            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-        with tunnel_lock: tunnel_process=p
-        tunnel_last_activity=time.time()
-        for line in iter(p.stdout.readline,''):
-            line=line.strip()
-            if not line: continue
-            tunnel_last_activity=time.time()
-            m=re.search(r'(https://[a-z0-9-]+\.lhr\.life)',line)
-            if m: set_url(m.group(1))
-        p.wait(); return False
-    except Exception as e:
-        log(f"[Tunnel-ssh] {e}"); return False
-def run_cf_once():
-    global tunnel_process,tunnel_last_activity
-    try:
-        p=subprocess.Popen([cf_bin(),'tunnel','--url',f'http://localhost:{PORT}','--no-autoupdate'],
-            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-        with tunnel_lock: tunnel_process=p
-        tunnel_last_activity=time.time()
-        for line in iter(p.stdout.readline,''):
-            line=line.strip()
-            if not line: continue
-            tunnel_last_activity=time.time()
-            m=re.search(r'(https://[a-z0-9-]+\.trycloudflare\.com)',line)
-            if m: set_url(m.group(1))
-        p.wait(); return False
-    except Exception as e:
-        log(f"[Tunnel-cf] {e}"); return False
-def ensure_cloudflared():
-    if shutil.which('cloudflared'): return True
-    try: subprocess.run(['pkg','install','-y','cloudflared'],capture_output=True,timeout=120)
-    except: pass
-    return bool(shutil.which('cloudflared'))
-def start_tunnel():
-    ensure_cloudflared()
-    method='ssh'; ssh_fails=0
-    while True:
-        if method=='ssh':
-            if not run_ssh_once():
-                ssh_fails+=1
-                if ssh_fails>=2 and shutil.which('cloudflared'):
-                    log("[Tunnel] SSH unstable (mobile network?) -> cloudflared")
-                    method='cf'
-            else: ssh_fails=0
-        else:
-            if not run_cf_once():
-                method='ssh'; ssh_fails=0
-        time.sleep(2)
-def tunnel_watchdog():
-    global tunnel_process
-    time.sleep(60)
-    while True:
-        try:
-            with tunnel_lock: p=tunnel_process
-            if p and p.poll() is None and (time.time()-tunnel_last_activity)>90:
-                log("[Watchdog] tunnel stale -> kill")
-                try: p.kill()
-                except: pass
-        except: pass
-        time.sleep(15)
-def get_url():
-    with tunnel_lock: u=current_tunnel_url
-    if u: return u
-    try:
-        t=TUNNEL.read_text().strip()
-        if t.startswith('http'): return t
-    except: pass
-    return cfg.get('tunnel_url')
-
-# ===================== БАЗА =====================
+# ===================== ХРАНИЛИЩЕ / ШИФР =====================
 def enc(t):
     try:
         b=t.encode(); s=hashlib.sha256(KEY).digest()
@@ -269,8 +178,175 @@ def gm_icon(g):
 def auto_reg(u):
     try: uid=int(u)
     except: return False
-    if uid not in TRUSTED_PLAYERS or reg(uid): return
-    us=lu(); us[str(uid)]={'name':TRUSTED_PLAYERS[uid],'username':f"p_{uid}",'is_bot':False,'is_admin':ia(uid),'registered_at':datetime.now(MSK).isoformat(),'trusted':True}; su(us)
+    if uid not in TRUSTED_PLAYERS: return False
+    if reg(uid): return True
+    name=TRUSTED_PLAYERS[uid]; us=lu()
+    us[str(uid)]={'name':name,'username':f"p_{uid}",'is_bot':False,'is_admin':(name==TECH or name in PROTECTED),'registered_at':datetime.now(MSK).isoformat(),'trusted':True}
+    su(us); return True
+
+# ===================== ТУННЕЛЬ v17.24 =====================
+tunnel_process=None; current_tunnel_url=None; tunnel_lock=threading.Lock()
+tunnel_last_activity=time.time()
+tunnel_method=None
+ssh_fail_streak=0; cf_fail_streak=0
+
+def log(m): print(m, flush=True)
+
+def check_port(host, port, timeout=5):
+    try:
+        s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
+        s.connect((host, port)); s.close(); return True
+    except: return False
+
+def ensure_cloudflared():
+    if shutil.which('cloudflared'): return True
+    try: subprocess.run(['pkg','install','-y','cloudflared'],capture_output=True,timeout=180)
+    except: pass
+    if shutil.which('cloudflared'): return True
+    try:
+        arch=os.uname().machine
+        url={'aarch64':'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64',
+             'armv7l':'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm',
+             'x86_64':'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64'}.get(arch)
+        if url:
+            dst=str(BASE/'cloudflared')
+            subprocess.run(['wget','-q','-O',dst,url],capture_output=True,timeout=180)
+            os.chmod(dst,0o755)
+            return os.path.exists(dst)
+    except: pass
+    return False
+def cf_bin(): return shutil.which('cloudflared') or str(BASE/'cloudflared')
+
+def post_url_to_channel(url,reason="new",ttype="ssh",retries=5):
+    now=datetime.now(MSK).strftime('%H:%M:%S')
+    msg=f"🔄 <b>Туннель</b> {'☁️' if ttype=='cf' else '🔴'}\n🌐 <code>{url}</code>\n⏰ {now}\n📡 <code>t.me/s/capscraft_relay</code>"
+    for _ in range(retries):
+        try:
+            bot.send_message(-1004388932854,msg,parse_mode='HTML',disable_web_page_preview=True); _flush_pending_posts(); return True
+        except: time.sleep(3)
+    return False
+def _flush_pending_posts():
+    if not FALLBACK_URL_FILE.exists(): return
+    try:
+        lines=FALLBACK_URL_FILE.read_text().strip().split('\n'); FALLBACK_URL_FILE.write_text('')
+        for line in lines:
+            parts=line.split('|',3)
+            if len(parts)>=2:
+                bot.send_message(-1004388932854,f"📬 <code>{parts[1]}</code>",parse_mode='HTML',disable_web_page_preview=True)
+    except: pass
+
+def set_url(u,ttype):
+    global current_tunnel_url
+    with tunnel_lock: ou=current_tunnel_url; current_tunnel_url=u
+    if u!=ou:
+        post_url_to_channel(u,"new",ttype)
+        try: TUNNEL.write_text(u); wj(TUNNEL_STATE_FILE,{'last_url':u,'type':ttype})
+        except: pass
+
+def run_ssh_once():
+    """Возвращает (established, duration). Блокирует пока туннель жив."""
+    global tunnel_process, tunnel_last_activity
+    started=time.time(); established=False
+    if not shutil.which('ssh'): os.system("pkg install -y openssh 2>&1 | tail -3")
+    if not (Path.home()/".ssh"/"id_rsa").exists(): os.system('ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa >/dev/null 2>&1')
+    try:
+        p=subprocess.Popen(['ssh','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null',
+            '-o','ServerAliveInterval=10','-o','ServerAliveCountMax=2','-o','TCPKeepAlive=yes',
+            '-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=10',
+            '-R',f'80:localhost:{PORT}','nokey@localhost.run'],
+            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+        with tunnel_lock: tunnel_process=p
+        for line in iter(p.stdout.readline,''):
+            line=line.strip()
+            if not line: continue
+            tunnel_last_activity=time.time()
+            m=re.search(r'(https://[a-z0-9-]+\.lhr\.life)',line)
+            if m: set_url(m.group(1),'ssh'); established=True
+        p.wait()
+    except Exception as e: log(f"[Tunnel-ssh] {e}")
+    return established, (time.time()-started)
+
+def run_cf_once():
+    """cloudflared: живучий, сам рестартится при обрыве сети."""
+    global tunnel_process, tunnel_last_activity
+    started=time.time(); established=False
+    try:
+        p=subprocess.Popen([cf_bin(),'tunnel','--url',f'http://localhost:{PORT}','--no-autoupdate'],
+            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+        with tunnel_lock: tunnel_process=p
+        for line in iter(p.stdout.readline,''):
+            line=line.strip()
+            if not line: continue
+            tunnel_last_activity=time.time()
+            m=re.search(r'(https://[a-z0-9-]+\.trycloudflare\.com)',line)
+            if m: set_url(m.group(1),'cf'); established=True
+        p.wait()
+    except Exception as e: log(f"[Tunnel-cf] {e}")
+    return established, (time.time()-started)
+
+def start_tunnel():
+    global tunnel_method, ssh_fail_streak, cf_fail_streak
+    have_cf=ensure_cloudflared()
+    log(f"[Tunnel] cloudflared available: {have_cf}")
+    # Мобильная сеть: если SSH порт 22 заблокирован -> сразу cloudflared
+    if have_cf and not check_port('localhost.run',22,5):
+        tunnel_method='cf'; log("[Tunnel] SSH port blocked (mobile 5G?) -> cloudflared")
+    else:
+        tunnel_method='ssh'; log("[Tunnel] SSH available -> localhost.run")
+    while True:
+        if tunnel_method=='ssh':
+            est,dur=run_ssh_once()
+            if est and dur>60: ssh_fail_streak=0; continue   # нормальный обрыв, рестарт SSH
+            ssh_fail_streak+=1
+            log(f"[Tunnel] SSH fail #{ssh_fail_streak} (dur {int(dur)}s)")
+            if ssh_fail_streak>=2 and have_cf:
+                tunnel_method='cf'; ssh_fail_streak=0
+                log("[Tunnel] SSH unstable -> switch to cloudflared")
+            else:
+                time.sleep(min(2+ssh_fail_streak,10))   # backoff при обрыве интернета
+        else:
+            est,dur=run_cf_once()
+            if est and dur>60: cf_fail_streak=0; continue
+            cf_fail_streak+=1
+            log(f"[Tunnel] CF fail #{cf_fail_streak} (dur {int(dur)}s)")
+            if cf_fail_streak>=3 and check_port('localhost.run',22,5):
+                tunnel_method='ssh'; cf_fail_streak=0
+                log("[Tunnel] CF unstable -> switch to SSH")
+            else:
+                time.sleep(min(2+cf_fail_streak,10))
+
+def force_reload_tunnel(reason="manual"):
+    global tunnel_process, tunnel_last_activity
+    log(f"[Tunnel-RELOAD] {reason}")
+    with tunnel_lock:
+        if tunnel_process:
+            try: tunnel_process.kill()
+            except: pass
+        tunnel_process=None
+    tunnel_last_activity=time.time()
+
+def tunnel_watchdog_loop():
+    global tunnel_last_activity
+    time.sleep(60)
+    while True:
+        try:
+            with tunnel_lock: p=tunnel_process
+            if p and p.poll() is None and (time.time()-tunnel_last_activity)>90:
+                log("[Watchdog] tunnel stale -> kill")
+                force_reload_tunnel("watchdog_stale")
+        except: pass
+        time.sleep(15)
+
+def get_current_tunnel_url():
+    with tunnel_lock: return current_tunnel_url
+def tunnel():
+    u=get_current_tunnel_url()
+    if u: return u
+    try:
+        t=TUNNEL.read_text().strip()
+        if t.startswith('http'): return t
+    except: pass
+    return cfg.get('tunnel_url')
 
 # ===================== TRACKING / VANISH =====================
 player_online_since={}; server_online_since=None
@@ -280,11 +356,6 @@ def load_online_tracking():
 def save_online_tracking(): wj(ONLINE_TRACK_FILE,{'players':player_online_since,'server':server_online_since})
 def get_online_since(n): return player_online_since.get(n) or player_online_since.get(n.lower())
 player_positions={}; player_vanish_since={}; player_file_lines={}; radar_first_seen={}; vanish_cooldown={}
-def is_player_in_tab(name):
-    try:
-        d=rj(SITE_STATUS_FILE,{})
-        return bool(d.get('online')) and name.lower() in [p.lower() for p in d.get('players_list',[])]
-    except: return False
 def is_teleport(name,x,z,ts):
     if name not in player_positions or len(player_positions[name])<3: return False
     pos=player_positions[name][-8:]; sp=[]
@@ -292,6 +363,11 @@ def is_teleport(name,x,z,ts):
         dt=pos[i]['timestamp']-pos[i-1]['timestamp']
         if dt>0: sp.append(((pos[i]['x']-pos[i-1]['x'])**2+(pos[i]['z']-pos[i-1]['z'])**2)**0.5/dt)
     return len(sp)>=2 and sp[-1]>=50
+def is_player_in_tab(name):
+    try:
+        d=rj(SITE_STATUS_FILE,{})
+        return bool(d.get('online')) and name.lower() in [p.lower() for p in d.get('players_list',[])]
+    except: return False
 def save_player_history(name,line,imp):
     fp=PLAYERS_DIR/f"{name}.txt"
     try:
@@ -319,21 +395,19 @@ def clear_vanish_notifications():
             try: bot.delete_message(a,s['vanish_msg_id'])
             except: pass
             s.pop('vanish_msg_id',None); sets(a,s)
-def clear_vanish_for_player(name):
-    player_vanish_since.pop(name,None); radar_first_seen.pop(name,None); clear_vanish_notifications()
 def process_player_data(data):
     if not isinstance(data,dict): return
     now=time.time(); plu=data.get('players',[])
     if not isinstance(plu,list): return
     cur={p.get('name').strip() for p in plu if isinstance(p,dict) and isinstance(p.get('name'),str)}
     for n in list(player_vanish_since):
-        if n not in cur: clear_vanish_for_player(n)
+        if n not in cur: player_vanish_since.pop(n,None); radar_first_seen.pop(n,None)
     for p in plu:
         if not isinstance(p,dict): continue
         name=p.get('name')
         if not isinstance(name,str) or not name.strip(): continue
         name=name.strip()
-        if len(name)<2 or len(name)>16 or not re.match(r'^[A-Za-z0-9_]+$',name): continue
+        if len(name)<2 or len(name)>16: continue
         try:
             x,y,z=float(p.get('x',0)),float(p.get('y',0)),float(p.get('z',0))
             hp,mh=float(p.get('health',20)),float(p.get('maxHealth',20)); eye=float(p.get('eyeHeight',1.62))
@@ -362,7 +436,7 @@ def vanish_checker_loop():
         except: pass
         time.sleep(5)
 
-# ===================== SITE / WATCHER =====================
+# ===================== SITE / WATCHER / HEALTH =====================
 def parse_site_status():
     global server_online_since
     try:
@@ -379,8 +453,7 @@ def parse_site_status():
         save_online_tracking()
         d={'online':on,'players_online':len(pl),'players_list':pl,'address':'gmd.capscraft.com','server_online_since':server_online_since}
         wj(SITE_STATUS_FILE,d); return d
-    except Exception as e:
-        log(f"[Site] {e}"); return None
+    except Exception as e: log(f"[Site] {e}"); return None
 def site_checker_loop():
     while True:
         s=parse_site_status()
@@ -402,12 +475,14 @@ def watcher_loop():
                 if not base: continue
                 try: delta=(now-datetime.fromisoformat(base)).total_seconds()
                 except: continue
-                if delta<180 or delta<=lim: continue
-                at=u.get('api_token'); n=u.get('name','?')
-                log(f"[Watcher] KICK {n}")
-                if at: rt(at,f"Авто-кик {int(delta/60)} мин")
-                h2=lhb(); h2.pop(cid,None); shb(h2)
-                us.pop(uid,None); su(us); na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(n)}</code>")
+                if delta<180: continue
+                if delta>lim:
+                    n=u.get('name','?'); at=u.get('api_token')
+                    log(f"[Watcher] KICK {n} (offline {int(delta/60)}m)")
+                    if at: rt(at,f"Авто-кик")
+                    h2=lhb(); h2.pop(cid,None); shb(h2)
+                    us.pop(uid,None); su(us)
+                    na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(n)}</code>")
         except: pass
 def rt(tok,r=""):
     ts=lt()
@@ -415,13 +490,10 @@ def rt(tok,r=""):
         td=ts.pop(tok); st(ts); us=lu(); pid=td.get('pending_id')
         if pid and pid in us:
             us.pop(pid,None); su(us)
-
-# ===================== TUNNEL HEALTH =====================
 tunnel_health={'status':'unknown'}
 def check_tunnel_health():
-    global tunnel_health
     try:
-        u=get_url()
+        u=tunnel()
         if not u: tunnel_health['status']='no_url'; return
         req=urllib.request.Request(f'{u}/api/url',headers={'bypass-tunnel-reminder':'1'})
         with urllib.request.urlopen(req,timeout=10) as r:
@@ -434,12 +506,12 @@ def tunnel_health_loop():
         except: pass
         time.sleep(60)
 def get_tunnel_status_text():
-    s=tunnel_health.get('status'); u=get_url() or 'не настроен'
+    s=tunnel_health.get('status'); u=tunnel() or 'не настроен'
     return {"ok":f"🟢 Работает\n{ui_row('URL',u)}","down":f"🟡 Недоступен\n{ui_row('URL',u)}","no_url":"⚫ URL не настроен"}.get(s,f"❓ {safe(s)}")
 
 # ===================== UI BUILDERS =====================
 def build_help_text():
-    return (f"{ui_header('Справка v17.26','📖')}\n\n<b>🚀 Команды:</b>\n<code>/start</code> пуск\n<code>/menu</code> меню\n<code>/status</code> статус (авто 5с)\n<code>/api</code> API\n<code>/api_reload</code> рестарт туннеля\n\n<b>📋 Пасты:</b>\n<code>/past</code> список\n<code>/past add name</code> создать\n<code>/past edit N</code> изменить\n<code>/past delete N</code> удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> список\n<code>/all assign COMP paste</code> привязать\n<code>/all kick COMP</code> кик")
+    return f"{ui_header('Справка v17.24','📖')}\n\n<code>/start</code> пуск\n<code>/menu</code> меню\n<code>/status</code> статус\n<code>/api</code> API\n<code>/past</code> пасты\n<code>/all</code> компы"
 def build_status_text():
     s=parse_site_status() or rj(SITE_STATUS_FILE,None)
     if not s: return None
@@ -455,19 +527,18 @@ def build_status_text():
             g=gm_icon(c.get('gamemode')) if c else ""
             sn=get_online_since(nick); d=f" ⏱{fmt_duration(now-sn)}" if sn else ""
             txt+=f"  • {g} <code>{safe(nick)}</code> [{c['x']:.0f},{c['y']:.0f},{c['z']:.0f}]{d} {v}\n" if c else f"  • <code>{safe(nick)}</code> 📍{d} {v}\n"
-    else: txt+="<i>🔇 никого</i>\n" if s.get('online') else "<i>💤 оффлайн</i>\n"
+    else: txt+="<i>🔇 никого</i>\n"
     onl=[p.lower() for p in pl]
     van=[(n,player_positions[n][-1]) for n in player_vanish_since if player_positions.get(n) and n.lower() not in onl]
     if van:
         txt+=f"\n<b>🚨 ВАНИШ ({len(van)}):</b>\n"
         for n,c in van: txt+=f"  • {gm_icon(c.get('gamemode'))} <code>{safe(n)}</code> [{c['x']:.0f},{c['y']:.0f},{c['z']:.0f}] 🚨\n"
     rt_=sum(1 for u in lu().values() if u.get('is_bot') and 'radar' in u.get('assigned_pastes',[]))
-    hb=lhb(); on=sum(1 for u in lu().values() if u.get('is_bot') and 'radar' in u.get('assigned_pastes',[]) and u.get('computer_id') in hb and (now-datetime.fromisoformat(hb[u['computer_id']]['last_seen'])).total_seconds()<120)
-    txt+=f"\n<b>📡 Радары (всего:{rt_} 🟢{on} 🔴{rt_-on}):</b>\n"
-    rad=[(n,p[-1]) for n,p in player_positions.items() if p]
-    for n,c in rad[:20]:
+    radar=[(n,p[-1]) for n,p in player_positions.items() if p]
+    txt+=f"\n<b>📡 Радары ({rt_}):</b>\n"
+    for n,c in radar[:20]:
         txt+=f"  • {gm_icon(c.get('gamemode'))} <code>{safe(n)}</code> [{c['x']:.0f},{c['y']:.0f},{c['z']:.0f}] {'🟢' if n.lower() in onl else '🚨'}\n"
-    if not rad: txt+="  <i>нет данных</i>\n"
+    if not radar: txt+="  <i>нет данных</i>\n"
     txt+=f"\n<i>🕐 {msk_now().strftime('%H:%M:%S')} (авто 5с)</i>"
     return txt
 def status_keyboard():
@@ -500,57 +571,11 @@ def main_menu_keyboard(uid):
     kb.add(types.InlineKeyboardButton("❓ Помощь",callback_data="menu:help")); return kb
 def back_kb():
     kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb
-def bpk(ps,pg):
-    tp=max(1,(len(ps)+PER-1)//PER); pg=max(0,min(pg,tp-1)); it=ps[pg*PER:pg*PER+PER]
-    kb=types.InlineKeyboardMarkup(row_width=1)
-    for i,p in enumerate(it): kb.add(types.InlineKeyboardButton(f"{pg*PER+i+1}. 📄 {safe(tr(p['name'],MAXPN))}",callback_data=f"pv:{pg*PER+i}"))
-    nav=[]
-    if pg>0: nav.append(types.InlineKeyboardButton("◀️",callback_data=f"pp:{pg-1}"))
-    nav.append(types.InlineKeyboardButton(f"{pg+1}/{tp}",callback_data="noop"))
-    if pg<tp-1: nav.append(types.InlineKeyboardButton("▶️",callback_data=f"pp:{pg+1}"))
-    if nav: kb.row(*nav)
-    kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb,pg,tp
-def buk(ud,pg):
-    it=list(ud.items()); tp=max(1,(len(it)+PER-1)//PER); pg=max(0,min(pg,tp-1)); ip=it[pg*PER:pg*PER+PER]
-    kb=types.InlineKeyboardMarkup(row_width=1)
-    for i,(uk,d) in enumerate(ip):
-        ic={"tech":"🛠","admin":"👑","bot":"🤖"}.get(role(uk),"👤")
-        extra=f" 📋{len(d.get('assigned_pastes',[]))}" if d.get('is_bot') else ""
-        kb.add(types.InlineKeyboardButton(f"{pg*PER+i+1}. {ic} {safe(tr(d.get('name') or uk,MAX_N))}{extra}",callback_data=f"av:{uk}"))
-    nav=[]
-    if pg>0: nav.append(types.InlineKeyboardButton("◀️",callback_data=f"ap:{pg-1}"))
-    nav.append(types.InlineKeyboardButton(f"{pg+1}/{tp}",callback_data="noop"))
-    if pg<tp-1: nav.append(types.InlineKeyboardButton("▶️",callback_data=f"ap:{pg+1}"))
-    if nav: kb.row(*nav)
-    kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb,pg,tp
-def bbpk(uk):
-    u=lu().get(uk,{}); m=u.get('mode','normal')
-    kb=types.InlineKeyboardMarkup(row_width=2)
-    if u.get('is_bot'):
-        kb.add(types.InlineKeyboardButton("🔧 Режим" if m!='service' else "🔓 Режим",callback_data=f"mode:{uk}"))
-        kb.add(types.InlineKeyboardButton("🚫 Кик",callback_data=f"confirm:kick:{uk}:yes"))
-    kb.add(types.InlineKeyboardButton("🔙 Назад",callback_data="menu:all")); return kb
-def confirm_kb(a):
-    kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("✅ Да",callback_data=f"confirm:{a}:yes"),types.InlineKeyboardButton("❌ Нет",callback_data=f"confirm:{a}:no")); return kb
 def build_api_text():
-    u=get_url() or f"http://{LIP}:{PORT}"
-    return f"{ui_header('API','🖥')}\n⏱ <code>{fmt_duration(time.time()-BOT_START)}</code>\n{ui_row('URL',u)}\n{ui_row('Пароль',PASSWORD)}\n{ui_row('Порт',PORT)}\n📡 @capscraft_relay\n🌐 {get_tunnel_status_text()}"
-def show_paste_profile(c,idx):
-    ps=lp()
-    if idx<0 or idx>=len(ps): return
-    p=ps[idx]; c_=dec(p['content'])
-    if not c_: return
-    kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🗑 Удалить",callback_data=f"confirm:del:{idx}:yes"),types.InlineKeyboardButton("🔙",callback_data="menu:past"))
-    try: bot.edit_message_text(f"{ui_header(p['name'],'📄')}\n{ui_row('Размер',f'{len(c_)} байт')}",c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
-    except: pass
-    try:
-        fo=io.BytesIO(c_.encode()); fo.name=f"{p['name']}.txt"
-        bot.send_document(c.message.chat.id,fo,caption=f"📄 {p['name']}")
-    except: pass
+    u=tunnel() or f"http://{LIP}:{PORT}"
+    return f"{ui_header('API','🖥')}\n{ui_row('URL',u)}\n{ui_row('Пароль',PASSWORD)}\n{ui_row('Порт',PORT)}\n🌐 {get_tunnel_status_text()}"
 
-# ===================== HANDLERS =====================
+# ===================== HANDLERS (сокращённо, как в v17.21) =====================
 @bot.message_handler(commands=['start'])
 def c_start(m):
     u=m.from_user.id; auto_reg(u); unreg_status(m.chat.id)
@@ -558,7 +583,7 @@ def c_start(m):
         sets(u,{'step':'wp','username':m.from_user.username or str(u),'is_bot':m.from_user.is_bot})
         bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','👋')}\n🔐 Пароль:",parse_mode='HTML')
     else:
-        bot.send_message(m.chat.id,f"{ui_header('С возвращением','🚀')}\n👤 <b>{safe(dn(u))}</b>\n{ui_row('Роль',role(u))}\n\n /menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
+        bot.send_message(m.chat.id,f"{ui_header('С возвращением','🚀')}\n👤 <b>{safe(dn(u))}</b>\n\n/menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
 @bot.message_handler(commands=['menu'])
 def c_menu(m):
     if not reg(m.from_user.id): return bot.send_message(m.chat.id,"/start")
@@ -577,20 +602,13 @@ def c_status(m):
 @bot.message_handler(commands=['api'])
 def c_api(m):
     if not ia(m.from_user.id): return bot.send_message(m.chat.id,"❌")
-    kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🔄 Рестарт туннеля",callback_data="reload_tunnel"))
+    kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔄 Рестарт туннеля",callback_data="reload_tunnel"))
     bot.send_message(m.chat.id,build_api_text(),parse_mode='HTML',reply_markup=kb)
 @bot.message_handler(commands=['api_reload'])
 def c_api_reload(m):
     if not ia(m.from_user.id): return bot.send_message(m.chat.id,"❌")
-    threading.Thread(target=lambda: force_reload(),daemon=True).start()
+    threading.Thread(target=lambda: force_reload_tunnel("tg"),daemon=True).start()
     bot.send_message(m.chat.id,"🔄 Перезагрузка туннеля...",parse_mode='HTML')
-def force_reload():
-    global tunnel_process
-    with tunnel_lock:
-        if tunnel_process:
-            try: tunnel_process.kill()
-            except: pass
 @bot.message_handler(commands=['log'])
 def c_log(m):
     if not ia(m.from_user.id): return bot.send_message(m.chat.id,"❌")
@@ -605,56 +623,44 @@ def c_log_clear(m):
 def c_past(m):
     if not reg(m.from_user.id): return
     a=m.text.split()[1:]
-    if not a:
-        kb,_,_=bpk(lp(),0); return bot.send_message(m.chat.id,"📋 Пасты",reply_markup=kb)
+    if not a: return bot.send_message(m.chat.id,f"📋 Пасты ({len(lp())})")
     s=a[0].lower()
     if s=='add' and len(a)>=3:
         n=tr(a[1],MAX_PN).lower(); c=' '.join(a[2:])
         ps=lp(); ps.append({'name':n,'content':enc(c),'hash':chash(c),'cid':m.from_user.id,'cn':dn(m.from_user.id)}); sp(ps)
         bot.send_message(m.chat.id,f"✅ <code>{safe(n)}</code>")
-    elif s=='add' and len(a)==2:
-        sets(m.from_user.id,{'step':'addw','paste_name':tr(a[1],MAX_PN).lower()})
-        bot.send_message(m.chat.id,"📄 текст/файл или /cancel")
-    elif s=='edit' and len(a)>=2:
-        i,p=find_paste(a[1],lp())
-        if i is not None:
-            sets(m.from_user.id,{'step':'editw','idx':i}); bot.send_message(m.chat.id,"✏️ текст/файл или /cancel")
     elif s=='delete' and len(a)>=2:
-        i,p=find_paste(a[1],lp())
-        if i is not None: bot.send_message(m.chat.id,f"⚠️ Удалить <code>{safe(p['name'])}</code>?",reply_markup=confirm_kb(f"del:{i}"))
-@bot.message_handler(commands=['all'])
-def c_all(m):
-    if not reg(m.from_user.id): return
-    a=m.text.split()[1:]
-    if not a:
-        kb,_,_=buk(lu(),0); return bot.send_message(m.chat.id,"👥 Компьютеры",reply_markup=kb)
-    if not ia(m.from_user.id): return bot.send_message(m.chat.id,"❌")
-    s=a[0].lower(); us=lu()
-    if s=='assign' and len(a)>=3:
-        t,d=find_user(a[1],list(us.items()))
-        if t and d.get('is_bot'):
-            cp=d.get('assigned_pastes',[]); cp.append(a[2].lower()); us[t]['assigned_pastes']=cp; su(us)
-            bot.send_message(m.chat.id,f"✅ привязан <code>{safe(a[2])}</code>")
-    elif s=='kick' and len(a)>=2:
-        t,d=find_user(a[1],list(us.items()))
-        if t: bot.send_message(m.chat.id,f"⚠️ Кикнуть <code>{safe(d.get('name'))}</code>?",reply_markup=confirm_kb(f"kick:{t}"))
-def find_user(a,ul):
-    try:
-        i=int(a)-1
-        if 0<=i<len(ul): return ul[i]
-    except: pass
-    al=a.lower()
-    for t,d in ul:
-        if (d.get('name') or '').lower()==al: return t,d
-    return None,None
+        i,_=find_paste(a[1],lp())
+        if i is not None:
+            ps=lp(); ps.pop(i); sp(ps); bot.send_message(m.chat.id,"✅ Удалён")
 def find_paste(a,pl):
     try:
         i=int(a)-1
         if 0<=i<len(pl): return i,pl[i]
     except: pass
-    al=a.lower()
     for i,p in enumerate(pl):
-        if p['name'].lower()==al: return i,p
+        if p['name'].lower()==a.lower(): return i,p
+    return None,None
+@bot.message_handler(commands=['all'])
+def c_all(m):
+    if not reg(m.from_user.id): return
+    a=m.text.split()[1:]
+    if not a: return bot.send_message(m.chat.id,f"👥 ({len(lu())})")
+    if not ia(m.from_user.id): return bot.send_message(m.chat.id,"❌")
+    s=a[0].lower(); us=lu()
+    if s=='assign' and len(a)>=3:
+        t,_=find_user(a[1],us)
+        if t and us[t].get('is_bot'):
+            cp=us[t].get('assigned_pastes',[]); cp.append(a[2].lower()); us[t]['assigned_pastes']=cp; su(us)
+            bot.send_message(m.chat.id,"✅ привязан")
+    elif s=='kick' and len(a)>=2:
+        t,_=find_user(a[1],us)
+        if t:
+            if us[t].get('api_token'): rt(us[t]['api_token'],"кик")
+            us.pop(t,None); su(us); bot.send_message(m.chat.id,"🚫 кикнут")
+def find_user(a,us):
+    for t,d in us.items():
+        if (d.get('name') or '').lower()==a.lower() or t==a: return t,d
     return None,None
 
 # ===================== CALLBACK =====================
@@ -667,66 +673,25 @@ def cb(c):
         if d=="refresh:status":
             t=build_status_text()
             if t:
-                try: bot.edit_message_text(t,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard()); reg_status(c.message.chat.id,c.message.message_id)
+                try:
+                    bot.edit_message_text(t,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard()); reg_status(c.message.chat.id,c.message.message_id)
                 except: pass
             bot.answer_callback_query(c.id,"🔄"); return
         if d=="reload_tunnel":
-            if ia(c.from_user.id): threading.Thread(target=force_reload,daemon=True).start()
+            if ia(c.from_user.id): threading.Thread(target=lambda: force_reload_tunnel("btn"),daemon=True).start()
             bot.answer_callback_query(c.id,"🔄"); return
         if d.startswith("menu:"):
             s=d.split(":")[1]
-            if s=="main":
-                us=lu(); bot.edit_message_text(f"{ui_header('Меню','📱')}\n🤖 {sum(1 for u in us.values() if u.get('is_bot'))} | 📄 {len(lp())}",c.message.chat.id,c.message.message_id,reply_markup=main_menu_keyboard(c.from_user.id))
-            elif s=="past":
-                kb,_,_=bpk(lp(),0); bot.edit_message_text("📋 Пасты",c.message.chat.id,c.message.message_id,reply_markup=kb)
-            elif s=="all":
-                kb,_,_=buk(lu(),0); bot.edit_message_text("👥 Компьютеры",c.message.chat.id,c.message.message_id,reply_markup=kb)
+            if s=="main": bot.edit_message_text("📱 Меню",c.message.chat.id,c.message.message_id,reply_markup=main_menu_keyboard(c.from_user.id))
             elif s=="status":
                 t=build_status_text()
-                if t: bot.edit_message_text(t,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard()); reg_status(c.message.chat.id,c.message.message_id)
+                if t:
+                    bot.edit_message_text(t,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard()); reg_status(c.message.chat.id,c.message.message_id)
             elif s=="api":
-                kb=types.InlineKeyboardMarkup(row_width=2); kb.add(types.InlineKeyboardButton("🔄 Рестарт",callback_data="reload_tunnel"))
+                kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔄 Рестарт",callback_data="reload_tunnel"))
                 bot.edit_message_text(build_api_text(),c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
             elif s=="help": bot.edit_message_text(build_help_text(),c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=back_kb())
             bot.answer_callback_query(c.id); return
-        if d.startswith("pp:"):
-            kb,_,_=bpk(lp(),int(d.split(":")[1])); bot.edit_message_reply_markup(c.message.chat.id,c.message.message_id,reply_markup=kb); bot.answer_callback_query(c.id); return
-        if d.startswith("ap:"):
-            kb,_,_=buk(lu(),int(d.split(":")[1])); bot.edit_message_reply_markup(c.message.chat.id,c.message.message_id,reply_markup=kb); bot.answer_callback_query(c.id); return
-        if d.startswith("pv:"): show_paste_profile(c,int(d.split(":")[1])); bot.answer_callback_query(c.id); return
-        if d.startswith("av:"):
-            uk=d.split(":")[1]; u=lu().get(uk,{})
-            kb=bbpk(uk)
-            hb=lhb(); ci=u.get('computer_id'); ht="❓"
-            if ci and ci in hb:
-                try:
-                    lm=int((datetime.now(MSK)-datetime.fromisoformat(hb[ci]['last_seen'])).total_seconds()/60)
-                    ht="🟢" if lm<2 else f"🔴{lm}м"
-                except: pass
-            txt=f"{ui_header(u.get('name',''),'🤖')}\n{ui_row('Режим',ui_mode(u.get('mode','normal')))}\n{ui_row('Пульс',ht)}\n📋 {', '.join(u.get('assigned_pastes',[])) or 'нет'}"
-            bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
-            bot.answer_callback_query(c.id); return
-        if d.startswith("mode:"):
-            uk=d.split(":")[1]
-            if ia(c.from_user.id):
-                us=lu()
-                if uk in us and us[uk].get('is_bot'):
-                    us[uk]['mode']='service' if us[uk].get('mode')!='service' else 'normal'; su(us)
-            bot.answer_callback_query(c.id,"🔧"); return
-        if d.startswith("confirm:"):
-            p=d.split(":"); a=p[-1]; aid=":".join(p[1:-1])
-            if a!="yes": bot.answer_callback_query(c.id,"❌"); return
-            if aid.startswith("del:"):
-                i=int(aid.split(":")[1]); ps=lp()
-                if 0<=i<len(ps): ps.pop(i); sp(ps)
-                bot.answer_callback_query(c.id,"✅")
-            elif aid.startswith("kick:"):
-                t=aid.split(":")[1]; us=lu()
-                if t in us:
-                    if us[t].get('api_token'): rt(us[t]['api_token'],"кик")
-                    us.pop(t,None); su(us)
-                bot.answer_callback_query(c.id,"🚫")
-            return
         bot.answer_callback_query(c.id)
     except Exception as e:
         log(f"[CB] {e}")
@@ -737,23 +702,12 @@ def cb(c):
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def hm(m):
     u=m.from_user.id; auto_reg(u); t=m.text.strip(); s=gs(u)
-    if s:
-        stp=s.get('step')
-        if stp=='wp':
-            if t==PASSWORD:
-                us=lu(); us[str(u)]={'name':None,'username':s.get('username'),'is_bot':s.get('is_bot'),'is_admin':False}; su(us); cs(u)
-                bot.send_message(m.chat.id,"✅ доступ")
-            else: bot.send_message(m.chat.id,"❌ пароль")
-            return
-        if stp=='addw':
-            if t.lower()=='/cancel': cs(u); return
-            ps=lp(); ps.append({'name':s['paste_name'],'content':enc(t),'hash':chash(t),'cid':u,'cn':dn(u)}); sp(ps); cs(u)
-            bot.send_message(m.chat.id,f"✅ <code>{safe(s['paste_name'])}</code>"); return
-        if stp=='editw':
-            if t.lower()=='/cancel': cs(u); return
-            i=s.get('idx'); ps=lp()
-            if 0<=i<len(ps): ps[i]['content']=enc(t); sp(ps)
-            cs(u); bot.send_message(m.chat.id,"✅"); return
+    if s and s.get('step')=='wp':
+        if t==PASSWORD:
+            us=lu(); us[str(u)]={'name':None,'username':s.get('username'),'is_bot':s.get('is_bot'),'is_admin':False}
+            su(us); cs(u); bot.send_message(m.chat.id,"✅ доступ")
+        else: bot.send_message(m.chat.id,"❌ пароль")
+        return
     if t.startswith('/') and t.split()[0][1:].lower().split('@')[0] not in KNOWN:
         return bot.send_message(m.chat.id,"❓ /help")
     if not reg(u):
@@ -765,6 +719,8 @@ def hm(m):
 class TS(ThreadingMixIn,HTTPServer): daemon_threads=True; allow_reuse_address=True
 class AH(BaseHTTPRequestHandler):
     def log_message(s,f,*a):
+        global tunnel_last_activity
+        tunnel_last_activity=time.time()
         try: log(f"[API] {s.client_address[0]} {f%a}")
         except: pass
     def _j(s,c,d):
@@ -797,11 +753,12 @@ class AH(BaseHTTPRequestHandler):
         except: pass
     def _get(s):
         tok,ib,ok=s._a(); p=s.path.split('?')[0]
-        if p=='/api/health': return s._j(200,{"status":tunnel_health.get('status'),"version":"17.26"})
+        if p=='/api/health':
+            check_tunnel_health(); return s._j(200,{"status":tunnel_health.get('status'),"version":"17.24"})
         if p=='/api/reload':
-            threading.Thread(target=force_reload,daemon=True).start(); return s._j(200,{"ok":True})
+            threading.Thread(target=lambda: force_reload_tunnel("api"),daemon=True).start(); return s._j(200,{"ok":True})
         if p=='/api/url':
-            u=get_url(); return s._j(200,{"url":u}) if u else s._j(503,{"error":"no"})
+            u=tunnel(); return s._j(200,{"url":u}) if u else s._j(503,{"error":"no"})
         if p=='/api/check':
             q=dict(x.split('=') for x in (s.path.split('?')[1].split('&') if '?' in s.path else []))
             pe=lpend(); pid=q.get('id','')
@@ -821,7 +778,7 @@ class AH(BaseHTTPRequestHandler):
         if p.startswith('/api/paste/'):
             n=unquote(p[len('/api/paste/'):]).lower()
             if ib:
-                us=lu(); pid=ts[tok].get('pending_id')
+                us=lu(); pid=ti.get('pending_id')
                 al=[x.lower() for x in us.get(pid,{}).get('assigned_pastes',[])] if pid and pid in us else []
                 if n not in al: return s._j(403,{"error":"PANIC"})
             for x in lp():
@@ -839,8 +796,6 @@ class AH(BaseHTTPRequestHandler):
             try:
                 process_player_data(json.loads(b) if b else {}); return s._j(200,{"ok":True})
             except Exception as e: return s._j(500,{"error":str(e)})
-        if p=='/api/reload':
-            threading.Thread(target=force_reload,daemon=True).start(); return s._j(200,{"ok":True})
         if p=='/api/login':
             try: d=json.loads(b) if b else {}
             except: d={}
@@ -852,32 +807,32 @@ class AH(BaseHTTPRequestHandler):
             pid,ft=str(uuid.uuid4()),str(uuid.uuid4())
             pe=lpend(); pe[pid]={'token':ft,'name':d.get('name'),'computer_id':lci,'status':'pending'}; spend(pe)
             ts[ft]={'name':d.get('name'),'computer_id':lci,'is_computer':True,'pending_id':pid}; st(ts)
-            us[pid]={'name':d.get('name'),'computer_id':lci,'is_bot':True,'is_admin':False,'mode':'normal','assigned_pastes':[],'api_token':ft,'heartbeat_interval':30,'registered_at':datetime.now(MSK).isoformat()}; su(us)
-            pe[pid]['status']='approved'; spend(pe)
+            us[pid]={'name':d.get('name'),'computer_id':lci,'is_bot':True,'is_admin':False,'mode':'normal','assigned_pastes':[],'api_token':ft,'heartbeat_interval':30,'registered_at':datetime.now(MSK).isoformat()}
+            su(us); pe[pid]['status']='approved'; spend(pe)
             return s._j(200,{"ok":True,"status":"approved","token":ft})
         if p=='/api/heartbeat':
             if not ib: return s._j(403,{"error":"no"})
-            cv=ts[tok].get('computer_id')
+            cv=ti.get('computer_id')
             if not cv: return s._j(400,{"error":"cid"})
             try: d=json.loads(b) if b else {}
             except: d={}
-            hb=lhb(); hb[cv]={'last_seen':datetime.now(MSK).isoformat(),'name':ts[tok].get('name'),'mode':d.get('mode')}; shb(hb)
-            return s._j(200,{"ok":True})
+            hb=lhb(); hb[cv]={'last_seen':datetime.now(MSK).isoformat(),'name':ti.get('name'),'mode':d.get('mode')}
+            shb(hb); return s._j(200,{"ok":True})
         s._j(404,{"error":"no"})
 def start_api():
     while True:
         try:
             srv=TS(('0.0.0.0',PORT),AH); srv.timeout=5
-            log(f"[API] Ready v17.26 on {PORT}"); srv.serve_forever()
+            log(f"[API] Ready v17.24 on {PORT}"); srv.serve_forever()
         except OSError:
             os.system(f"fuser -k {PORT}/tcp 2>/dev/null"); time.sleep(2)
         except: time.sleep(5)
 
 def main():
-    log("Starting bot v17.26 (beautiful UI + mobile + survivability)...")
+    log("Starting bot v17.24 (mobile 5G + survivability)...")
     load_online_tracking()
     threading.Thread(target=start_tunnel,daemon=True).start()
-    threading.Thread(target=tunnel_watchdog,daemon=True).start()
+    threading.Thread(target=tunnel_watchdog_loop,daemon=True).start()
     time.sleep(2)
     threading.Thread(target=start_api,daemon=True).start()
     threading.Thread(target=site_checker_loop,daemon=True).start()
