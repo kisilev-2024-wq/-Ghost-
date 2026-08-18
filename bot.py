@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.23 — SSH + cloudflared failover + all fixes"""
+"""Bot v17.24 — zero-trust + self-healing + exponential retries + internal watcher"""
 import sys
 import os
 import io
@@ -61,6 +61,15 @@ BOT_START = time.time()
 TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 RATE_LIMIT_WINDOW = 60
 MAX_LOGIN_ATTEMPTS = 5
+
+# ============================================
+# НОВОЕ v17.24: внутренние константы живучести
+# ============================================
+GRACE_PERIOD = 180  # секунд до принудительного восстановления
+MAX_TUNNEL_RETRY = 60  # макс задержка между ретраями туннеля (сек)
+_last_health_check = time.time()
+_telegram_ok = False
+_tunnel_ok = False
 
 active_status_messages = {}
 active_status_lock = threading.Lock()
@@ -176,7 +185,7 @@ def get_last_log_lines(max_lines=5000, max_bytes=900_000):
         if size <= max_bytes:
             with open(RUNTIME_LOG, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
-        with open(RUNNEL_LOG, 'rb') if False else open(RUNTIME_LOG, 'rb') as f:
+        with open(RUNTIME_LOG, 'rb') as f:
             f.seek(0, 2)
             end = f.tell()
             start = max(0, end - max_bytes)
@@ -272,12 +281,12 @@ def log_failed_login(key, reason):
         pass
 
 # ============================================
-# TUNNEL (SSH + CLOUDFLARED FAILOVER)
+# TUNNEL (SSH + CLOUDFLARED FAILOVER + EXPONENTIAL RETRIES)
 # ============================================
 tunnel_process = None
 cloudflared_process = None
 current_tunnel_url = None
-tunnel_type = None  # 'ssh' or 'cloudflared'
+tunnel_type = None
 tunnel_last_activity = time.time()
 
 def load_tunnel_state():
@@ -298,7 +307,7 @@ def save_tunnel_state(s):
 
 def post_url_to_channel(url, reason="new", ttype="ssh", retries=5):
     now = datetime.now(MSK).strftime('%H:%M:%S')
-    emoji = "🔵" if ttype == "cloudflared" else "🔴"
+    emoji = "☁️" if ttype == "cloudflared" else "🔴"
     msg = (f"🔄 <b>Туннель {'обновлён' if reason == 'new' else 'переподключён'}</b> {emoji}\n\n"
            f"🌐 <code>{url}</code>\n"
            f"🔧 Тип: <code>{ttype}</code>\n\n"
@@ -344,7 +353,6 @@ def _flush_pending_posts():
         pass
 
 def check_ssh_available(host="localhost.run", port=22, timeout=5):
-    """Проверяет доступен ли SSH порт"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -355,11 +363,9 @@ def check_ssh_available(host="localhost.run", port=22, timeout=5):
         return False
 
 def cloudflared_available():
-    """Проверяет установлен ли cloudflared"""
     return CLOUDFLARED_BIN.exists() and os.access(str(CLOUDFLARED_BIN), os.X_OK)
 
 def start_cloudflared():
-    """Запускает cloudflared туннель"""
     global cloudflared_process, current_tunnel_url, tunnel_type, tunnel_last_activity
     if not cloudflared_available():
         print("[Tunnel] cloudflared binary not found at " + str(CLOUDFLARED_BIN), flush=True)
@@ -373,7 +379,6 @@ def start_cloudflared():
         with tunnel_lock:
             cloudflared_process = p
             tunnel_type = 'cloudflared'
-        # читаем вывод и ищем URL
         url_found = False
         for line in iter(p.stdout.readline, ''):
             line = line.strip()
@@ -381,7 +386,6 @@ def start_cloudflared():
                 continue
             print(f"[Cloudflared] {line}", flush=True)
             tunnel_last_activity = time.time()
-            # ищем URL типа https://xxx.trycloudflare.com
             m = re.search(r'(https://[a-z0-9-]+\.trycloudflare\.com)', line)
             if m:
                 nu = m.group(1)
@@ -402,11 +406,18 @@ def start_cloudflared():
                 break
             if "failed" in line.lower() or "error" in line.lower():
                 print(f"[Tunnel] cloudflared error: {line}", flush=True)
+                try:
+                    p.terminate()
+                except:
+                    pass
                 return False
         if not url_found:
-            print("[Tunnel] cloudflared: URL не найден в выводе", flush=True)
+            print("[Tunnel] cloudflared: URL не найден", flush=True)
+            try:
+                p.terminate()
+            except:
+                pass
             return False
-        # держим процесс живым
         p.wait()
         return True
     except Exception as e:
@@ -414,7 +425,6 @@ def start_cloudflared():
         return False
 
 def start_ssh_tunnel():
-    """Запускает SSH туннель (localhost.run)"""
     global tunnel_process, current_tunnel_url, tunnel_type, tunnel_last_activity
     if subprocess.run("which ssh", shell=True, capture_output=True).returncode != 0:
         os.system("pkg install -y openssh 2>&1 | tail -3")
@@ -459,35 +469,42 @@ def start_ssh_tunnel():
                         fails = 0
             p.wait()
             fails += 1
-            wait = min(1 + fails, 10)
-            print(f"[Tunnel] SSH упал (fail #{fails}), рестарт через {wait}с...", flush=True)
+            # НОВОЕ v17.24: экспоненциальные ретраи
+            wait = min(2 ** min(fails, 5), MAX_TUNNEL_RETRY)
+            print(f"[Tunnel] SSH упал (fail #{fails}), ретрай через {wait}с...", flush=True)
             time.sleep(wait)
         except Exception as e:
             print(f"[Tunnel] SSH err: {e}", flush=True)
             fails += 1
-            time.sleep(2)
+            wait = min(2 ** min(fails, 5), MAX_TUNNEL_RETRY)
+            time.sleep(wait)
 
 def start_tunnel():
-    """Главная функция туннеля: пробует SSH, если не работает — cloudflared"""
     global tunnel_type
+    cloudflared_fail_count = 0
     st_state = load_tunnel_state()
     if st_state.get('last_url'):
         with tunnel_lock:
             current_tunnel_url = st_state['last_url']
 
-    # Если принудительно включён cloudflared
     if FORCE_CLOUDFLARED:
-        print("[Tunnel] force_cloudflared=true в config, использую только cloudflared", flush=True)
+        print("[Tunnel] force_cloudflared=true, использую только cloudflared", flush=True)
         if cloudflared_available():
             while True:
-                start_cloudflared()
-                time.sleep(5)
+                ok = start_cloudflared()
+                if not ok:
+                    cloudflared_fail_count += 1
+                    wait = min(2 ** min(cloudflared_fail_count, 5), MAX_TUNNEL_RETRY)
+                    print(f"[Tunnel] cloudflared упал (fail #{cloudflared_fail_count}), ретрай через {wait}с...", flush=True)
+                    time.sleep(wait)
+                else:
+                    cloudflared_fail_count = 0
+                    time.sleep(5)
         else:
             print("[Tunnel] cloudflared не установлен, падаем на SSH", flush=True)
         start_ssh_tunnel()
         return
 
-    # Проверяем доступность SSH
     print("[Tunnel] проверка доступности SSH порта...", flush=True)
     ssh_ok = check_ssh_available()
     cf_ok = cloudflared_available()
@@ -498,11 +515,17 @@ def start_tunnel():
     elif cf_ok:
         print("[Tunnel] ✗ SSH недоступен, переключаюсь на cloudflared", flush=True)
         while True:
-            start_cloudflared()
-            time.sleep(5)
+            ok = start_cloudflared()
+            if not ok:
+                cloudflared_fail_count += 1
+                wait = min(2 ** min(cloudflared_fail_count, 5), MAX_TUNNEL_RETRY)
+                print(f"[Tunnel] cloudflared упал (fail #{cloudflared_fail_count}), ретрай через {wait}с...", flush=True)
+                time.sleep(wait)
+            else:
+                cloudflared_fail_count = 0
+                time.sleep(5)
     else:
         print("[Tunnel] ❌ Ни SSH ни cloudflared не доступны!", flush=True)
-        print("[Tunnel] Запусти: cd ~/telegram-bot && ./cloudflared --version", flush=True)
 
 def force_reload_tunnel(reason="manual"):
     global tunnel_last_activity, tunnel_process, cloudflared_process
@@ -752,9 +775,6 @@ def validate_hb_interval(sec):
         return 3600
     return sec
 
-# ============================================
-# TRUSTED PLAYERS
-# ============================================
 _trusted_cache = {}
 _trusted_cache_lock = threading.Lock()
 
@@ -790,9 +810,6 @@ def auto_register_trusted(uid):
         _trusted_cache[uid] = True
     return True
 
-# ============================================
-# ONLINE TRACKING
-# ============================================
 player_online_since = {}
 server_online_since = None
 
@@ -816,9 +833,6 @@ def save_online_tracking():
 def get_online_since(n):
     return player_online_since.get(n) or player_online_since.get(n.lower())
 
-# ============================================
-# FINDERS
-# ============================================
 def find_user_by_arg(arg, ul):
     try:
         i = int(arg) - 1
@@ -851,9 +865,6 @@ def find_paste_by_arg(arg, pl):
             return i, p
     return None, None
 
-# ============================================
-# UI HELPERS
-# ============================================
 def edit_or_send(c, t, kb=None, pm='HTML'):
     if hasattr(c, 'message') and c.message:
         try:
@@ -952,9 +963,6 @@ def na(m):
         except:
             pass
 
-# ============================================
-# PLAYER TRACKING
-# ============================================
 player_positions = {}
 player_zones = {}
 player_last_seen = {}
@@ -1188,9 +1196,6 @@ def vanish_checker_loop():
             print(f"[VanishChecker] err: {e}", flush=True)
         time.sleep(5)
 
-# ============================================
-# TUNNEL HEALTH
-# ============================================
 tunnel_health = {
     'status': 'unknown', 'url': None, 'type': None, 'last_check': None,
     'last_ok': None, 'errors': [], 'checks_total': 0,
@@ -1301,8 +1306,72 @@ def update_url_from_log():
     return None
 
 # ============================================
-# SITE
+# НОВОЕ v17.24: внутренняя проверка здоровья
 # ============================================
+def check_bot_health():
+    """Проверяет что Telegram API и туннель работают"""
+    global _telegram_ok, _tunnel_ok, _last_health_check
+    
+    # Проверка Telegram API
+    try:
+        bot.get_me()
+        _telegram_ok = True
+    except Exception as e:
+        _telegram_ok = False
+        print(f"[Health] Telegram API error: {str(e)[:100]}", flush=True)
+    
+    # Проверка туннеля
+    try:
+        url = tunnel()
+        if url:
+            headers = {'bypass-tunnel-reminder': 'true', 'User-Agent': 'HealthCheck/1.0'}
+            req = urllib.request.Request(f'{url}/api/url', headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                _tunnel_ok = r.status == 200
+        else:
+            _tunnel_ok = False
+    except Exception as e:
+        _tunnel_ok = False
+        print(f"[Health] Tunnel error: {str(e)[:100]}", flush=True)
+    
+    if _telegram_ok and _tunnel_ok:
+        _last_health_check = time.time()
+    
+    return _telegram_ok and _tunnel_ok
+
+def internal_watcher_loop():
+    """Внутренний watcher - мониторит здоровье бота"""
+    print(f"[InternalWatcher] started (grace={GRACE_PERIOD}s)", flush=True)
+    consecutive_fails = 0
+    
+    while True:
+        try:
+            time.sleep(30)
+            
+            healthy = check_bot_health()
+            
+            if healthy:
+                consecutive_fails = 0
+            else:
+                consecutive_fails += 1
+                elapsed = time.time() - _last_health_check
+                
+                print(f"[InternalWatcher] Health check failed ({consecutive_fails}x), "
+                      f"telegram={_telegram_ok}, tunnel={_tunnel_ok}, "
+                      f"elapsed={elapsed:.0f}s", flush=True)
+                
+                # Если прошло больше grace period - перезапуск туннеля
+                if elapsed > GRACE_PERIOD:
+                    print(f"[InternalWatcher] ⚠️ Grace period ({GRACE_PERIOD}s) exceeded, "
+                          f"reloading tunnel...", flush=True)
+                    force_reload_tunnel("internal_watcher")
+                    _last_health_check = time.time()
+                    consecutive_fails = 0
+        
+        except Exception as e:
+            print(f"[InternalWatcher] Error: {e}", flush=True)
+            time.sleep(10)
+
 def parse_site_status():
     global server_online_since
     try:
@@ -1474,11 +1543,8 @@ def get_radar_stats():
         offline += 1
     return total, online, offline
 
-# ============================================
-# UI BUILDERS
-# ============================================
 def build_help_text():
-    return (f"{ui_header('Справка v17.23', '📖')}\n\n"
+    return (f"{ui_header('Справка v17.24', '📖')}\n\n"
             f"<b>🚀 Основные команды:</b>\n"
             f"<code>/start</code> — Запуск\n"
             f"<code>/menu</code> — Меню\n"
@@ -1612,9 +1678,6 @@ def unregister_status_messages(chat_id):
     with active_status_lock:
         active_status_messages.pop(chat_id, None)
 
-# ============================================
-# KEYBOARDS
-# ============================================
 def main_menu_keyboard(uid):
     u = lu().get(str(uid), {})
     em = "✅" if u.get('vanish_tracking') else "❌"
@@ -1773,9 +1836,6 @@ def show_paste_profile(c, idx):
             bot.send_message(c.chat.id, txt, parse_mode='HTML', reply_markup=kb)
     send_paste_file(c.message.chat.id if c.message else c.chat.id, c_, p['name'], c.from_user.id)
 
-# ============================================
-# COMMANDS SETUP
-# ============================================
 PUBLIC_COMMANDS = [
     types.BotCommand("start", "🚀 Пуск"),
     types.BotCommand("menu", "📱 Меню"),
@@ -2316,9 +2376,6 @@ def uan(pid, by, act):
         except:
             pass
 
-# ============================================
-# FILES
-# ============================================
 @bot.message_handler(content_types=['document'])
 def handle_document(m):
     if not reg(m.from_user.id):
@@ -2393,9 +2450,6 @@ def handle_document(m):
                          f"{ui_row('Имя', ps[idx]['name'])}",
                          parse_mode='HTML')
 
-# ============================================
-# CALLBACK
-# ============================================
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
     try:
@@ -2806,9 +2860,6 @@ def sbp(cid, mid, uk):
     except:
         bot.send_message(cid, txt, parse_mode='HTML', reply_markup=bbpk(uk))
 
-# ============================================
-# TEXT
-# ============================================
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def hm(m):
     u = m.from_user.id
@@ -2846,7 +2897,6 @@ def hm(m):
         if stp == 'wn':
             n = tr(t, MAX_N)
             us = lu()
-            # ИСПРАВЛЕНО v17.22: правильный доступ к .lower()
             if n.lower() in [x.get('name','').lower() for x in us.values() if x.get('name')]:
                 bot.send_message(m.chat.id, "⚠️ Имя занято")
                 return
@@ -2989,9 +3039,6 @@ def hm(m):
         return
     bot.send_message(m.chat.id, "💡 <b>Меню</b>\n\n/menu", parse_mode='HTML', reply_markup=main_menu_keyboard(u))
 
-# ============================================
-# HTTP API
-# ============================================
 class TS(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -3101,7 +3148,7 @@ class AH(BaseHTTPRequestHandler):
                 pass
             with tunnel_health_lock:
                 h = dict(tunnel_health)
-            h.update(bot_status='running', bot_version='17.23',
+            h.update(bot_status='running', bot_version='17.24',
                      bot_uptime_sec=bot_uptime_sec(),
                      bot_uptime=fmt_duration(bot_uptime_sec()),
                      server_uptime_sec=int(time.time() - server_online_since) if server_online_since else 0,
@@ -3493,7 +3540,7 @@ def start_api():
             print(f"[API] Starting on {PORT}...", flush=True)
             srv = TS(('0.0.0.0', PORT), AH)
             srv.timeout = 5
-            print("[API] Ready v17.23", flush=True)
+            print("[API] Ready v17.24", flush=True)
             srv.serve_forever()
         except OSError as e:
             if e.errno == 98:
@@ -3512,7 +3559,7 @@ def start_api():
                     pass
 
 def main():
-    print("Starting bot v17.23 (SSH + cloudflared failover + all fixes)...", flush=True)
+    print("Starting bot v17.24 (zero-trust + self-healing + exponential retries)...", flush=True)
     load_online_tracking()
     update_url_from_log()
     threading.Thread(target=start_tunnel, daemon=True).start()
@@ -3524,6 +3571,7 @@ def main():
     threading.Thread(target=tunnel_health_loop, daemon=True).start()
     threading.Thread(target=vanish_checker_loop, daemon=True).start()
     threading.Thread(target=status_auto_refresh_loop, daemon=True).start()
+    threading.Thread(target=internal_watcher_loop, daemon=True).start()  # НОВОЕ v17.24
     threading.Thread(target=lambda: (time.sleep(5), update_command_menus()), daemon=True).start()
     print("Bot ready! Relay: @capscraft_relay", flush=True)
     try:
