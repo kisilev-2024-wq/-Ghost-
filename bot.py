@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.25 — full fixes: POST reload, cloudflared failover, dead_chats, vanish"""
-import sys,os,io,json,base64,socket,threading,time,uuid,hashlib,re,subprocess,platform
-import html as html_lib,urllib.request
+"""Bot v17.27 — FULL cool UI + correct capscraft parse + 5G (SSH+cloudflared) + survivability"""
+import sys, os, io, json, base64, socket, threading, time, uuid, hashlib, re, subprocess
+import html as html_lib, urllib.request
 from urllib.parse import unquote
-from http.server import HTTPServer,BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
-from datetime import datetime,timezone,timedelta
+from datetime import datetime, timezone, timedelta
 import telebot
 from telebot import types
 
 CHANNEL_ID=-1004388932854; CHANNEL_USERNAME="capscraft_relay"
 BASE=Path.home()/"telegram-bot"; BASE.mkdir(parents=True,exist_ok=True)
 CFG=BASE/"config.json"; USERS=BASE/"users.json"; PASTES=BASE/"pastes.json"
-STATES=BASE/"user_states.json"; TOKENS=BASE/"api_tokens.json"
-PENDING=BASE/"pending_tokens.json"; TUNNEL=BASE/"tunnel_url.txt"
-HB=BASE/"heartbeats.json"; SITE_STATUS_FILE=BASE/"site_status.json"
+STATES=BASE/"user_states.json"; TOKENS=BASE/"api_tokens.json"; PENDING=BASE/"pending_tokens.json"
+TUNNEL=BASE/"tunnel_url.txt"; HB=BASE/"heartbeats.json"; SITE_STATUS_FILE=BASE/"site_status.json"
 TUNNEL_HEALTH_FILE=BASE/"tunnel_health.json"; TUNNEL_STATE_FILE=BASE/"tunnel_state.json"
 ONLINE_TRACK_FILE=BASE/"online_tracking.json"; FALLBACK_URL_FILE=BASE/"pending_url_post.txt"
-RUNTIME_LOG=BASE/"runtime.log"; LOGIN_ATTEMPTS_FILE=BASE/"login_attempts.json"
-PLAYERS_DIR=BASE/"players"; PLAYERS_DIR.mkdir(exist_ok=True); LOCATIONS_FILE=BASE/"locations.json"
-CLOUDFLARED_BIN=BASE/"cloudflared"
+RUNTIME_LOG=BASE/"runtime.log"; PLAYERS_DIR=BASE/"players"; PLAYERS_DIR.mkdir(exist_ok=True)
+LOCATIONS_FILE=BASE/"locations.json"; CLOUDFLARED_BIN=BASE/"cloudflared"
 KNOWN={'start','help','past','all','api','api_reload','log','log_clear','status','menu'}
 SITE_URL="https://gmd.capscraft.com"; FRIEND_SERVER_IP="185.26.120.251"
 TRUSTED_PLAYERS={"5183248850":"Gishta1","5602435561":"Rainy42","5370523250":"FFFFFFFFF12324"}
@@ -30,16 +28,18 @@ MAX_CONTENT_LENGTH=10*1024*1024; MAX_HISTORY=10000; VANISH_GRACE=30; VANISH_NOTI
 MSK=timezone(timedelta(hours=3)); BOT_START=time.time()
 active_status_messages={}; active_status_lock=threading.Lock(); STATUS_REFRESH_INTERVAL=5
 dead_chats=set()
+
 try: cfg=json.load(open(CFG))
 except Exception as e: print(f"FATAL: config: {e}",flush=True); sys.exit(106)
 BOT_TOKEN=cfg.get("bot_token","")
 if not BOT_TOKEN or BOT_TOKEN=="YOUR_BOT_TOKEN_HERE": sys.exit(107)
 PASSWORD=cfg.get("password","")
-KEY=cfg.get("encryption_key","").encode()
-PROTECTED=set(cfg.get("protected_users",[])); TECH=cfg.get("tech_name","FFFFFFFFF12324")
+KEY=cfg.get("encryption_key","default").encode()
+PROTECTED=set(cfg.get("protected_users",[]))
 MAX_N=cfg.get("max_name_length",12); MAX_PN=cfg.get("max_paste_name_length",20)
 PER=cfg.get("items_per_page",5); PORT=cfg.get("api_port",8080)
 API_EN=cfg.get("api_enabled",True); PROXY=cfg.get("proxy_url")
+
 def lip():
     try:
         s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); ip=s.getsockname()[0]; s.close(); return ip
@@ -74,7 +74,7 @@ def get_last_log_lines(max_lines=5000,max_bytes=900_000):
         size=RUNTIME_LOG.stat().st_size
         if size<=max_bytes:
             with open(RUNTIME_LOG,'r',encoding='utf-8',errors='ignore') as f: return f.read()
-        with open(RUNNEL_LOG if False else RUNTIME_LOG,'rb') as f:
+        with open(RUNTIME_LOG,'rb') as f:
             f.seek(0,2); end=f.tell(); start=max(0,end-max_bytes); f.seek(start)
             if start>0: f.readline()
             chunk=f.read().decode('utf-8',errors='ignore')
@@ -92,7 +92,10 @@ def clear_log():
             with open(RUNTIME_LOG,'w',encoding='utf-8') as f: f.write(f"[{datetime.now().isoformat()}] Log cleared by admin\n")
     except: pass
 
-tunnel_process=None; cloudflared_process=None; current_tunnel_url=None; tunnel_lock=threading.Lock(); tunnel_last_activity=time.time()
+# ================= ТУННЕЛЬ: SSH + CLOUDFLARED (5G) + ЖИВУЧЕСТЬ =================
+tunnel_process=None; cloudflared_process=None; current_tunnel_url=None
+tunnel_lock=threading.Lock(); tunnel_last_activity=time.time(); tunnel_type=None
+
 def load_tunnel_state():
     try:
         if TUNNEL_STATE_FILE.exists():
@@ -103,57 +106,51 @@ def save_tunnel_state(s):
     try:
         with open(TUNNEL_STATE_FILE,'w',encoding='utf-8') as f: json.dump(s,f,indent=2)
     except: pass
-def post_url_to_channel(url,reason="new",ttype="ssh",retries=5):
+def post_url_to_channel(url,reason="new",retries=5):
     now=datetime.now(MSK).strftime('%H:%M:%S')
-    msg=(f"🔄 <b>Туннель {'обновлён' if reason=='new' else 'переподключён'}</b> ({ttype})\n\n🌐 <code>{url}</code>\n\n⏰ {now}\n📡 <code>t.me/s/{CHANNEL_USERNAME}</code>")
+    msg=(f"🔄 <b>Туннель {'обновлён' if reason=='new' else 'переподключён'}</b>\n\n🌐 <code>{url}</code>\n\n⏰ {now}\n📡 <code>t.me/s/{CHANNEL_USERNAME}</code>")
     for a in range(retries):
         try:
-            bot.send_message(CHANNEL_ID,msg,parse_mode='HTML',disable_web_page_preview=True); _flush_pending_posts(); return True
-        except Exception as e: time.sleep(3)
+            bot.send_message(CHANNEL_ID,msg,parse_mode='HTML',disable_web_page_preview=True)
+            print(f"[Tunnel] ✓ канал: {url}",flush=True); _flush_pending_posts(); return True
+        except Exception as e:
+            print(f"[Tunnel] пост attempt {a+1}/{retries}: {e}",flush=True); time.sleep(3)
     try:
-        with open(FALLBACK_URL_FILE,'a',encoding='utf-8') as f: f.write(f"{now}|{url}|{reason}|{ttype}\n")
+        with open(FALLBACK_URL_FILE,'a',encoding='utf-8') as f: f.write(f"{now}|{url}|{reason}\n")
     except: pass
     return False
 def _flush_pending_posts():
     if not FALLBACK_URL_FILE.exists(): return
     try:
-        with open(FALLBACK_URL_FILE,'r',encoding='utf-8') as f: lines=f.read().strip().split('\n')
-        with open(FALLBACK_URL_FILE,'w',encoding='utf-8') as f: f.write('')
+        lines=FALLBACK_URL_FILE.read_text().strip().split('\n'); FALLBACK_URL_FILE.write_text('')
         for line in lines:
             if not line.strip(): continue
-            try:
-                parts=line.split('|',3)
-                if len(parts)>=2:
-                    bot.send_message(CHANNEL_ID,f"📬 <b>Отложенный URL</b>\n\n🌐 <code>{parts[1]}</code>",parse_mode='HTML',disable_web_page_preview=True)
-            except: pass
+            parts=line.split('|',2)
+            if len(parts)>=2:
+                bot.send_message(CHANNEL_ID,f"📬 <b>Отложенный URL</b>\n\n🌐 <code>{parts[1]}</code>",parse_mode='HTML',disable_web_page_preview=True)
     except: pass
 
-def ssh_port_open(host="localhost.run",port=22,timeout=5):
-    try:
-        s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(timeout); s.connect((host,port)); s.close(); return True
-    except: return False
 def ensure_cloudflared():
     try:
         if CLOUDFLARED_BIN.exists() and os.access(str(CLOUDFLARED_BIN),os.X_OK): return True
-        m=platform.machine().lower()
-        if 'aarch64' in m or 'arm64' in m: url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-        elif 'arm' in m: url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
-        else: url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-        print("[Tunnel] скачиваю cloudflared...",flush=True)
-        for cmd in (f"curl -sL --max-time 180 -o {CLOUDFLARED_BIN} {url}",f"wget -q --timeout=180 -O {CLOUDFLARED_BIN} {url}"):
-            try:
-                if os.system(cmd)==0 and CLOUDFLARED_BIN.exists() and CLOUDFLARED_BIN.stat().st_size>1000000:
-                    os.chmod(str(CLOUDFLARED_BIN),0o755); print("[Tunnel] ✓ cloudflared установлен",flush=True); return True
-            except: pass
-        return False
-    except: return False
+        m=subprocess.run("uname -m",shell=True,capture_output=True,text=True).stdout.strip()
+        arch={'aarch64':'arm64','arm64':'arm64','armv7l':'arm','x86_64':'amd64'}.get(m,'arm64')
+        url=f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+        print(f"[Tunnel] скачиваю cloudflared ({arch})...",flush=True)
+        if os.system(f'curl -sL --max-time 180 -o {CLOUDFLARED_BIN} {url}')==0 and CLOUDFLARED_BIN.exists():
+            os.chmod(str(CLOUDFLARED_BIN),0o755); print("[Tunnel] ✓ cloudflared установлен",flush=True); return True
+    except Exception as e: print(f"[Tunnel] cloudflared install err: {e}",flush=True)
+    return False
 
 def ssh_session_once():
-    global tunnel_process,current_tunnel_url,tunnel_last_activity
+    global tunnel_process,current_tunnel_url,tunnel_type,tunnel_last_activity
     started=time.time(); p=None
     try:
-        p=subprocess.Popen(['ssh','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null','-o','ServerAliveInterval=10','-o','ServerAliveCountMax=2','-o','TCPKeepAlive=yes','-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=15','-R',f'80:localhost:{PORT}','nokey@localhost.run'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-        with tunnel_lock: tunnel_process=p
+        p=subprocess.Popen(['ssh','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null',
+            '-o','ServerAliveInterval=10','-o','ServerAliveCountMax=2','-o','TCPKeepAlive=yes',
+            '-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=15','-R',f'80:localhost:{PORT}','nokey@localhost.run'],
+            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+        with tunnel_lock: tunnel_process=p; tunnel_type='ssh'
         for line in iter(p.stdout.readline,''):
             line=line.strip()
             if not line: continue
@@ -163,23 +160,25 @@ def ssh_session_once():
                 nu=m.group(1)
                 with tunnel_lock: ou=current_tunnel_url; current_tunnel_url=nu
                 if nu!=ou:
-                    post_url_to_channel(nu,"reconnect" if ou else "new","ssh")
+                    post_url_to_channel(nu,"reconnect" if ou else "new")
                     try:
                         with open(TUNNEL,'w',encoding='utf-8') as f: f.write(nu)
                         save_tunnel_state({'last_url':nu,'type':'ssh'})
                     except: pass
         p.wait()
-    except: pass
+    except Exception as e: print(f"[SSH] err: {e}",flush=True)
     try:
         if p: p.kill()
     except: pass
     return (time.time()-started)>60
+
 def cloudflared_session_once():
-    global cloudflared_process,current_tunnel_url,tunnel_last_activity
+    global cloudflared_process,current_tunnel_url,tunnel_type,tunnel_last_activity
     started=time.time(); p=None
     try:
-        p=subprocess.Popen([str(CLOUDFLARED_BIN),'tunnel','--url',f'http://localhost:{PORT}','--no-autoupdate'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-        with tunnel_lock: cloudflared_process=p
+        p=subprocess.Popen([str(CLOUDFLARED_BIN),'tunnel','--url',f'http://localhost:{PORT}','--no-autoupdate'],
+            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+        with tunnel_lock: cloudflared_process=p; tunnel_type='cloudflared'
         for line in iter(p.stdout.readline,''):
             line=line.strip()
             if not line: continue
@@ -189,47 +188,48 @@ def cloudflared_session_once():
                 nu=m.group(1)
                 with tunnel_lock: ou=current_tunnel_url; current_tunnel_url=nu
                 if nu!=ou:
-                    post_url_to_channel(nu,"reconnect" if ou else "new","cloudflared")
+                    post_url_to_channel(nu,"reconnect" if ou else "new")
                     try:
                         with open(TUNNEL,'w',encoding='utf-8') as f: f.write(nu)
                         save_tunnel_state({'last_url':nu,'type':'cloudflared'})
                     except: pass
         p.wait()
-    except: pass
+    except Exception as e: print(f"[Cloudflared] err: {e}",flush=True)
     try:
         if p: p.kill()
     except: pass
     return (time.time()-started)>60
 
+def ssh_port_open():
+    try:
+        s=socket.socket(); s.settimeout(5); s.connect(("localhost.run",22)); s.close(); return True
+    except: return False
+
 def start_tunnel():
-    global tunnel_last_activity
+    """Супервайзер: SSH основной, cloudflared (443) как 5G-фолбэк, авто-переключение."""
+    global tunnel_type
     st=load_tunnel_state()
     if st.get('last_url'):
         with tunnel_lock: current_tunnel_url=st['last_url']
-    if subprocess.run("which ssh",shell=True,capture_output=True).returncode!=0: os.system("pkg install -y openssh 2>&1 | tail -3")
-    if not (Path.home()/".ssh"/"id_rsa").exists(): os.system('ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa >/dev/null 2>&1')
-    backend='ssh' if ssh_port_open() else ('cloudflared' if ensure_cloudflared() else 'ssh')
+    if subprocess.run("which ssh",shell=True,capture_output=True).returncode!=0:
+        os.system("pkg install -y openssh 2>&1 | tail -3")
+    if not (Path.home()/".ssh"/"id_rsa").exists():
+        os.system('ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa >/dev/null 2>&1')
+    have_cf=ensure_cloudflared()
+    backend='ssh' if ssh_port_open() else ('cloudflared' if have_cf else 'ssh')
     print(f"[Tunnel] супервайзер запущен (backend={backend})",flush=True)
     ssh_streak=0; cf_streak=0
     while True:
-        try:
-            if backend=='ssh':
-                ok=ssh_session_once()
-                if ok: ssh_streak=0
-                else:
-                    ssh_streak+=1
-                    print(f"[Tunnel] SSH fail #{ssh_streak}",flush=True)
-                    if ssh_streak>=3 and ensure_cloudflared(): backend='cloudflared'; ssh_streak=0; continue
-                    time.sleep(min(1+ssh_streak,8))
-            else:
-                ok=cloudflared_session_once()
-                if ok: cf_streak=0
-                else:
-                    cf_streak+=1
-                    print(f"[Tunnel] CF fail #{cf_streak}",flush=True)
-                    if cf_streak>=3 and ssh_port_open(): backend='ssh'; cf_streak=0; continue
-                    time.sleep(min(1+cf_streak,8))
-        except Exception as e: print(f"[Tunnel] err: {e}",flush=True); time.sleep(5)
+        if backend=='ssh':
+            healthy=ssh_session_once(); ssh_streak=0 if healthy else ssh_streak+1
+            if not healthy and ssh_streak>=3 and have_cf:
+                print("[Tunnel] SSH нестабилен → cloudflared (443)",flush=True); backend='cloudflared'; ssh_streak=0
+            elif not healthy: time.sleep(min(1+ssh_streak,8))
+        else:
+            healthy=cloudflared_session_once(); cf_streak=0 if healthy else cf_streak+1
+            if not healthy and cf_streak>=3:
+                print("[Tunnel] cloudflared нестабилен → SSH",flush=True); backend='ssh'; cf_streak=0
+            elif not healthy: time.sleep(min(1+cf_streak,8))
 
 def force_reload_tunnel(reason="manual"):
     global tunnel_last_activity,tunnel_process,cloudflared_process
@@ -243,6 +243,7 @@ def force_reload_tunnel(reason="manual"):
                     except: pass
         tunnel_process=None; cloudflared_process=None
     tunnel_last_activity=time.time(); return True
+
 def tunnel_watchdog_loop():
     global tunnel_last_activity
     time.sleep(60)
@@ -260,27 +261,28 @@ def tunnel_watchdog_loop():
 def get_current_tunnel_url():
     with tunnel_lock: return current_tunnel_url
 def get_current_tunnel_type():
-    with tunnel_lock:
-        if tunnel_process is not None and tunnel_process.poll() is None: return 'ssh'
-        if cloudflared_process is not None and cloudflared_process.poll() is None: return 'cloudflared'
-        return 'unknown'
+    with tunnel_lock: return tunnel_type or 'unknown'
 def tunnel():
     u=get_current_tunnel_url()
     if u: return u
     try:
         if TUNNEL.exists():
-            with open(TUNNEL,'r',encoding='utf-8') as f: t=f.read().strip()
+            t=TUNNEL.read_text().strip()
             if t.startswith('http'): return t
     except: pass
     return cfg.get('tunnel_url')
 def bot_uptime_sec(): return int(time.time()-BOT_START)
+
+# ================= БАЗА =================
 def enc(t):
     try:
-        b=t.encode(); salt=hashlib.sha256(KEY).digest(); return base64.b64encode(bytes(x ^ salt[i%len(salt)] ^ KEY[i%len(KEY)] for i,x in enumerate(b))).decode()
+        b=t.encode(); salt=hashlib.sha256(KEY).digest()
+        return base64.b64encode(bytes(x ^ salt[i%len(salt)] ^ KEY[i%len(KEY)] for i,x in enumerate(b))).decode()
     except: return None
 def dec(d):
     try:
-        b=base64.b64decode(d); salt=hashlib.sha256(KEY).digest(); return bytes(x ^ salt[i%len(salt)] ^ KEY[i%len(KEY)] for i,x in enumerate(b)).decode()
+        b=base64.b64decode(d); salt=hashlib.sha256(KEY).digest()
+        return bytes(x ^ salt[i%len(salt)] ^ KEY[i%len(KEY)] for i,x in enumerate(b)).decode()
     except: return None
 def chash(t): return hashlib.sha256((str(t)+KEY.decode('utf-8',errors='ignore')).encode()).hexdigest()[:16]
 def rj(p,d):
@@ -379,65 +381,28 @@ def gm_icon(g):
     if 'adv' in g: return "🧭"
     if 'spec' in g: return "👁"
     return "❔"
-def hb_category(sec):
-    try: sec=int(sec)
-    except: sec=30
-    if sec==5: return "1️⃣ Частое (5с)"
-    if sec==30: return "2️⃣ Среднее (30с)"
-    if sec==300: return "3️⃣ Долгое (5м)"
-    if sec==600: return "4️⃣ Долгое+ (10м)"
-    return f"5️⃣ Кастом ({sec}с)"
-def validate_hb_interval(sec):
-    try: sec=int(sec)
-    except: return 30
-    if sec<5: return 5
-    if sec>3600: return 3600
-    return sec
 
-_trusted_cache={}; _trusted_lock=threading.Lock()
 def auto_register_trusted(uid):
     try: uid=int(uid)
     except: return False
-    with _trusted_lock:
-        if uid in _trusted_cache: return _trusted_cache[uid]
-    if uid not in TRUSTED_PLAYERS_INT:
-        with _trusted_lock: _trusted_cache[uid]=False
-        return False
-    if reg(uid):
-        with _trusted_lock: _trusted_cache[uid]=True
-        return True
+    if uid not in TRUSTED_PLAYERS_INT: return False
+    if reg(uid): return True
     name=TRUSTED_PLAYERS_INT[uid]; us=lu()
     us[str(uid)]={'name':name,'username':f"player_{uid}",'is_bot':False,'is_admin':(name==TECH or name in PROTECTED),'registered_at':datetime.now(MSK).isoformat(),'trusted':True}
-    su(us)
-    with _trusted_lock: _trusted_cache[uid]=True
-    return True
+    su(us); print(f"[Auth] auto-registered {name}",flush=True); return True
 
 player_online_since={}; server_online_since=None
 def load_online_tracking():
     global player_online_since,server_online_since
     try:
-        with open(ONLINE_TRACK_FILE,'r',encoding='utf-8') as f: d=json.load(f)
-        player_online_since=d.get('players',{}); server_online_since=d.get('server')
+        d=json.load(open(ONLINE_TRACK_FILE)); player_online_since=d.get('players',{}); server_online_since=d.get('server')
     except: pass
 def save_online_tracking():
     try:
         with open(ONLINE_TRACK_FILE,'w',encoding='utf-8') as f: json.dump({'players':player_online_since,'server':server_online_since},f)
     except: pass
 def get_online_since(n): return player_online_since.get(n) or player_online_since.get(n.lower())
-login_attempts_lock=threading.Lock(); login_attempts={}
-def check_rate_limit(key,max_attempts=5,window=60):
-    now=time.time()
-    with login_attempts_lock:
-        login_attempts.setdefault(key,[])
-        login_attempts[key]=[t for t in login_attempts[key] if now-t<window]
-        if len(login_attempts[key])>=max_attempts: return False,len(login_attempts[key])
-        login_attempts[key].append(now); return True,len(login_attempts[key])
-def log_failed_login(key,reason):
-    try:
-        a=rj(LOGIN_ATTEMPTS_FILE,[]); a.append({'time':datetime.now(MSK).isoformat(),'key':key,'reason':reason})
-        if len(a)>1000: a=a[-1000:]
-        wj(LOGIN_ATTEMPTS_FILE,a)
-    except: pass
+
 def find_user_by_arg(arg,ul):
     try:
         i=int(arg)-1
@@ -502,7 +467,9 @@ def na(m):
         try: bot.send_message(a,m,parse_mode='HTML')
         except: pass
 
-player_positions={}; player_zones={}; player_vanish_since={}; player_file_lines={}; radar_first_seen={}; vanish_cooldown={}
+# ================= PLAYER TRACKING + ВАНИШ =================
+player_positions={}; player_zones={}; player_vanish_since={}; player_file_lines={}
+radar_first_seen={}; vanish_cooldown={}
 def is_teleport(name,x,z,ts):
     if name not in player_positions or len(player_positions[name])<3: return False
     pos=player_positions[name][-8:]; sp=[]
@@ -514,12 +481,12 @@ def is_teleport(name,x,z,ts):
     if len(sp)<2: return False
     if sp[-1]<50: return False
     if max(sp[:-1])<5: return True
-    return True
+    return not (any(sp[i]>sp[i-1]+3 for i in range(1,len(sp))) or any(sp[i]<sp[i-1]-3 for i in range(1,len(sp))))
 def update_zone_status(name,x,z): return "standing"
 def is_player_in_tab(name):
     try:
         if SITE_STATUS_FILE.exists():
-            with open(SITE_STATUS_FILE,'r',encoding='utf-8') as f: d=json.load(f)
+            d=json.load(open(SITE_STATUS_FILE))
             if not d.get('online'): return False
             return name.lower() in [p.lower() for p in d.get('players_list',[])]
     except: pass
@@ -536,14 +503,12 @@ def save_player_history(name,line,important):
     player_file_lines.setdefault(name,0); player_file_lines[name]+=1
     if player_file_lines[name]>MAX_HISTORY*1.2:
         try:
-            with open(fp,'r',encoding='utf-8') as f: lines=f.readlines()
-            if len(lines)>MAX_HISTORY:
-                with open(fp,'w',encoding='utf-8') as f: f.writelines(lines[-MAX_HISTORY:])
-                player_file_lines[name]=MAX_HISTORY
+            lines=fp.read_text().strip().split('\n')
+            if len(lines)>MAX_HISTORY: fp.write_text('\n'.join(lines[-MAX_HISTORY:]))
+            player_file_lines[name]=MAX_HISTORY
         except: pass
-def get_vanish_tracking_admins(): return aia()
 def notify_vanish(name,x,z,dim):
-    admins=get_vanish_tracking_admins()
+    admins=aia()
     if not admins: return
     msg=(f"🚨 <b>ВАНИШ ОБНАРУЖЕН!</b>\n\n👤 <code>{safe(name)}</code>\n📍 <code>[{x:.0f}, {z:.0f}]</code> | {safe(dim)}\n⚠️ В радаре есть, в табе НЕТ\n⏰ {msk_now().strftime('%H:%M:%S')}")
     for a in admins:
@@ -557,22 +522,19 @@ def notify_vanish(name,x,z,dim):
                 m=bot.send_message(a,msg,parse_mode='HTML'); s['vanish_msg_id']=m.message_id; sets(a,s)
         except: pass
 def clear_vanish_notifications():
-    for a in get_vanish_tracking_admins():
+    for a in aia():
         s=gs(a) or {}
         if 'vanish_msg_id' in s:
             try: bot.delete_message(a,s['vanish_msg_id'])
             except: pass
             s.pop('vanish_msg_id',None); sets(a,s)
 def clear_vanish_for_player(name):
-    player_vanish_since.pop(name,None); radar_first_seen.pop(name,None)
-    clear_vanish_notifications()
+    player_vanish_since.pop(name,None); radar_first_seen.pop(name,None); clear_vanish_notifications()
 def process_player_data(data):
-    if not isinstance(data,dict): return
-    now=time.time(); players_in_update=data.get('players',[])
+    now=time.time()
+    players_in_update=data.get('players',[])
     if not isinstance(players_in_update,list): return
-    current_names=set()
-    for p in players_in_update:
-        if isinstance(p,dict) and isinstance(p.get('name'),str) and p['name'].strip(): current_names.add(p['name'].strip())
+    current_names={p.get('name') for p in players_in_update if isinstance(p,dict) and p.get('name')}
     for name in list(player_vanish_since.keys()):
         if name not in current_names: clear_vanish_for_player(name)
     for p in players_in_update:
@@ -608,10 +570,9 @@ def vanish_checker_loop():
         except: pass
         time.sleep(5)
 
+# ================= TUNNEL HEALTH =================
 tunnel_health={'status':'unknown','url':None,'checks_total':0,'checks_ok':0,'last_error':None}
-def sanitize_error(e): return re.sub(r'<[^>]+>','',str(e)).replace('<','').replace('>','')[:200]
 def check_tunnel_health():
-    global tunnel_health
     try:
         url=tunnel()
         if not url: tunnel_health['status']='no_url'; return
@@ -625,11 +586,9 @@ def check_tunnel_health():
             with urllib.request.urlopen(req,timeout=10) as r:
                 if r.status==200:
                     tunnel_health.update(status='ok',checks_ok=tunnel_health['checks_ok']+1,last_error=None)
-                    with open(TUNNEL_HEALTH_FILE,'w',encoding='utf-8') as f: json.dump(tunnel_health,f,indent=2,default=str)
                     return
-        except Exception as e: tunnel_health['last_error']=f'Public: {sanitize_error(e)}'
+        except Exception as e: tunnel_health['last_error']=str(e)[:100]
         tunnel_health['status']='tunnel_down' if local_ok else 'bot_down'
-        with open(TUNNEL_HEALTH_FILE,'w',encoding='utf-8') as f: json.dump(tunnel_health,f,indent=2,default=str)
     except: pass
 def tunnel_health_loop():
     time.sleep(5)
@@ -639,34 +598,42 @@ def tunnel_health_loop():
         time.sleep(60)
 def get_tunnel_status_text():
     s=tunnel_health.get('status','unknown'); url=tunnel_health.get('url') or tunnel() or 'не настроен'
-    ttype=get_current_tunnel_type()
-    tinfo=f" ({ttype})" if ttype!='unknown' else ""
+    tt=get_current_tunnel_type()
     if s=='ok':
         tot=tunnel_health.get('checks_total',0); okc=tunnel_health.get('checks_ok',0)
         rate=int(okc/tot*100) if tot else 100
-        return f"🟢 <b>Работает</b>{tinfo}\n{ui_row('Успех',f'{rate}%')}\n{ui_row('URL',url)}"
-    if s=='tunnel_down': return f"🟡 <b>Туннель недоступен</b>{tinfo}\n{ui_row('URL',url)}"
+        return f"🟢 <b>Работает</b> ({tt})\n{ui_row('Успех',f'{rate}%')}\n{ui_row('URL',url)}"
+    if s=='tunnel_down': return f"🟡 <b>Туннель недоступен</b> ({tt})\n{ui_row('URL',url)}"
     if s=='bot_down': return "🔴 <b>Бот недоступен</b>"
-    if s=='no_url': return "⚫ <b>URL не настроен</b>"
     return f"❓ <b>Статус:</b> {safe(s)}"
 def update_url_from_log():
     u=get_current_tunnel_url()
     if u:
-        try:
-            with open(TUNNEL,'w',encoding='utf-8') as f: f.write(u)
-            return u
+        try: TUNNEL.write_text(u); return u
         except: pass
     return None
 
+# ================= ПАРСИНГ CAPSCRAFT (ИСПРАВЛЕНО, несколько фолбэков) =================
 def parse_site_status():
     global server_online_since
     try:
         req=urllib.request.Request(SITE_URL,headers={'User-Agent':'Mozilla/5.0'})
         with urllib.request.urlopen(req,timeout=15) as r: html_text=r.read().decode('utf-8')
-        is_online=bool(re.search(r"minecraftserverinfo\s+isonline",html_text,re.IGNORECASE))
+        is_online=bool(re.search(r"minecraftserverinfo\s+isonline",html_text,re.IGNORECASE)) or ('"online"' in html_text and '"online":true' in html_text)
         players_list=[]
-        for nick in re.findall(r"alt='([A-Za-z0-9_]{3,16})s Avatar'",html_text,re.IGNORECASE):
+        # Фолбэк 1: строки игроков виджета
+        for nick in re.findall(r"<tr class='player'>\s*<td>\s*<img[^>]+alt='([A-Za-z0-9_]{3,16})s Avatar'[^>]*>.*?playeronline",html_text,re.IGNORECASE|re.DOTALL):
             if nick not in players_list: players_list.append(nick)
+        # Фолбэк 2: любые аватарки с Online рядом
+        if not players_list:
+            for row in re.findall(r"<tr[^>]*class='player[^>]*>(.*?)</tr>",html_text,re.IGNORECASE|re.DOTALL):
+                if 'online' in row.lower():
+                    m=re.search(r"alt='([A-Za-z0-9_]{3,16})s Avatar'",row,re.IGNORECASE)
+                    if m and m.group(1) not in players_list: players_list.append(m.group(1))
+        # Фолбэк 3: JSON-виджет
+        if not players_list:
+            for nick in re.findall(r'"name"\s*:\s*"([A-Za-z0-9_]{3,16})"',html_text):
+                if nick not in players_list: players_list.append(nick)
         address="gmd.capscraft.com"
         am=re.search(r"data-address='([\w\.]+)'",html_text)
         if am: address=am.group(1)
@@ -680,10 +647,12 @@ def parse_site_status():
         for n in list(player_online_since):
             if n not in on: del player_online_since[n]
         save_online_tracking()
-        result={'online':is_online,'players_online':len(players_list),'address':address,'players_list':players_list,'server_online_since':server_online_since}
+        result={'online':is_online,'players_online':len(players_list),'address':address,'players_list':players_list,
+            'server_online_since':server_online_since}
         with open(SITE_STATUS_FILE,'w',encoding='utf-8') as f: json.dump(result,f,indent=2,ensure_ascii=False)
         return result
-    except: return None
+    except Exception as e:
+        print(f"[Site] err: {e}",flush=True); return None
 def site_checker_loop():
     while True:
         try:
@@ -693,65 +662,45 @@ def site_checker_loop():
         time.sleep(60)
 def watcher_loop():
     GRACE=180
-    print("[Watcher] started (grace=180s)",flush=True)
     while True:
         try:
             time.sleep(30)
             if not SITE_STATUS_FILE.exists(): continue
-            try:
-                with open(SITE_STATUS_FILE,'r',encoding='utf-8') as f:
-                    if not json.load(f).get('online'): continue
-            except: continue
-            heartbeats=lhb(); users=lu(); now=datetime.now(MSK)
-            try:
-                with open(CFG,'r',encoding='utf-8') as f: gk=json.load(f).get('kiktime_minutes',10)*60
+            if not json.load(open(SITE_STATUS_FILE)).get('online'): continue
+            heartbeats=lhb(); users=lu(); now=datetime.now()
+            try: gk=json.load(open(CFG)).get('kiktime_minutes',10)*60
             except: gk=600
             for uid,user in list(users.items()):
                 try:
-                    if not user.get('is_bot'): continue
-                    if user.get('mode','normal')=='service': continue
-                    kt=user.get('kiktime_override'); limit=(kt*60) if kt else gk
+                    if not user.get('is_bot') or user.get('mode')=='service': continue
+                    kt=user.get('kiktime_override'); ks=(kt*60) if kt else gk
                     cid=user.get('computer_id')
                     if not cid or cid not in heartbeats: continue
                     lsv=heartbeats[cid].get('last_seen')
                     if not lsv: continue
                     delta=(now-datetime.fromisoformat(lsv)).total_seconds()
-                    if delta>limit:
+                    if delta>ks:
                         at=user.get('api_token')
                         if at: rt(at,f"Авто-кик: offline {int(delta/60)} мин")
                         hb2=lhb()
                         if cid in hb2: del hb2[cid]; shb(hb2)
                         if uid in users: del users[uid]; su(users)
-                        na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(user.get('name','?'))}</code>\n⏱ Offline {int(delta/60)} мин")
                 except: pass
         except: pass
-def get_radar_stats():
-    users=lu(); heartbeats=lhb(); now=datetime.now(MSK)
-    total=online=offline=0
-    for uid,u in users.items():
-        if not u.get('is_bot') or 'radar' not in u.get('assigned_pastes',[]): continue
-        total+=1; cid=u.get('computer_id')
-        if cid and cid in heartbeats:
-            try:
-                lsv=heartbeats[cid].get('last_seen')
-                if lsv and (now-datetime.fromisoformat(lsv)).total_seconds()<120: online+=1; continue
-            except: pass
-        offline+=1
-    return total,online,offline
 
+# ================= СТАТУС (ПОЛНЫЙ "КРУТОЙ" ИНТЕРФЕЙС) =================
 def build_help_text():
-    return (f"{ui_header('Справка v17.25','📖')}\n\n<b>🚀 Команды:</b>\n<code>/start</code> /start\n<code>/menu</code> /menu\n<code>/status</code> /status\n<code>/api</code> /api\n<code>/api_reload</code> /api_reload\n<code>/past</code> /past\n<code>/all</code> /all\n<code>/log</code> /log\n<code>/log_clear</code> /log_clear")
+    return (f"{ui_header('Справка v17.27','📖')}\n\n<b>🚀 Основные команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Перезагрузить туннель\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть")
 def build_status_text():
     try: status=parse_site_status()
     except: status=None
     if not status:
         try:
-            if SITE_STATUS_FILE.exists():
-                with open(SITE_STATUS_FILE,'r',encoding='utf-8') as f: status=json.load(f)
+            if SITE_STATUS_FILE.exists(): status=json.load(open(SITE_STATUS_FILE))
         except: pass
     if not status: return None
     state=ui_status(status.get('online')); players_list=status.get('players_list',[]); now=time.time()
-    txt=(f"{ui_header('Статус сервера','🌐')}\n\n{state}\n📡 <b>Адрес:</b> <code>{safe(status.get('address','gmd.capscraft.com'))}</code>\n")
+    txt=(f"{ui_header('Статус сервера','🌐')}\n\n{state}\n\n📡 <b>Адрес:</b> <code>{safe(status.get('address','gmd.capscraft.com'))}</code>\n")
     if status.get('online') and server_online_since: txt+=f"⏱ <b>Сервер онлайн:</b> <code>{fmt_duration(now-server_online_since)}</code>\n"
     txt+="\n"
     coords={}
@@ -765,6 +714,7 @@ def build_status_text():
             since=get_online_since(nick); dur=f" ⏱{fmt_duration(now-since)}" if since else ""
             if c: txt+=f"  • {g} <code>{safe(nick)}</code> [{c['x']:.0f}, {c['y']:.0f}, {c['z']:.0f}]{dur} {v}\n"
             else: txt+=f"  • <code>{safe(nick)}</code> 📍 нет координат{dur} {v}\n"
+        if len(players_list)>30: txt+=f"  <i>... ещё {len(players_list)-30}</i>\n"
     else: txt+="<i>🔇 Никого нет онлайн</i>\n" if status.get('online') else "<i>💤 Сервер оффлайн</i>\n"
     onl_low=[p.lower() for p in players_list]
     vanished=[(n,player_positions[n][-1]) for n in player_vanish_since if n in player_positions and player_positions[n] and n.lower() not in onl_low]
@@ -782,15 +732,28 @@ def build_status_text():
             mark="🟢" if name.lower() in onl else "🚨"
             g=gm_icon(c.get('gamemode'))
             txt+=f"  • {g} <code>{safe(name)}</code> [{c['x']:.0f}, {c['y']:.0f}, {c['z']:.0f}] {mark}\n"
+        if len(radar)>20: txt+=f"  <i>... ещё {len(radar)-20}</i>\n"
     else: txt+="  <i>нет данных</i>\n"
     txt+=f"\n<i>🕐 Обновлено: {msk_now().strftime('%H:%M:%S')} (авто 5с)</i>"
     return txt
+def get_radar_stats():
+    users=lu(); heartbeats=lhb(); now=datetime.now()
+    total=on=off=0
+    for uid,u in users.items():
+        if not u.get('is_bot') or 'radar' not in u.get('assigned_pastes',[]): continue
+        total+=1; cid=u.get('computer_id')
+        if cid and cid in heartbeats:
+            try:
+                lsv=heartbeats[cid].get('last_seen')
+                if lsv and (now-datetime.fromisoformat(lsv)).total_seconds()<120: on+=1; continue
+            except: pass
+        off+=1
+    return total,on,off
 def status_keyboard():
     kb=types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("🔄 Обновить",callback_data="refresh:status"),types.InlineKeyboardButton("⏸ Стоп авто",callback_data="stop_auto_refresh"))
     kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb
 def status_auto_refresh_loop():
-    print("[Status] auto-refresh loop started (every 5s)",flush=True)
     while True:
         try:
             time.sleep(STATUS_REFRESH_INTERVAL)
@@ -803,7 +766,7 @@ def status_auto_refresh_loop():
                 try: bot.edit_message_text(txt,chat_id,message_id,parse_mode='HTML',reply_markup=kb)
                 except Exception as e:
                     err=str(e)
-                    if any(k in err for k in ("MESSAGE_EDIT_TIME_LIMIT","message can't be edited","chat not found","deactivated","Forbidden")):
+                    if any(k in err for k in ("MESSAGE_EDIT_TIME_LIMIT","can't be edited","chat not found","deactivated","Forbidden")):
                         with active_status_lock: active_status_messages.pop(chat_id,None)
         except: pass
 def register_status_message(chat_id,message_id):
@@ -811,10 +774,13 @@ def register_status_message(chat_id,message_id):
 def unregister_status_messages(chat_id):
     with active_status_lock: active_status_messages.pop(chat_id,None)
 
+# ================= КЛАВИАТУРЫ =================
 def main_menu_keyboard(uid):
+    u=lu().get(str(uid),{}); em="✅" if u.get('vanish_tracking') else "❌"
     kb=types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("📋 Пасты",callback_data="menu:past"),types.InlineKeyboardButton("👥 Компьютеры",callback_data="menu:all"))
     kb.add(types.InlineKeyboardButton("🌐 Сервер",callback_data="menu:status"),types.InlineKeyboardButton("🖥 API",callback_data="menu:api"))
+    kb.add(types.InlineKeyboardButton(f"🕵️ Слежение: {em}",callback_data="toggle_vanish"))
     kb.add(types.InlineKeyboardButton("❓ Помощь",callback_data="menu:help")); return kb
 def back_to_menu_keyboard():
     kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb
@@ -822,8 +788,9 @@ def bpk(ps,pg):
     t=len(ps); tp=max(1,(t+PER-1)//PER); pg=max(0,min(pg,tp-1)); st_=pg*PER; it=ps[st_:st_+PER]
     kb=types.InlineKeyboardMarkup(row_width=1)
     for i,p in enumerate(it):
-        idx=st_+i
-        kb.add(types.InlineKeyboardButton(f"{idx+1}. 📄 {safe(tr(p['name'],MAX_PN))}",callback_data="pv:"+str(idx)))
+        idx=st_+i; n=tr(p['name'],MAX_PN); c=tr(p.get('cn',''),MAX_N)
+        bc=sum(1 for u in lu().values() if u.get('is_bot') and n.lower() in [x.lower() for x in u.get('assigned_pastes',[])])
+        kb.add(types.InlineKeyboardButton(f"{idx+1:>2}. 📄 {safe(n)} • 👤 {safe(c)} • 🤖{bc}",callback_data="pv:"+str(idx)))
     nav=[]
     if pg>0: nav.append(types.InlineKeyboardButton("◀️",callback_data="pp:"+str(pg-1)))
     nav.append(types.InlineKeyboardButton(f"{pg+1}/{tp}",callback_data="noop"))
@@ -837,9 +804,10 @@ def buk(ud,pg):
         n=tr(d.get('name') or uk,MAX_N); ic={"tech":"🛠","admin":"👑","bot":"🤖"}.get(role(uk),"👤")
         extra=""
         if d.get('is_bot'):
-            m=d.get('mode','normal'); mi="🔧" if m=='service' else "🔓"
-            extra=f" {mi} 📋{len(d.get('assigned_pastes',[]))}"
-        kb.add(types.InlineKeyboardButton(f"{i+1}. {ic} {safe(n)}{extra}",callback_data=f"av:{i}:{uk}"))
+            m=d.get('mode','normal'); mi="🔧" if m=='service' else ("🚨" if m=='fortress' else "🔓")
+            kt=f" ⏱{d.get('kiktime_override')}м" if d.get('kiktime_override') else ""
+            extra=f" {mi} 📋{len(d.get('assigned_pastes',[]))}{kt}"
+        kb.add(types.InlineKeyboardButton(f"{i+1:>2}. {ic} {safe(n)}{extra}",callback_data=f"av:{i}:{uk}"))
     nav=[]
     if pg>0: nav.append(types.InlineKeyboardButton("◀️",callback_data="ap:"+str(pg-1)))
     nav.append(types.InlineKeyboardButton(f"{pg+1}/{tp}",callback_data="noop"))
@@ -854,68 +822,46 @@ def bbpk(uk):
         kb.add(types.InlineKeyboardButton(f"💓 {hb_category(u.get('heartbeat_interval',30))}",callback_data="hb_menu:"+uk))
         kb.add(types.InlineKeyboardButton("🚫 Кикнуть",callback_data="kick_bot:"+uk))
     kb.add(types.InlineKeyboardButton("🔙 Назад",callback_data="menu:all")); return kb
-def hb_keyboard(uk):
-    kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("1️⃣ 5с",callback_data="hb_set:"+uk+":5"),types.InlineKeyboardButton("2️⃣ 30с",callback_data="hb_set:"+uk+":30"))
-    kb.add(types.InlineKeyboardButton("3️⃣ 5м",callback_data="hb_set:"+uk+":300"),types.InlineKeyboardButton("4️⃣ 10м",callback_data="hb_set:"+uk+":600"))
-    kb.add(types.InlineKeyboardButton("5️⃣ Кастом",callback_data="hb_custom:"+uk))
-    kb.add(types.InlineKeyboardButton("🔙 Назад",callback_data="av_back:"+uk)); return kb
 def confirm_keyboard(aid):
     kb=types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("✅ Да",callback_data=f"confirm:{aid}:yes"),types.InlineKeyboardButton("❌ Нет",callback_data=f"confirm:{aid}:no")); return kb
+def hb_category(sec):
+    try: sec=int(sec)
+    except: sec=30
+    return {5:"1️⃣ Частое (5с)",30:"2️⃣ Среднее (30с)",300:"3️⃣ Долгое (5м)",600:"4️⃣ Долгое+ (10м)"}.get(sec,f"5️⃣ Кастом ({sec}с)")
 def build_api_text():
     tu=tunnel(); su_=tu or ("http://"+LIP+":"+str(PORT))
-    return (f"{ui_header('API','🖥')}\n\n<b>⏱ Бот работает:</b> <code>{fmt_duration(bot_uptime_sec())}</code>\n\n<b>🔌 Подключение:</b>\n{ui_row('Тип','🌐 localhost.run' if get_current_tunnel_type()=='ssh' else '☁️ cloudflared')}\n{ui_row('URL',su_)}\n{ui_row('Пароль',PASSWORD)}\n{ui_row('Порт',PORT)}\n\n<b>🌐 Туннель:</b>\n{get_tunnel_status_text()}")
+    return (f"{ui_header('API Информация','🖥')}\n\n<b>⏱ Бот работает:</b> <code>{fmt_duration(bot_uptime_sec())}</code>\n\n<b>🔌 Подключение:</b>\n{ui_row('Тип','🌐 localhost.run' if get_current_tunnel_type()=='ssh' else '☁️ cloudflared (443)')}\n{ui_row('URL',su_)}\n{ui_row('Пароль',PASSWORD)}\n{ui_row('Порт',PORT)}\n\n<b>🌐 Туннель:</b>\n{get_tunnel_status_text()}")
 def show_paste_profile(c,idx):
     ps=lp()
     if idx<0 or idx>=len(ps): bot.answer_callback_query(c.id,"❌"); return
     delete_last_file(c.from_user.id); p=ps[idx]; c_=dec(p['content'])
     if not c_: bot.answer_callback_query(c.id,"❌"); return
+    b=[u.get('name','?') for u in lu().values() if u.get('is_bot') and p['name'].lower() in [x.lower() for x in u.get('assigned_pastes',[])]]
+    txt=(f"{ui_header(p['name'],'📄')}\n\n{ui_row('👤 Автор',p.get('cn','?'))}\n{ui_row('📊 Размер',f'{len(c_)} байт')}\n{ui_row('🔐 Хеш',p.get('hash','?'))}\n")
+    if b:
+        txt+="\n<b>🤖 Привязан к:</b>\n"
+        for n in b[:10]: txt+=f"  • <code>{safe(n)}</code>\n"
     kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🗑 Удалить",callback_data=f"paste_del:{idx}"),types.InlineKeyboardButton("🔙",callback_data="menu:past"))
-    try: bot.edit_message_text(f"{ui_header(p['name'],'📄')}\n{ui_row('Размер',f'{len(c_)} байт')}",c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
+    kb.add(types.InlineKeyboardButton("🗑 Удалить",callback_data=f"paste_del:{idx}"),types.InlineKeyboardButton("🔙 К пастам",callback_data="menu:past"))
+    try: bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
     except: pass
     send_paste_file(c.message.chat.id,c_,p['name'],c.from_user.id)
 
-PUBLIC_COMMANDS=[types.BotCommand("start","🚀 Пуск"),types.BotCommand("menu","📱 Меню"),types.BotCommand("help","❓ Помощь"),types.BotCommand("past","📋 Пасты"),types.BotCommand("all","👥 Компьютеры")]
-ADMIN_COMMANDS=PUBLIC_COMMANDS+[types.BotCommand("status","🌐 Статус"),types.BotCommand("api","🖥 API"),types.BotCommand("api_reload","🔄 Рестарт туннеля"),types.BotCommand("log","📄 Логи"),types.BotCommand("log_clear","🗑 Очистить")]
-def admin_chat_ids():
-    ids=set()
-    for s,d in lu().items():
-        try:
-            if ia(int(s)): ids.add(int(s))
-        except: pass
-    for uid in TRUSTED_PLAYERS_INT:
-        if ia(uid): ids.add(uid)
-    return ids
-def update_command_menus():
-    global dead_chats
-    try: bot.set_my_commands(PUBLIC_COMMANDS)
-    except: pass
-    for uid in admin_chat_ids():
-        if uid in dead_chats: continue
-        try: bot.set_my_commands(ADMIN_COMMANDS,scope=types.BotCommandScopeChat(uid))
-        except Exception as e:
-            if "chat not found" in str(e) or "deactivated" in str(e): dead_chats.add(uid)
-    print(f"[Menu] подсказки обновлены: public + {len(admin_chat_ids())} админов",flush=True)
-try:
-    bot.delete_my_commands(); bot.set_my_commands(PUBLIC_COMMANDS+[types.BotCommand("status","🌐 Сервер"),types.BotCommand("api","🖥 API"),types.BotCommand("api_reload","🔄 Туннель")])
-except: pass
-
+# ================= КОМАНДЫ =================
 @bot.message_handler(commands=['api_reload'])
 def cmd_api_reload(m):
-    if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
-    unregister_status_messages(m.chat.id)
+    delete_last_file(m.from_user.id); unregister_status_messages(m.chat.id)
     threading.Thread(target=lambda: force_reload_tunnel("manual"),daemon=True).start()
     bot.send_message(m.chat.id,"🔄 <b>Перезагрузка туннеля...</b>",parse_mode='HTML')
 @bot.message_handler(commands=['log'])
 def cmd_log(m):
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌"); return
-    log_content=get_last_log_lines()
-    if not log_content: bot.send_message(m.chat.id,"❌ Лог пуст"); return
-    fo=io.BytesIO(log_content.encode('utf-8')); fo.name="bot_log.log"
-    bot.send_document(m.chat.id,fo,caption=f"📄 {len(log_content)} байт")
+    content=get_last_log_lines()
+    if not content: bot.send_message(m.chat.id,"❌ Лог пуст"); return
+    fo=io.BytesIO(content.encode('utf-8')); fo.name="bot_log.log"
+    bot.send_document(m.chat.id,fo,caption=f"📄 {len(content)} байт")
 @bot.message_handler(commands=['log_clear'])
 def cmd_log_clear(m):
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌"); return
@@ -925,25 +871,27 @@ def cmd_start(m):
     u=m.from_user.id; auto_register_trusted(u); unregister_status_messages(m.chat.id)
     if not reg(u):
         un=m.from_user.username or ("id_"+str(u)); sets(u,{'step':'wp','username':un,'is_bot':m.from_user.is_bot})
-        bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','👋')}\n\n👤 <b>{safe(un)}</b>\n\n🔐 Пароль:",parse_mode='HTML')
+        bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','👋')}\n\n👤 <b>{safe(un)}</b>\n\n🔐 Введите пароль:",parse_mode='HTML')
     else:
         r=role(u); rt_={"tech":"🛠 Тех.админ","admin":"👑 Админ","bot":"🤖 Компьютер"}.get(r,"👤 Пользователь")
         bot.send_message(m.chat.id,f"{ui_header('С возвращением','🚀')}\n\n👤 <b>{safe(dn(u))}</b>\n{ui_row('Роль',rt_)}\n\n📱 /menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
 @bot.message_handler(commands=['menu'])
 def cmd_menu(m):
-    if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
-    unregister_status_messages(m.chat.id)
+    if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start first"); return
+    delete_last_file(m.from_user.id); unregister_status_messages(m.chat.id)
     us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
-    bot.send_message(m.chat.id,f"{ui_header('Меню','📱')}\n\n{ui_row('🤖 Компьютеры',bc)}\n{ui_row('👤 Пользователи',len(us)-bc)}\n{ui_row('📄 Пасты',len(lp()))}",parse_mode='HTML',reply_markup=main_menu_keyboard(m.from_user.id))
+    bot.send_message(m.chat.id,f"{ui_header('Главное меню','📱')}\n\n<b>📊 Статистика:</b>\n{ui_row('🤖 Компьютеры',bc)}\n{ui_row('👤 Пользователи',len(us)-bc)}\n{ui_row('📄 Пасты',len(lp()))}\n\nВыберите раздел:",parse_mode='HTML',reply_markup=main_menu_keyboard(m.from_user.id))
 @bot.message_handler(commands=['help'])
 def cmd_help(m):
-    if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
+    if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start first"); return
     bot.send_message(m.chat.id,build_help_text(),parse_mode='HTML',reply_markup=back_to_menu_keyboard())
 @bot.message_handler(commands=['api'])
 def cmd_api(m):
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌"); return
+    update_url_from_log(); check_tunnel_health()
     kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🔄 Рестарт туннеля",callback_data="reload_tunnel")); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
+    kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel"),types.InlineKeyboardButton("🔄 Рестарт туннеля",callback_data="reload_tunnel"))
+    kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
     bot.send_message(m.chat.id,build_api_text(),parse_mode='HTML',reply_markup=kb)
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
@@ -956,36 +904,48 @@ def cmd_status(m):
 def cmd_past(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     pa=m.text.split()[1:]
-    if not pa:
-        kb,_,_=bpk(lp(),0); bot.send_message(m.chat.id,"📋 Пасты",parse_mode='HTML',reply_markup=kb); return
+    if not pa: spm(m.chat.id,0); return
     s=pa[0].lower()
-    if s=='add' and len(pa)>=2:
-        n=tr(pa[1],MAX_PN).lower()
-        if any(p['name'].lower()==n for p in lp()): bot.send_message(m.chat.id,"⚠️ Уже есть"); return
-        if len(pa)>=3:
-            c=' '.join(pa[2:]); e=enc(c)
+    if s=='add':
+        if len(pa)==2:
+            n=tr(pa[1],MAX_PN).lower()
+            if any(p['name'].lower()==n for p in lp()): bot.send_message(m.chat.id,"⚠️ Уже существует"); return
+            sets(m.from_user.id,{'step':'add_file_wait','paste_name':n})
+            bot.send_message(m.chat.id,f"📄 <b>Создание:</b> <code>{safe(n)}</code>\n\nОтправьте текст/файл\n/cancel",parse_mode='HTML')
+        elif len(pa)>=3:
+            n=tr(pa[1],MAX_PN).lower(); c=' '.join(pa[2:])
+            e=enc(c)
             ps=lp(); ps.append({'name':n,'content':e,'hash':chash(c),'cid':m.from_user.id,'cn':dn(m.from_user.id)}); sp(ps)
-            bot.send_message(m.chat.id,f"✅ Паст {safe(n)} создан"); return
-        sets(m.from_user.id,{'step':'add_file_wait','paste_name':n})
-        bot.send_message(m.chat.id,"📄 Отправьте текст/файл или /cancel"); return
-    if s=='edit' and len(pa)>=2:
+            bot.send_message(m.chat.id,f"{ui_header('Паст создан','✅')}\n{ui_row('Имя',n)}",parse_mode='HTML')
+    elif s=='edit' and len(pa)>=2:
         idx,paste=find_paste_by_arg(pa[1],lp())
         if idx is None: bot.send_message(m.chat.id,"❌"); return
+        c=dec(paste['content'])
         sets(m.from_user.id,{'step':'edit_file_wait','idx':idx})
-        bot.send_message(m.chat.id,"✏️ Отправьте текст/файл или /cancel"); return
-    if s=='delete' and len(pa)>=2:
+        bot.send_message(m.chat.id,f"{ui_header('Редактирование','📝')}\n<b>📄 {safe(paste['name'])}</b>\n<pre>{safe((c or '')[:500])}</pre>\n\nОтправьте текст/файл\n/cancel",parse_mode='HTML')
+    elif s=='delete' and len(pa)>=2:
         idx,paste=find_paste_by_arg(pa[1],lp())
         if idx is None: bot.send_message(m.chat.id,"❌"); return
         sets(m.from_user.id,{'step':'dc','idx':idx})
-        bot.send_message(m.chat.id,f"⚠️ Удалить {safe(paste['name'])}?",reply_markup=confirm_keyboard(f"del_paste:{idx}")); return
+        bot.send_message(m.chat.id,f"⚠️ <b>Удалить?</b>\n📄 <code>{safe(paste['name'])}</code>",parse_mode='HTML',reply_markup=confirm_keyboard(f"del_paste:{idx}"))
+def spm(cid,pg,msg_to_edit=None):
+    ps=lp()
+    if not ps:
+        txt=f"{ui_header('Пасты','📋')}\n\n<i>📭 Пусто</i>\n\n<code>/past add name text</code>"
+        if msg_to_edit: edit_or_send(msg_to_edit,txt,back_to_menu_keyboard())
+        else: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=back_to_menu_keyboard())
+        return
+    kb,pg,tp=bpk(ps,pg)
+    txt=f"{ui_header('Пасты','📋')}\n{ui_row('Всего',len(ps))}\n{ui_row('Страница',f'{pg+1}/{tp}')}\n\n<i>Нажмите для просмотра</i>"
+    if msg_to_edit: edit_or_send(msg_to_edit,txt,kb)
+    else: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=kb)
 @bot.message_handler(commands=['all'])
 def cmd_all(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     us=lu(); my=us.get(str(m.from_user.id))
     if not my or my.get('is_bot') or not my.get('name'): bot.send_message(m.chat.id,"⚠️ Только пользователи"); return
     pa=m.text.split()[1:]
-    if not pa:
-        kb,_,_=buk(us,0); bot.send_message(m.chat.id,"👥 Компьютеры",parse_mode='HTML',reply_markup=kb); return
+    if not pa: sam(m.chat.id,0); return
     s=pa[0].lower()
     if s=='assign' and len(pa)>=3 and ia(m.from_user.id):
         tid,td=find_user_by_arg(pa[1],list(us.items()))
@@ -993,33 +953,60 @@ def cmd_all(m):
         pn=pa[2].lower()
         cp=td.get('assigned_pastes',[])
         if pn not in cp: cp.append(pn); us[tid]['assigned_pastes']=cp; su(us)
-        bot.send_message(m.chat.id,f"✅ Привязан {safe(pn)}"); return
-    if s=='unassign' and len(pa)>=2 and ia(m.from_user.id):
+        bot.send_message(m.chat.id,f"{ui_header('Привязан','✅')}\n{ui_row('🤖',td.get('name',''))}\n{ui_row('📄',pn)}",parse_mode='HTML')
+    elif s=='unassign' and len(pa)>=2 and ia(m.from_user.id):
         tid,td=find_user_by_arg(pa[1],list(us.items()))
-        if tid: us[tid]['assigned_pastes']=[]; su(us); bot.send_message(m.chat.id,"✅ Отвязано"); return
-    if s=='kick' and len(pa)>=2 and ia(m.from_user.id):
+        if tid: us[tid]['assigned_pastes']=[]; su(us); bot.send_message(m.chat.id,"✅ Отвязано")
+    elif s=='perform' and len(pa)>=3 and ia(m.from_user.id):
         tid,td=find_user_by_arg(pa[1],list(us.items()))
-        if tid: bot.send_message(m.chat.id,f"⚠️ Кикнуть {safe(td.get('name'))}?",reply_markup=confirm_keyboard(f"kick:{tid}")); return
+        pi,paste=find_paste_by_arg(pa[2],lp()) if len(pa)>=3 else (None,None)
+        if tid and paste:
+            cp=td.get('assigned_pastes',[])
+            if paste['name'] not in cp: cp.append(paste['name']); us[tid]['assigned_pastes']=cp; su(us)
+            bot.send_message(m.chat.id,f"{ui_header('Выполнено','✅')}\n{ui_row('🤖',td.get('name',''))}\n{ui_row('📄',paste['name'])}",parse_mode='HTML')
+    elif s=='kick' and len(pa)>=2 and ia(m.from_user.id):
+        tid,td=find_user_by_arg(pa[1],list(us.items()))
+        if tid: bot.send_message(m.chat.id,f"⚠️ <b>Кикнуть?</b>\n🤖 <code>{safe(td.get('name'))}</code>",parse_mode='HTML',reply_markup=confirm_keyboard(f"kick:{tid}"))
+def sam(cid,pg,msg_to_edit=None):
+    us=lu()
+    if not us:
+        txt=f"{ui_header('Компьютеры','👥')}\n\n<i>📭 Пусто</i>"
+        if msg_to_edit: edit_or_send(msg_to_edit,txt,back_to_menu_keyboard())
+        else: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=back_to_menu_keyboard())
+        return
+    kb,pg,tp=buk(us,pg)
+    txt=f"{ui_header('Компьютеры','👥')}\n{ui_row('🤖',sum(1 for u in us.values() if u.get('is_bot')))}\n{ui_row('📄 Страница',f'{pg+1}/{tp}')}\n\n<i>Нажмите для деталей</i>"
+    if msg_to_edit: edit_or_send(msg_to_edit,txt,kb)
+    else: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=kb)
+def san(pid,n,cid):
+    pe=lpend()
+    if pid not in pe: return
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("✅ Принять",callback_data="aa:"+pid),types.InlineKeyboardButton("❌ Отклонить",callback_data="ad:"+pid))
+    for a in aia():
+        try: bot.send_message(a,f"{ui_header('Запрос авторизации','🔐')}\n{ui_row('🖥',n)}\n{ui_row('🆔',cid)}",parse_mode='HTML',reply_markup=kb)
+        except: pass
+
+# ================= ФАЙЛЫ =================
 @bot.message_handler(content_types=['document'])
 def handle_document(m):
     state=gs(m.from_user.id)
-    if not state: return
-    step=state.get('step')
-    if step not in ('add_file_wait','edit_file_wait'): return
+    if not state or state.get('step') not in ('add_file_wait','edit_file_wait'): return
     if m.document.file_size>MAX_CONTENT_LENGTH: bot.send_message(m.chat.id,"❌ Слишком большой"); return
     try:
         fi=bot.get_file(m.document.file_id); content=bot.download_file(fi.file_path).decode('utf-8',errors='ignore')
     except: return
-    if step=='add_file_wait':
-        name=state.get('paste_name')
-        if not name: cs(m.from_user.id); return
-        e=enc(content); ps=lp(); ps.append({'name':name,'content':e,'hash':chash(content),'cid':m.from_user.id,'cn':dn(m.from_user.id)}); sp(ps)
-        cs(m.from_user.id); bot.send_message(m.chat.id,f"✅ Паст {safe(name)} создан")
-    elif step=='edit_file_wait':
+    if state['step']=='add_file_wait':
+        name=state.get('paste_name'); e=enc(content)
+        ps=lp(); ps.append({'name':name,'content':e,'hash':chash(content),'cid':m.from_user.id,'cn':dn(m.from_user.id)}); sp(ps)
+        cs(m.from_user.id); bot.send_message(m.chat.id,f"{ui_header('Паст создан','✅')}\n{ui_row('Имя',name)}",parse_mode='HTML')
+    else:
         idx=state.get('idx'); ps=lp()
         if idx is not None and 0<=idx<len(ps):
             ps[idx]['content']=enc(content); ps[idx]['hash']=chash(content); sp(ps)
         cs(m.from_user.id); bot.send_message(m.chat.id,"✅ Обновлён")
+
+# ================= CALLBACK =================
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
     try:
@@ -1030,22 +1017,27 @@ def cb(c):
         if d=="refresh:status":
             txt=build_status_text()
             if txt:
-                try:
-                    bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard()); register_status_message(c.message.chat.id,c.message.message_id)
+                try: bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard()); register_status_message(c.message.chat.id,c.message.message_id)
                 except: pass
             bot.answer_callback_query(c.id); return
+        if d=="check_tunnel":
+            check_tunnel_health(); bot.answer_callback_query(c.id,"🔄"); return
         if d=="reload_tunnel":
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
             threading.Thread(target=lambda: force_reload_tunnel("btn"),daemon=True).start(); bot.answer_callback_query(c.id,"🔄"); return
+        if d=="toggle_vanish":
+            if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
+            us=lu(); uid=str(c.from_user.id)
+            us[uid]['vanish_tracking']=not us[uid].get('vanish_tracking',False); su(us)
+            bot.answer_callback_query(c.id,"🕵️ переключено"); return
         if d.startswith("menu:"):
             sec=d.split(":")[1]
+            unregister_status_messages(c.message.chat.id)
             if sec=="main":
                 us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
-                edit_or_send(c,f"{ui_header('Меню','📱')}\n\n{ui_row('🤖 Компьютеры',bc)}\n{ui_row('📄 Пасты',len(lp()))}",main_menu_keyboard(c.from_user.id))
-            elif sec=="past":
-                kb,_,_=bpk(lp(),0); edit_or_send(c,"📋 Пасты",kb)
-            elif sec=="all":
-                kb,_,_=buk(lu(),0); edit_or_send(c,"👥 Компьютеры",kb)
+                edit_or_send(c,f"{ui_header('Главное меню','📱')}\n{ui_row('🤖',bc)}\n{ui_row('📄',len(lp()))}",main_menu_keyboard(c.from_user.id))
+            elif sec=="past": spm(c.message.chat.id,0,msg_to_edit=c)
+            elif sec=="all": sam(c.message.chat.id,0,msg_to_edit=c)
             elif sec=="status":
                 txt=build_status_text()
                 if txt:
@@ -1056,65 +1048,59 @@ def cb(c):
                 edit_or_send(c,build_api_text(),kb)
             elif sec=="help": edit_or_send(c,build_help_text(),back_to_menu_keyboard())
             bot.answer_callback_query(c.id); return
+        if d.startswith("hb_menu:"):
+            uk=d.split(":")[1]
+            kb=hb_keyboard(uk); bot.edit_message_reply_markup(c.message.chat.id,c.message.message_id,reply_markup=kb); bot.answer_callback_query(c.id); return
         if d.startswith("hb_set:"):
-            parts=d.split(":"); uk=parts[1]; sec=validate_hb_interval(parts[2])
-            if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
+            parts=d.split(":"); uk=parts[1]; sec=int(parts[2])
             us=lu()
             if uk in us: us[uk]['heartbeat_interval']=sec; su(us)
             bot.answer_callback_query(c.id,f"💓 {hb_category(sec)}"); return
-        if d.startswith("hb_custom:"):
-            uk=d.split(":")[1]
-            if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
-            sets(c.from_user.id,{'step':'hb_wait','target':uk}); bot.answer_callback_query(c.id,"⏱ Секунды?"); return
         if d.startswith("mode_toggle:"):
-            uk=d.split(":")[1]
-            if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
-            us=lu()
+            uk=d.split(":")[1]; us=lu()
             if uk in us and us[uk].get('is_bot'):
                 us[uk]['mode']='normal' if us[uk].get('mode')=='service' else 'service'; su(us)
             bot.answer_callback_query(c.id,"🔄"); return
-        if d.startswith("pv:"): show_paste_profile(c,int(d.split(":")[1])); bot.answer_callback_query(c.id); return
-        if d.startswith("pp:"):
-            kb,_,_=bpk(lp(),int(d.split(":")[1])); edit_or_send(c,"📋 Пасты",kb); bot.answer_callback_query(c.id); return
-        if d.startswith("ap:"):
-            kb,_,_=buk(lu(),int(d.split(":")[1])); edit_or_send(c,"👥 Компьютеры",kb); bot.answer_callback_query(c.id); return
-        if d.startswith("av:"):
-            uk=d.split(":")[2]; _sbp(c.message.chat.id,c.message.message_id,uk); bot.answer_callback_query(c.id); return
-        if d.startswith("av_back:"):
-            _sbp(c.message.chat.id,c.message.message_id,d.split(":")[1]); bot.answer_callback_query(c.id); return
-        if d.startswith("paste_del:"):
-            idx=int(d.split(":")[1]); ps=lp()
-            if 0<=idx<len(ps): ps.pop(idx); sp(ps)
-            bot.answer_callback_query(c.id,"✅ Удалён"); return
         if d.startswith("kick_bot:"):
             uk=d.split(":")[1]
-            if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
             bot.edit_message_text("⚠️ Кикнуть?",c.message.chat.id,c.message.message_id,reply_markup=confirm_keyboard(f"kick:{uk}")); bot.answer_callback_query(c.id); return
+        if d.startswith("pv:"): show_paste_profile(c,int(d.split(":")[1])); bot.answer_callback_query(c.id); return
+        if d.startswith("pp:"): spm(c.message.chat.id,int(d.split(":")[1]),msg_to_edit=c); bot.answer_callback_query(c.id); return
+        if d.startswith("ap:"): sam(c.message.chat.id,int(d.split(":")[1]),msg_to_edit=c); bot.answer_callback_query(c.id); return
         if d.startswith("confirm:"):
             parts=d.split(":"); ans=parts[-1]; aid=":".join(parts[1:-1])
-            if ans=="yes" and aid.startswith("kick:"):
-                tid=aid.split(":")[1]; us=lu()
-                if tid in us:
-                    td=us[tid]
-                    if td.get('api_token'): rt(td['api_token'],"Kicked")
-                    del us[tid]; su(us)
-            bot.answer_callback_query(c.id,"✅"); return
+            if ans=="yes":
+                if aid.startswith("del_paste:"):
+                    idx=int(aid.split(":")[1]); ps=lp()
+                    if 0<=idx<len(ps): ps.pop(idx); sp(ps)
+                elif aid.startswith("kick:"):
+                    tid=aid.split(":")[1]; us=lu()
+                    if tid in us:
+                        if us[tid].get('api_token'): rt(us[tid]['api_token'],"Kicked")
+                        del us[tid]; su(us)
+            cs(c.from_user.id); bot.answer_callback_query(c.id,"✅"); return
         bot.answer_callback_query(c.id)
-    except Exception as e: print(f"[CB] err: {e}",flush=True)
-def _sbp(cid,mid,uk):
+    except Exception as e:
+        print(f"[CB] err: {e}",flush=True)
+        try: bot.answer_callback_query(c.id)
+        except: pass
+def sbp(cid,mid,uk):
     us=lu()
     if uk not in us: return
     u=us[uk]
-    hb=lhb(); ci=u.get('computer_id'); ht="❓"
+    at=u.get('api_token','?'); hb=lhb(); ci=u.get('computer_id'); ht="❓"
     if ci in hb:
         try:
-            lm=int((datetime.now(MSK)-datetime.fromisoformat(hb[ci]['last_seen'])).total_seconds()/60)
+            lm=int((datetime.now()-datetime.fromisoformat(hb[ci]['last_seen'])).total_seconds()/60)
             ht="🟢" if lm<2 else f"🔴 {lm}м"
         except: pass
-    txt=(f"{ui_header(u.get('name',''),'🤖')}\n{ui_row('🆔 CID',ci)}\n{ui_row('🎯 Режим',ui_mode(u.get('mode','normal')))}\n{ui_row('💓 Пульс',ht)}\n{ui_row('💓 Интервал',hb_category(u.get('heartbeat_interval',30)))}\n{ui_row('📋 Скрипты',len(u.get('assigned_pastes',[])))}")
+    txt=(f"{ui_header(u.get('name',''),'🤖')}\n{ui_row('🆔 CID',ci)}\n{ui_row('🎯 Режим',ui_mode(u.get('mode','normal')))}\n{ui_row('💓 Пульс',ht)}\n{ui_row('💓 Интервал',hb_category(u.get('heartbeat_interval',30)))}\n")
+    ap=u.get('assigned_pastes',[])
+    if ap: txt+="<b>📋 Скрипты:</b>\n"+"".join(f"  • <code>{safe(p)}</code>\n" for p in ap[:10])
     try: bot.edit_message_text(txt,cid,mid,parse_mode='HTML',reply_markup=bbpk(uk))
     except: pass
 
+# ================= TEXT =================
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def hm(m):
     u=m.from_user.id; auto_register_trusted(u)
@@ -1122,55 +1108,29 @@ def hm(m):
     if s:
         stp=s.get('step')
         if stp=='wp':
-            ok,_=check_rate_limit(f"pw:{u}")
-            if not ok: bot.send_message(m.chat.id,"⏳ Слишком много попыток"); return
             if t==PASSWORD:
-                if s.get('is_bot'):
-                    us=lu(); us[str(u)]={'name':None,'username':s.get('username'),'is_bot':True,'is_admin':False}; su(us); cs(u)
-                    bot.send_message(m.chat.id,"✅ Доступ разрешён")
-                else:
-                    ns=dict(s); ns['step']='wn'; sets(u,ns); bot.send_message(m.chat.id,"✅ Пароль верный\n👤 Имя:")
-            else:
-                bot.send_message(m.chat.id,"❌ Неверный пароль"); log_failed_login(f"pw:{u}","bad")
+                ns=dict(s); ns['step']='wn'; sets(u,ns)
+                bot.send_message(m.chat.id,"✅ Пароль верный\n👤 Введите имя:",parse_mode='HTML')
+            else: bot.send_message(m.chat.id,"❌ Неверный пароль",parse_mode='HTML')
             return
         if stp=='wn':
             n=tr(t,MAX_N); us=lu()
-            if n.lower() in [ (x.get('name') or '').lower() for x in us.values() if x.get('name')]: bot.send_message(m.chat.id,"⚠️ Занято"); return
-            f=len(us)==0; aa=f or (n.lower() in [p.lower() for p in PROTECTED])
-            us[str(u)]={'name':n,'username':s.get('username'),'is_bot':False,'is_admin':aa}; su(us); cs(u)
-            bot.send_message(m.chat.id,f"🎉 <b>{safe(n)}</b>\n\n📱 /menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u)); return
-        if stp=='hb_wait':
-            sec=validate_hb_interval(t); tgt=s.get('target'); us=lu()
-            if tgt in us: us[tgt]['heartbeat_interval']=sec; su(us)
-            cs(u); bot.send_message(m.chat.id,f"💓 {hb_category(sec)}"); return
-        if stp=='add_file_wait':
-            if t.lower() in ('/cancel','cancel'): cs(u); bot.send_message(m.chat.id,"❌"); return
-            name=s.get('paste_name')
-            e=enc(t); ps=lp(); ps.append({'name':name,'content':e,'hash':chash(t),'cid':u,'cn':dn(u)}); sp(ps)
-            cs(u); bot.send_message(m.chat.id,f"✅ {safe(name)} создан"); return
-        if stp=='edit_file_wait':
-            if t.lower() in ('/cancel','cancel'): cs(u); bot.send_message(m.chat.id,"❌"); return
-            idx=s.get('idx'); ps=lp()
-            if idx is not None and 0<=idx<len(ps): ps[idx]['content']=enc(t); ps[idx]['hash']=chash(t); sp(ps)
-            cs(u); bot.send_message(m.chat.id,"✅ Обновлён"); return
-        if stp=='dc':
-            idx=s.get('idx')
-            if t.lower() in ('да','yes','y'):
-                ps=lp()
-                if idx is not None and 0<=idx<len(ps): ps.pop(idx); sp(ps)
-                cs(u); bot.send_message(m.chat.id,"✅ Удалён")
-            else: cs(u); bot.send_message(m.chat.id,"❌")
+            us[str(u)]={'name':n,'username':s.get('username'),'is_bot':False,'is_admin':(n==TECH or n in PROTECTED)}
+            su(us); cs(u)
+            bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','🎉')}\n👤 <b>{safe(n)}</b>\n📱 /menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
             return
+        if stp in ('add_file_wait','edit_file_wait'):
+            if t.lower() in ('/cancel','cancel'): cs(u); bot.send_message(m.chat.id,"❌"); return
         return
-    if t.startswith('/'):
-        cn=t.split()[0][1:].lower().split('@')[0]
-        if cn not in KNOWN: bot.send_message(m.chat.id,"❓ /help"); return
+    if t.startswith('/') and t.split()[0][1:].lower() not in KNOWN:
+        bot.send_message(m.chat.id,"❓ /help"); return
     if not reg(u):
-        un=m.from_user.username or ("id_"+str(u)); sets(u,{'step':'wp','username':un,'is_bot':m.from_user.is_bot})
-        bot.send_message(m.chat.id,f"👋 <b>{safe(un)}</b>\n\n🔐 Пароль:",parse_mode='HTML'); return
+        sets(u,{'step':'wp','username':m.from_user.username or str(u),'is_bot':m.from_user.is_bot})
+        bot.send_message(m.chat.id,"🔐 Пароль:",parse_mode='HTML'); return
     bot.send_message(m.chat.id,"💡 /menu",reply_markup=main_menu_keyboard(u))
 
-class TS(ThreadingMixIn,HTTPServer): daemon_threads=True; allow_reuse_address=True; request_queue_size=128
+# ================= HTTP API =================
+class TS(ThreadingMixIn,HTTPServer): daemon_threads=True; allow_reuse_address=True
 class AH(BaseHTTPRequestHandler):
     def log_message(self,f,*a):
         global tunnel_last_activity
@@ -1180,21 +1140,17 @@ class AH(BaseHTTPRequestHandler):
     def _j(self,c,d):
         try:
             b=json.dumps(d,ensure_ascii=False).encode()
-            self.send_response(c)
-            self.send_header('Content-Type','application/json; charset=utf-8')
+            self.send_response(c); self.send_header('Content-Type','application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Headers','Authorization, Content-Type, bypass-tunnel-reminder, X-Computer-ID, X-Server-Key')
             self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS')
-            self.send_header('Content-Length',str(len(b))); self.send_header('Connection','close')
-            self.end_headers(); self.wfile.write(b)
+            self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
         except: pass
     def _b(self):
         l=int(self.headers.get('Content-Length',0))
         if l>MAX_CONTENT_LENGTH: return None
         return self.rfile.read(l).decode() if l>0 else ""
-    def _check_friend_auth(self):
-        k=self.headers.get('X-Server-Key','')
-        if not k or k!=PASSWORD: return False
-        return self.client_address[0]==FRIEND_SERVER_IP
+    def _friend(self):
+        return self.headers.get('X-Server-Key','')==PASSWORD and self.client_address[0]==FRIEND_SERVER_IP
     def _a(self):
         au=self.headers.get('Authorization',''); ci=self.headers.get('X-Computer-ID','')
         if not au.startswith('Bearer '): return None,None,False,"no",None
@@ -1206,157 +1162,95 @@ class AH(BaseHTTPRequestHandler):
             if not ok: return tok,ib,False,r,sd
         return tok,ib,True,"ok",ti
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Headers','Authorization, Content-Type, bypass-tunnel-reminder, X-Computer-ID, X-Server-Key')
-        self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS')
-        self.end_headers()
+        self.send_response(200); self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS'); self.end_headers()
     def do_GET(self):
         try: self._get()
         except: pass
     def _get(self):
-        if not API_EN: self._j(503,{"error":"Disabled"}); return
         tok,ib,v,r,ti=self._a(); p=self.path.split('?')[0]
         if p=='/api/health':
             check_tunnel_health()
-            self._j(200,{"bot_status":"running","bot_version":"17.25","tunnel":tunnel_health.get('status')}); return
-        if p=='/api/reload':
-            if not tok or not v: self._j(401,{"error":"no token"}); return
-            threading.Thread(target=lambda: force_reload_tunnel("api"),daemon=True).start()
-            self._j(200,{"ok":True}); return
+            self._j(200,{"bot":"running","version":"17.27","tunnel":tunnel_health.get('status')}); return
         if p=='/api/url':
             u=tunnel()
-            if u: self._j(200,{"url":u})
-            else: self._j(503,{"error":"no"})
-            return
-        if p=='/api/relay_url':
-            u=get_current_tunnel_url()
-            if u: self._j(200,{"url":u,"channel":f"https://t.me/s/{CHANNEL_USERNAME}"})
-            else: self._j(503,{"error":"no tunnel"})
-            return
-        if p=='/api/check':
-            q=self.path.split('?')[1] if '?' in self.path else ''
-            pa=dict(x.split('=') for x in q.split('&') if '=' in x); pid=pa.get('id','')
-            pe=lpend()
-            if pid not in pe: self._j(404,{"error":"no"}); return
-            s=pe[pid].get('status','pending'); rs={"status":s,"pending_id":pid}
-            if s=='approved': rs["token"]=pe[pid].get('token')
-            self._j(200,rs); return
-        if p.startswith('/api/player/'):
-            if not self._check_friend_auth(): self._j(403,{"error":"Unauthorized"}); return
-            name=p.split('/')[-1]
-            if not name or not re.match(r'^[A-Za-z0-9_]{2,16}$',name): self._j(400,{"error":"invalid name"}); return
-            fp=PLAYERS_DIR/f"{name}.txt"
-            if not fp.exists(): self._j(404,{"error":"Not found"}); return
-            self._j(200,{"name":name,"history":fp.read_text()}); return
+            self._j(200,{"url":u}) if u else self._j(503,{"error":"no"}); return
         if p=='/api/me':
             if not tok: self._j(401,{"error":"Invalid"}); return
-            td=lt().get(tok,{}); rs={"ok":True,"computer_id":td.get('computer_id')}
-            if ib:
-                us=lu(); pid=ti.get('pending_id'); um='normal'; up=[]; hbi=30
-                if pid and pid in us: um=us[pid].get('mode','normal'); up=us[pid].get('assigned_pastes',[]); hbi=us[pid].get('heartbeat_interval',30)
-                rs.update({"role":"bot","assigned_pastes":up,"mode":um,"heartbeat_interval":hbi})
-            else: rs["role"]="human"
-            self._j(200,rs); return
+            td=lt().get(tok,{}); us=lu(); pid=td.get('pending_id')
+            um='normal'; up=[]; hbi=30
+            if pid and pid in us: um=us[pid].get('mode','normal'); up=us[pid].get('assigned_pastes',[]); hbi=us[pid].get('heartbeat_interval',30)
+            self._j(200,{"ok":True,"computer_id":td.get('computer_id'),"mode":um,"assigned_pastes":up,"heartbeat_interval":hbi}); return
         if p.startswith('/api/paste/'):
             if not tok: self._j(401,{"error":"no"}); return
             n=unquote(p[len('/api/paste/'):]).lower()
             if ib:
                 us=lu(); pid=ti.get('pending_id')
                 al=[x.lower() for x in us[pid].get('assigned_pastes',[])] if pid and pid in us else []
-                if not al or n not in al:
-                    rt(tok,"PANIC"); na("🚨 <b>PANIC!</b>"); self._j(403,{"error":"PANIC"}); return
+                if not al or n not in al: self._j(403,{"error":"PANIC"}); return
             for x in lp():
                 if x['name'].lower()==n:
                     c=dec(x['content'])
-                    if not c: self._j(500,{"error":"decrypt"}); return
-                    self._j(200,{"name":x['name'],"content":c,"hash":x.get('hash')}); return
+                    self._j(200,{"name":x['name'],"content":c}) if c else self._j(500,{"error":"decrypt"})
+                    return
             self._j(404,{"error":"no"}); return
+        if p.startswith('/api/player/') or p=='/api/players/list':
+            if not self._friend(): self._j(403,{"error":"Unauthorized"}); return
+            if p=='/api/players/list':
+                self._j(200,{"players":[f.stem for f in PLAYERS_DIR.glob('*.txt')]}); return
+            name=p.split('/')[-1]
+            fp=PLAYERS_DIR/f"{name}.txt"
+            if not fp.exists(): self._j(404,{"error":"Not found"}); return
+            self._j(200,{"name":name,"history":fp.read_text()}); return
         self._j(404,{"error":"no"})
     def do_POST(self):
         try: self._post()
         except: pass
     def _post(self):
-        if not API_EN: self._j(503,{"error":"Disabled"}); return
         tok,ib,v,r,ti=self._a(); p=self.path.split('?')[0]
         b=self._b()
         if b is None: self._j(413,{"error":"too large"}); return
-        ci=self.headers.get('X-Computer-ID','')
         if p=='/api/reload':
             if not tok or not v: self._j(401,{"error":"no token"}); return
-            threading.Thread(target=lambda: force_reload_tunnel("api_post"),daemon=True).start()
+            threading.Thread(target=lambda: force_reload_tunnel("api"),daemon=True).start()
             self._j(200,{"ok":True}); return
         if p=='/api/player_data':
             try:
-                d=json.loads(b) if b else {}
-                process_player_data(d)
-                self._j(200,{"ok":True,"processed":len(d.get('players',[]))}); return
+                process_player_data(json.loads(b) if b else {})
+                self._j(200,{"ok":True}); return
             except Exception as e: self._j(500,{"error":str(e)}); return
         if p=='/api/login':
-            ok,_=check_rate_limit(f"login:{self.client_address[0]}")
-            if not ok: self._j(429,{"error":"rate limit"}); return
-            try: d=json.loads(b) if b else {}
+            try: d=json.loads(b)
             except: d={}
-            if d.get('password')!=PASSWORD:
-                log_failed_login(self.client_address[0],"wrong"); self._j(401,{"error":"Wrong password"}); return
-            us=lu(); ts=lt(); lci=d.get('computer_id',ci or 'unk')
+            if d.get('password')!=PASSWORD: self._j(401,{"error":"Wrong password"}); return
+            us=lu(); ts=lt(); lci=d.get('computer_id','unk')
             for uid,ud in us.items():
-                if ud.get('is_bot') and ud.get('computer_id')==lci:
-                    et=ud.get('api_token')
-                    if et and et in ts:
-                        self._j(200,{"ok":True,"status":"already_registered","token":et}); return
+                if ud.get('is_bot') and ud.get('computer_id')==lci and ud.get('api_token') in ts:
+                    self._j(200,{"ok":True,"status":"already_registered","token":ud['api_token']}); return
             pid=str(uuid.uuid4()); ft=str(uuid.uuid4())
-            pe=lpend(); pe[pid]={'token':ft,'name':d.get('name'),'computer_id':lci,'status':'pending'}; spend(pe)
-            ts[ft]={'name':d.get('name'),'computer_id':lci,'is_computer':True,'pending_id':pid,'created_at':datetime.now(MSK).isoformat()}; st(ts)
+            pe=lpend(); pe[pid]={'token':ft,'name':d.get('name'),'computer_id':lci,'status':'approved'}; spend(pe)
+            ts[ft]={'name':d.get('name'),'computer_id':lci,'is_computer':True,'pending_id':pid}; st(ts)
             us[pid]={'name':d.get('name'),'computer_id':lci,'is_bot':True,'is_admin':False,'mode':'normal','assigned_pastes':[],'api_token':ft,'heartbeat_interval':30}; su(us)
-            pe[pid]['status']='approved'; spend(pe)
-            threading.Thread(target=lambda: _san(pid,d.get('name'),lci),daemon=True).start()
             self._j(200,{"ok":True,"status":"approved","token":ft}); return
         if p=='/api/heartbeat':
             if not ib: self._j(403,{"error":"no"}); return
             cv=ti.get('computer_id')
             if not cv: self._j(400,{"error":"no cid"}); return
-            try: d=json.loads(b) if b else {}
-            except: d={}
-            hb=lhb(); hb[cv]={'last_seen':datetime.now(MSK).isoformat(),'name':ti.get('name'),'mode':d.get('mode'),'scripts_running':d.get('scripts_running',[])}
-            shb(hb); self._j(200,{"ok":True}); return
-        if p.startswith('/api/paste/') and not ib and v:
-            n=unquote(p[len('/api/paste/'):]).lower()
-            try: d=json.loads(b) if b else {}; c=d.get('content',b)
-            except: c=b
-            if not c: self._j(400,{"error":"empty"}); return
-            e=enc(c)
-            ps=lp(); f=None
-            for i,x in enumerate(ps):
-                if x['name'].lower()==n: f=i; break
-            if f is not None:
-                ps[f]['content']=e; ps[f]['hash']=chash(c); sp(ps); self._j(200,{"ok":True,"action":"updated"})
-            else:
-                ps.append({'name':n,'content':e,'hash':chash(c),'cid':0,'cn':'API'}); sp(ps); self._j(201,{"ok":True,"action":"created"})
-            return
+            hb=lhb(); hb[cv]={'last_seen':datetime.now().isoformat(),'name':ti.get('name'),'mode':(json.loads(b) if b else {}).get('mode')}; shb(hb)
+            self._j(200,{"ok":True}); return
         self._j(404,{"error":"no"})
-def _san(pid,n,cid):
-    for a in aia():
-        try: bot.send_message(a,f"🔐 <b>Новый компьютер</b>\n🖥 {safe(n)}\n🆔 {cid}",parse_mode='HTML')
-        except: pass
+
 def start_api():
-    if not API_EN: print("API disabled",flush=True); return
     while True:
-        srv=None
         try:
-            print(f"[API] Starting on {PORT}...",flush=True)
             srv=TS(('0.0.0.0',PORT),AH); srv.timeout=5
-            print("[API] Ready v17.25",flush=True)
+            print(f"[API] Ready v17.27 on {PORT}",flush=True)
             srv.serve_forever()
-        except OSError as e:
-            if e.errno==98: os.system(f"fuser -k {PORT}/tcp 2>/dev/null"); time.sleep(2)
-            else: time.sleep(5)
-        except Exception as e: time.sleep(5)
-        finally:
-            if srv:
-                try: srv.server_close()
-                except: pass
+        except OSError:
+            os.system(f"fuser -k {PORT}/tcp 2>/dev/null"); time.sleep(2)
+        except: time.sleep(5)
+
 def main():
-    print("Starting bot v17.25...",flush=True)
+    print("Starting bot v17.27 (full UI + 5G + survivability)...",flush=True)
     load_online_tracking(); update_url_from_log()
     threading.Thread(target=start_tunnel,daemon=True).start()
     threading.Thread(target=tunnel_watchdog_loop,daemon=True).start()
@@ -1367,10 +1261,8 @@ def main():
     threading.Thread(target=tunnel_health_loop,daemon=True).start()
     threading.Thread(target=vanish_checker_loop,daemon=True).start()
     threading.Thread(target=status_auto_refresh_loop,daemon=True).start()
-    threading.Thread(target=lambda:(time.sleep(5),update_command_menus()),daemon=True).start()
     print("Bot ready! Relay: @capscraft_relay",flush=True)
-    try: bot.infinity_polling(timeout=60,long_polling_timeout=60,skip_pending=False)
-    finally:
-        _tee_out.close(); _tee_err.close()
+    bot.infinity_polling(timeout=60,long_polling_timeout=60,skip_pending=False)
+
 if __name__=='__main__':
     main()
