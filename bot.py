@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bot v17.25 — 5G-ready (SSH 443) + max survivability + all fixes"""
+"""Bot v17.25 — cloudflared primary (5G-safe) + SSH fallback + survivability"""
 import sys, os, io, json, base64, socket, threading, time, uuid, hashlib, re, subprocess
-import signal, tempfile, html as html_lib, urllib.request
+import platform, html as html_lib, urllib.request
 from urllib.parse import unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -14,27 +14,26 @@ from telebot import types
 CHANNEL_ID = -1004388932854
 CHANNEL_USERNAME = "capscraft_relay"
 BASE = Path.home() / "telegram-bot"; BASE.mkdir(parents=True, exist_ok=True)
-CFG=BASE/"config.json"; USERS=BASE/"users.json"; PASTES=BASE/"pastes.json"
-STATES=BASE/"user_states.json"; TOKENS=BASE/"api_tokens.json"; PENDING=BASE/"pending_tokens.json"
-TUNNEL=BASE/"tunnel_url.txt"; HB=BASE/"heartbeats.json"; SITE_STATUS_FILE=BASE/"site_status.json"
-TUNNEL_HEALTH_FILE=BASE/"tunnel_health.json"; TUNNEL_STATE_FILE=BASE/"tunnel_state.json"
-ONLINE_TRACK_FILE=BASE/"online_tracking.json"; FALLBACK_URL_FILE=BASE/"pending_url_post.txt"
-RUNTIME_LOG=BASE/"runtime.log"; PLAYERS_DIR=BASE/"players"; PLAYERS_DIR.mkdir(exist_ok=True)
-LOCATIONS_FILE=BASE/"locations.json"
+CFG=BASE/"config.json"; USERS=BASE/"users.json"; PASTES=BASE/"pastes.json"; STATES=BASE/"user_states.json"
+TOKENS=BASE/"api_tokens.json"; PENDING=BASE/"pending_tokens.json"; TUNNEL=BASE/"tunnel_url.txt"
+HB=BASE/"heartbeats.json"; SITE_STATUS_FILE=BASE/"site_status.json"; TUNNEL_HEALTH_FILE=BASE/"tunnel_health.json"
+TUNNEL_STATE_FILE=BASE/"tunnel_state.json"; ONLINE_TRACK_FILE=BASE/"online_tracking.json"
+FALLBACK_URL_FILE=BASE/"pending_url_post.txt"; RUNTIME_LOG=BASE/"runtime.log"
+PLAYERS_DIR=BASE/"players"; PLAYERS_DIR.mkdir(exist_ok=True); LOCATIONS_FILE=BASE/"locations.json"
+CLOUDFLARED_BIN = BASE / "cloudflared"
 
-TECH="FFFFFFFFF12324"
 KNOWN={'start','help','past','all','api','api_reload','log','log_clear','status','menu'}
 SITE_URL="https://gmd.capscraft.com"; FRIEND_SERVER_IP="185.26.120.251"
-TRUSTED_PLAYERS={5183248850:"Gishta1",5602435561:"Rainy42",5370523250:"FFFFFFFFF12324"}
+TECH="FFFFFFFFF12324"
+TRUSTED_PLAYERS={"5183248850":"Gishta1","5602435561":"Rainy42","5370523250":"FFFFFFFFF12324"}
+TRUSTED_PLAYERS_INT={int(k):v for k,v in TRUSTED_PLAYERS.items()}
 VANISH_GRACE=30; VANISH_NOTIFY_CD=60; MAX_HISTORY=10000
+MAX_CONTENT_LENGTH=10*1024*1024; RATE_LIMIT_WINDOW=60; MAX_LOGIN_ATTEMPTS=5
 MSK=timezone(timedelta(hours=3)); BOT_START=time.time()
-STATUS_REFRESH_INTERVAL=5
+active_status_messages={}; active_status_lock=threading.Lock(); STATUS_REFRESH_INTERVAL=5
 
-active_status_messages={}; active_status_lock=threading.Lock()
-tunnel_lock=threading.Lock(); players_lock=threading.Lock()
-tunnel_health_lock=threading.Lock()
-
-try: cfg=json.load(open(CFG))
+try:
+    with open(CFG,'r',encoding='utf-8') as f: cfg=json.load(f)
 except Exception as e: print(f"FATAL: config: {e}",flush=True); sys.exit(106)
 BOT_TOKEN=cfg.get("bot_token","")
 if not BOT_TOKEN or BOT_TOKEN=="YOUR_BOT_TOKEN_HERE": sys.exit(107)
@@ -42,10 +41,9 @@ PASSWORD=cfg.get("password","")
 if not PASSWORD or PASSWORD=="admin123": print("FATAL: weak password",flush=True); sys.exit(108)
 KEY=cfg.get("encryption_key","").encode()
 if not KEY or KEY==b"default": print("FATAL: default key",flush=True); sys.exit(109)
-PROTECTED=set(cfg.get("protected_users",[]))
-MAX_N=cfg.get("max_name_length",12); MAX_PN=cfg.get("max_paste_name_length",20)
-PER=cfg.get("items_per_page",5); PORT=cfg.get("api_port",8080)
-API_EN=cfg.get("api_enabled",True); PROXY=cfg.get("proxy_url")
+PROTECTED=set(cfg.get("protected_users",[])); MAX_N=cfg.get("max_name_length",12)
+MAX_PN=cfg.get("max_paste_name_length",20); PER=cfg.get("items_per_page",5)
+PORT=cfg.get("api_port",8080); API_EN=cfg.get("api_enabled",True); PROXY=cfg.get("proxy_url")
 ALLOWED_ORIGINS=cfg.get("allowed_origins",[])
 
 def lip():
@@ -55,12 +53,6 @@ def lip():
 LIP=lip()
 if PROXY: telebot.apihelper.proxy={"http":PROXY,"https":PROXY}
 bot=telebot.TeleBot(BOT_TOKEN)
-
-def signal_handler(sig,frame):
-    try: bot.stop_polling()
-    except: pass
-    sys.exit(0)
-signal.signal(signal.SIGINT,signal_handler); signal.signal(signal.SIGTERM,signal_handler)
 
 class TeeLogger:
     def __init__(s,f,o): s.file=open(f,'a',encoding='utf-8',buffering=1); s.original=o; s.lock=threading.Lock()
@@ -72,6 +64,8 @@ class TeeLogger:
             except: pass
     def flush(s):
         try: s.file.flush()
+        except: pass
+        try: s.original.flush()
         except: pass
     def close(s):
         try: s.file.close()
@@ -101,14 +95,14 @@ def clear_log():
         if RUNTIME_LOG.exists():
             try: RUNTIME_LOG.replace(BASE/"runtime.log.prev")
             except: pass
-            with open(RUNTIME_LOG,'w',encoding='utf-8') as f: f.write(f"[{datetime.now().isoformat()}] cleared\n")
+            with open(RUNTIME_LOG,'w',encoding='utf-8') as f: f.write(f"[{datetime.now(MSK).isoformat()}] cleared\n")
     except: pass
 
 # ============================================
-# ТУННЕЛЬ (5G-ready: 443 -> 22 -> cloudflared)
+# ТУННЕЛЬ: CLOUDFLARED PRIMARY + SSH FALLBACK
 # ============================================
-tunnel_process=None; cloudflared_process=None; current_tunnel_url=None
-tunnel_last_activity=time.time(); tunnel_type=None
+tunnel_process=None; cloudflared_process=None; current_tunnel_url=None; tunnel_type=None
+tunnel_lock=threading.Lock(); tunnel_last_activity=time.time()
 
 def load_tunnel_state():
     try:
@@ -121,17 +115,19 @@ def save_tunnel_state(s):
         with open(TUNNEL_STATE_FILE,'w',encoding='utf-8') as f: json.dump(s,f,indent=2)
     except: pass
 
-def post_url_to_channel(url,reason="new",retries=5):
+def post_url_to_channel(url,reason="new",ttype="cloudflared",retries=5):
     now=datetime.now(MSK).strftime('%H:%M:%S')
-    msg=(f"🔄 <b>Туннель {'обновлён' if reason=='new' else 'переподключён'}</b>\n\n🌐 <code>{url}</code>\n⏰ {now}\n📡 <code>t.me/s/{CHANNEL_USERNAME}</code>")
+    emoji="☁️" if ttype=="cloudflared" else "🔴"
+    msg=(f"🔄 <b>Туннель {'обновлён' if reason=='new' else 'переподключён'}</b> {emoji}\n\n"
+         f"🌐 <code>{url}</code>\n🔧 <code>{ttype}</code>\n⏰ {now}\n📡 <code>t.me/s/{CHANNEL_USERNAME}</code>")
     for a in range(retries):
         try:
             bot.send_message(CHANNEL_ID,msg,parse_mode='HTML',disable_web_page_preview=True)
-            print(f"[Tunnel] ✓ канал: {url}",flush=True); _flush_pending_posts(); return True
+            print(f"[Tunnel] ✓ канал: {url} ({ttype})",flush=True); _flush_pending_posts(); return True
         except Exception as e:
-            print(f"[Tunnel] пост {a+1}/{retries}: {e}",flush=True); time.sleep(3)
+            print(f"[Tunnel] post {a+1}/{retries}: {e}",flush=True); time.sleep(3)
     try:
-        with open(FALLBACK_URL_FILE,'a',encoding='utf-8') as f: f.write(f"{now}|{url}|{reason}\n")
+        with open(FALLBACK_URL_FILE,'a',encoding='utf-8') as f: f.write(f"{now}|{url}|{reason}|{ttype}\n")
     except: pass
     return False
 
@@ -142,144 +138,129 @@ def _flush_pending_posts():
         with open(FALLBACK_URL_FILE,'w',encoding='utf-8') as f: f.write('')
         for line in lines:
             if not line.strip(): continue
-            parts=line.split('|',2)
+            parts=line.split('|',3)
             if len(parts)>=2:
-                bot.send_message(CHANNEL_ID,f"📬 <b>Отложенный URL</b>\n🌐 <code>{parts[1]}</code>",parse_mode='HTML',disable_web_page_preview=True)
+                ttype=parts[3] if len(parts)>3 else "ssh"
+                bot.send_message(CHANNEL_ID,f"📬 <b>Отложенный URL</b>\n🌐 <code>{parts[1]}</code> ({ttype})",parse_mode='HTML',disable_web_page_preview=True)
     except: pass
 
-def ssh_line_useful(line):
-    """Фильтр мусора (QR-коды, escape-последовательности)"""
-    if '\x1b' in line: return False
-    low=line.lower()
-    if 'lhr.life' in low or 'tunnel' in low: return True
-    if 'error' in low or 'refused' in low or 'timed out' in low or 'reset' in low: return True
-    if 'connection id' in low or 'authn' in low or 'welcome' in low: return True
-    if '=====' in line: return False
-    return False
-
-def run_ssh_tunnel(port):
-    """Возвращает True если туннель пожил >2мин, иначе False"""
-    global tunnel_process,current_tunnel_url,tunnel_last_activity,tunnel_type
-    start=time.time()
-    had_url=False
-    if subprocess.run("which ssh",shell=True,capture_output=True).returncode!=0:
-        os.system("pkg install -y openssh 2>&1 | tail -3")
-    if not (Path.home()/".ssh"/"id_rsa").exists():
-        os.system('ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa >/dev/null 2>&1')
-    print(f"[Tunnel] запуск SSH :{port}...",flush=True)
-    tunnel_last_activity=time.time()
+def ensure_cloudflared():
+    """Скачивает cloudflared если нет (5G-safe туннель через 443)"""
+    if CLOUDFLARED_BIN.exists() and os.access(str(CLOUDFLARED_BIN),os.X_OK): return True
+    arch=platform.machine()
+    if arch in ("aarch64","arm64"): url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+    elif arch in ("armv7l","arm"): url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
+    elif arch in ("x86_64","amd64"): url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    else: return False
     try:
-        p=subprocess.Popen(['ssh','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null',
-            '-o','ServerAliveInterval=20','-o','ServerAliveCountMax=3','-o','ExitOnForwardFailure=yes',
-            '-o','ConnectTimeout=15','-p',str(port),'-R','80:localhost:8080','nokey@localhost.run'],
-            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-        with tunnel_lock: tunnel_process=p; tunnel_type=f"ssh:{port}"
-        for line in iter(p.stdout.readline,''):
-            line=line.strip()
-            if not line: continue
-            tunnel_last_activity=time.time()
-            if ssh_line_useful(line): print(f"[SSH:{port}] {line}",flush=True)
-            m=re.search(r'(https://[a-z0-9-]+\.lhr\.life)',line)
-            if m:
-                nu=m.group(1); had_url=True
-                with tunnel_lock: ou=current_tunnel_url; current_tunnel_url=nu
-                if nu!=ou:
-                    print(f"[Tunnel] ✓ НОВЫЙ URL: {nu}",flush=True)
-                    post_url_to_channel(nu,"reconnect" if ou else "new")
-                    try:
-                        with open(TUNNEL,'w',encoding='utf-8') as f: f.write(nu)
-                        save_tunnel_state({'last_url':nu,'type':f'ssh:{port}','updated_at':datetime.now().isoformat()})
-                    except: pass
-        p.wait()
+        print("[Tunnel] скачиваю cloudflared (~30MB, один раз)...",flush=True)
+        r=subprocess.run(['curl','-sL','--max-time','300','-o',str(CLOUDFLARED_BIN),url],timeout=320)
+        if r.returncode==0 and CLOUDFLARED_BIN.exists():
+            os.chmod(CLOUDFLARED_BIN,0o755)
+            print(f"[Tunnel] ✓ cloudflared установлен ({CLOUDFLARED_BIN.stat().st_size} байт)",flush=True)
+            return True
+        return False
     except Exception as e:
-        print(f"[Tunnel] SSH:{port} err: {e}",flush=True)
-    return had_url and (time.time()-start>120)
+        print(f"[Tunnel] не удалось скачать cloudflared: {e}",flush=True); return False
 
-def cloudflared_available():
-    return (BASE/"cloudflared").exists() and os.access(str(BASE/"cloudflared"),os.X_OK)
-
-def run_cloudflared():
-    global cloudflared_process,current_tunnel_url,tunnel_last_activity,tunnel_type
-    start=time.time(); had_url=False
-    if not cloudflared_available():
-        print("[Tunnel] cloudflared не установлен",flush=True); return False
+def start_cloudflared():
+    """Cloudflared quick tunnel → https://xxx.trycloudflare.com (порт 443, 5G-safe)"""
+    global cloudflared_process,current_tunnel_url,tunnel_type,tunnel_last_activity
     print("[Tunnel] запуск cloudflared...",flush=True)
     tunnel_last_activity=time.time()
     try:
-        p=subprocess.Popen([str(BASE/"cloudflared"),'tunnel','--url',f'http://localhost:{PORT}','--no-autoupdate'],
+        p=subprocess.Popen([str(CLOUDFLARED_BIN),'tunnel','--url',f'http://localhost:{PORT}','--no-autoupdate'],
             stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-        with tunnel_lock: cloudflared_process=p; tunnel_type="cloudflared"
+        with tunnel_lock: cloudflared_process=p; tunnel_type='cloudflared'
+        got=False
         for line in iter(p.stdout.readline,''):
             line=line.strip()
             if not line: continue
             tunnel_last_activity=time.time()
             m=re.search(r'(https://[a-z0-9-]+\.trycloudflare\.com)',line)
-            if m:
-                nu=m.group(1); had_url=True
+            if m and not got:
+                got=True; nu=m.group(1)
                 with tunnel_lock: ou=current_tunnel_url; current_tunnel_url=nu
                 if nu!=ou:
-                    print(f"[Tunnel] ✓ НОВЫЙ CF URL: {nu}",flush=True)
-                    post_url_to_channel(nu,"reconnect" if ou else "new")
+                    print(f"[Tunnel] ✓ НОВЫЙ URL (cloudflared): {nu}",flush=True)
+                    post_url_to_channel(nu,"reconnect" if ou else "new","cloudflared")
                     try:
                         with open(TUNNEL,'w',encoding='utf-8') as f: f.write(nu)
-                        save_tunnel_state({'last_url':nu,'type':'cloudflared','updated_at':datetime.now().isoformat()})
+                        save_tunnel_state({'last_url':nu,'type':'cloudflared'})
                     except: pass
         p.wait()
+        return True
     except Exception as e:
-        print(f"[Tunnel] cloudflared err: {e}",flush=True)
-    return had_url and (time.time()-start>120)
+        print(f"[Tunnel] cloudflared err: {e}",flush=True); return False
 
-def tunnel_supervisor():
-    """Supervisor: 443 -> 22 -> cloudflared, переключение после 2 фейлов"""
-    global tunnel_last_activity
+def start_ssh_tunnel():
+    """SSH localhost.run (фолбэк, порт 22 — может блокироваться в 5G)"""
+    global tunnel_process,current_tunnel_url,tunnel_type,tunnel_last_activity
+    if subprocess.run("which ssh",shell=True,capture_output=True).returncode!=0:
+        os.system("pkg install -y openssh 2>&1 | tail -3")
+    if not (Path.home()/".ssh"/"id_rsa").exists():
+        os.system('ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa >/dev/null 2>&1')
+    fails=0
+    while True:
+        print("[Tunnel] запуск localhost.run (SSH)...",flush=True)
+        tunnel_last_activity=time.time()
+        try:
+            p=subprocess.Popen(['ssh','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=/dev/null',
+                '-o','ServerAliveInterval=15','-o','ServerAliveCountMax=2','-o','TCPKeepAlive=yes',
+                '-o','ExitOnForwardFailure=yes','-o','ConnectTimeout=15',
+                '-R',f'80:localhost:{PORT}','nokey@localhost.run'],
+                stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+            with tunnel_lock: tunnel_process=p; tunnel_type='ssh'
+            for line in iter(p.stdout.readline,''):
+                line=line.strip()
+                if not line: continue
+                tunnel_last_activity=time.time()
+                m=re.search(r'(https://[a-z0-9-]+\.lhr\.life)',line)
+                if m:
+                    nu=m.group(1)
+                    with tunnel_lock: ou=current_tunnel_url; current_tunnel_url=nu
+                    if nu!=ou:
+                        print(f"[Tunnel] ✓ НОВЫЙ URL (ssh): {nu}",flush=True)
+                        post_url_to_channel(nu,"reconnect" if ou else "new","ssh")
+                        try:
+                            with open(TUNNEL,'w',encoding='utf-8') as f: f.write(nu)
+                            save_tunnel_state({'last_url':nu,'type':'ssh'})
+                        except: pass
+                        fails=0
+            p.wait(); fails+=1; time.sleep(min(1+fails,10))
+        except Exception as e:
+            print(f"[Tunnel] ssh err: {e}",flush=True); fails+=1; time.sleep(2)
+
+def start_tunnel():
+    """Главный цикл: cloudflared primary, SSH fallback"""
+    global current_tunnel_url
     st=load_tunnel_state()
     if st.get('last_url'):
         with tunnel_lock: current_tunnel_url=st['last_url']
-    methods=['ssh443','ssh22','cloudflared']
-    idx=0; fails=0
+    have_cf=ensure_cloudflared()
+    if not have_cf:
+        print("[Tunnel] ⚠️ cloudflared недоступен → SSH fallback",flush=True)
+        start_ssh_tunnel(); return
     while True:
-        m=methods[idx]
-        if m=='ssh443': ok=run_ssh_tunnel(443)
-        elif m=='ssh22': ok=run_ssh_tunnel(22)
-        else: ok=run_cloudflared()
-        if ok:
-            fails=0
-        else:
-            fails+=1
-            if fails>=2:
-                print(f"[Tunnel] метод {m} нестабилен -> следующий",flush=True)
-                idx=(idx+1)%len(methods); fails=0
-        time.sleep(2)
-
-def force_reload_tunnel(reason="manual"):
-    global tunnel_last_activity,tunnel_process,cloudflared_process
-    print(f"[Tunnel-RELOAD] {reason}",flush=True)
-    with tunnel_lock:
-        for proc in (tunnel_process,cloudflared_process):
-            if proc is not None:
-                try:
-                    proc.terminate(); proc.wait(timeout=3)
-                except subprocess.TimeoutExpired: proc.kill()
-                except: pass
-        tunnel_process=None; cloudflared_process=None
-    tunnel_last_activity=time.time()
-    return True
+        start_cloudflared()
+        time.sleep(3)
 
 def tunnel_watchdog_loop():
-    global tunnel_last_activity
+    """Следит за ОБОИМИ процессами, перезапускает при тишине"""
     time.sleep(60)
     while True:
         try:
             with tunnel_lock: p=tunnel_process; cp=cloudflared_process
-            active=p if (p and p.poll() is None) else (cp if (cp and cp.poll() is None) else None)
-            if active is None:
+            alive=(p and p.poll() is None) or (cp and cp.poll() is None)
+            idle=time.time()-tunnel_last_activity
+            if alive and idle>90:
+                print(f"[Tunnel-WD] тишина {int(idle)}с → перезапуск",flush=True)
+                for proc in (p,cp):
+                    if proc and proc.poll() is None:
+                        try: proc.kill()
+                        except: pass
                 tunnel_last_activity=time.time()
-            else:
-                idle=time.time()-tunnel_last_activity
-                if idle>90:
-                    print(f"[Watchdog] тишина {int(idle)}с -> reload",flush=True)
-                    force_reload_tunnel("watchdog_stale"); tunnel_last_activity=time.time()
-        except Exception as e: print(f"[Watchdog] err: {e}",flush=True)
+        except Exception as e: print(f"[Tunnel-WD] err: {e}",flush=True)
         time.sleep(15)
 
 def get_current_tunnel_url():
@@ -295,20 +276,17 @@ def tunnel():
             if t.startswith('http'): return t
     except: pass
     return cfg.get('tunnel_url')
-
-# ============================================
-# БАЗА
-# ============================================
 def bot_uptime_sec(): return int(time.time()-BOT_START)
+
 def enc(t):
     try:
         b=t.encode(); salt=hashlib.sha256(KEY).digest()
-        return base64.b64encode(bytes(x ^ salt[i%len(salt)] ^ KEY[i%len(KEY)] for i,x in enumerate(b))).decode()
+        return base64.b64encode(bytes(x^salt[i%len(salt)]^KEY[i%len(KEY)] for i,x in enumerate(b))).decode()
     except: return None
 def dec(d):
     try:
         b=base64.b64decode(d); salt=hashlib.sha256(KEY).digest()
-        return bytes(x ^ salt[i%len(salt)] ^ KEY[i%len(KEY)] for i,x in enumerate(b)).decode()
+        return bytes(x^salt[i%len(salt)]^KEY[i%len(KEY)] for i,x in enumerate(b)).decode()
     except: return None
 def chash(t): return hashlib.sha256((str(t)+KEY.decode('utf-8',errors='ignore')).encode()).hexdigest()[:16]
 def rj(p,d):
@@ -317,16 +295,11 @@ def rj(p,d):
     except: return d
 def wj(p,d):
     try:
-        fd,tp=tempfile.mkstemp(dir=str(p.parent),suffix='.tmp')
-        try:
-            with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(d,f,indent=2,ensure_ascii=False)
-            os.replace(tp,p)
-        except:
-            try: os.unlink(tp)
-            except: pass
-            raise
+        fd,tp=tempfile_if:= (lambda: __import__('tempfile').mkstemp(dir=str(p.parent),suffix='.tmp'))()
+        with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(d,f,indent=2,ensure_ascii=False)
+        os.replace(tp,p)
     except Exception as e: print(f"[wj] err {p}: {e}",flush=True)
-def lu(): return rj(USERS,{}); 
+def lu(): return rj(USERS,{})
 def su(u): wj(USERS,u)
 def lp(): return rj(PASTES,[])
 def sp(p): wj(PASTES,p)
@@ -344,7 +317,7 @@ def dn(u):
 def ia(u):
     try: uid=int(u)
     except: return False
-    if uid in TRUSTED_PLAYERS:
+    if uid in TRUSTED_PLAYERS_INT:
         n=TRUSTED_PLAYERS[uid]
         if n==TECH or n in PROTECTED: return True
     d=lu().get(str(uid))
@@ -356,7 +329,7 @@ def ia(u):
 def role(u):
     try: uid=int(u)
     except: return "user"
-    if uid in TRUSTED_PLAYERS:
+    if uid in TRUSTED_PLAYERS_INT:
         n=TRUSTED_PLAYERS[uid]
         if n==TECH: return "tech"
         if n in PROTECTED: return "admin"
@@ -373,12 +346,11 @@ def aia():
         try:
             if ia(int(s)): a.append(int(s))
         except: pass
-    for uid in TRUSTED_PLAYERS:
+    for uid in TRUSTED_PLAYERS_INT:
         if ia(uid) and uid not in a: a.append(uid)
     return a
 def gs(u): return ls().get(str(u),{})
-def sets(u,d):
-    s=ls(); s[str(u)]=d; ss(s)
+def sets(u,d): s=ls(); s[str(u)]=d; ss(s)
 def cs(u):
     s=ls()
     if str(u) in s: del s[str(u)]
@@ -427,29 +399,40 @@ def validate_hb_interval(sec):
     if sec>3600: return 3600
     return sec
 
-_trusted_cache={}; _trusted_lock=threading.Lock()
+login_attempts_lock=threading.Lock(); login_attempts={}
+def check_rate_limit(key,max_attempts=MAX_LOGIN_ATTEMPTS,window=RATE_LIMIT_WINDOW):
+    now=time.time()
+    with login_attempts_lock:
+        if key not in login_attempts: login_attempts[key]=[]
+        login_attempts[key]=[t for t in login_attempts[key] if now-t<window]
+        if len(login_attempts[key])>=max_attempts: return False,len(login_attempts[key])
+        login_attempts[key].append(now); return True,len(login_attempts[key])
+def log_failed_login(key,reason):
+    try:
+        a=rj(BASE/"login_attempts.json",[])
+        a.append({'time':datetime.now(MSK).isoformat(),'key':key,'reason':reason})
+        if len(a)>1000: a=a[-1000:]
+        wj(BASE/"login_attempts.json",a)
+    except: pass
+
+_trusted_cache={}; _trusted_cache_lock=threading.Lock()
 def auto_register_trusted(uid):
     try: uid=int(uid)
     except: return False
-    with _trusted_lock:
+    with _trusted_cache_lock:
         if uid in _trusted_cache: return _trusted_cache[uid]
-    if uid not in TRUSTED_PLAYERS:
-        with _trusted_lock: _trusted_cache[uid]=False
+    if uid not in TRUSTED_PLAYERS_INT:
+        with _trusted_cache_lock: _trusted_cache[uid]=False
         return False
     if reg(uid):
-        with _trusted_lock: _trusted_cache[uid]=True
+        with _trusted_cache_lock: _trusted_cache[uid]=True
         return True
     name=TRUSTED_PLAYERS[uid]; us=lu()
-    us[str(uid)]={'name':name,'username':f"player_{uid}",'is_bot':False,
-        'is_admin':(name==TECH or name in PROTECTED),'registered_at':datetime.now(MSK).isoformat(),'trusted':True}
+    us[str(uid)]={'name':name,'username':f"player_{uid}",'is_bot':False,'is_admin':(name==TECH or name in PROTECTED),'registered_at':datetime.now(MSK).isoformat(),'trusted':True}
     su(us)
-    print(f"[Auth] auto-registered {name}",flush=True)
-    with _trusted_lock: _trusted_cache[uid]=True
+    with _trusted_cache_lock: _trusted_cache[uid]=True
     return True
 
-# ============================================
-# PLAYER TRACKING + ВАНИШ
-# ============================================
 player_online_since={}; server_online_since=None
 def load_online_tracking():
     global player_online_since,server_online_since
@@ -463,8 +446,77 @@ def save_online_tracking():
     except: pass
 def get_online_since(n): return player_online_since.get(n) or player_online_since.get(n.lower())
 
-player_positions={}; player_vanish_since={}; player_file_lines={}; radar_first_seen={}; vanish_cooldown={}
+def find_user_by_arg(arg,ul):
+    try:
+        i=int(arg)-1
+        if 0<=i<len(ul): return ul[i]
+    except ValueError: pass
+    al=arg.lower()
+    for tid,td in ul:
+        if (td.get('name') or '').lower()==al: return tid,td
+    for tid,td in ul:
+        if al in (td.get('name') or '').lower(): return tid,td
+    return None,None
+def find_paste_by_arg(arg,pl):
+    try:
+        i=int(arg)-1
+        if 0<=i<len(pl): return i,pl[i]
+    except ValueError: pass
+    al=arg.lower()
+    for i,p in enumerate(pl):
+        if p['name'].lower()==al: return i,p
+    for i,p in enumerate(pl):
+        if al in p['name'].lower(): return i,p
+    return None,None
+def edit_or_send(c,t,kb=None,pm='HTML'):
+    if hasattr(c,'message') and c.message:
+        try: bot.edit_message_text(t,c.message.chat.id,c.message.message_id,parse_mode=pm,reply_markup=kb)
+        except Exception as e:
+            if "message is not modified" not in str(e):
+                try: bot.send_message(c.message.chat.id,t,parse_mode=pm,reply_markup=kb)
+                except: pass
+    elif hasattr(c,'chat'): bot.send_message(c.chat.id,t,parse_mode=pm,reply_markup=kb)
+def send_paste_file(cid,content,name,uid):
+    fid=None
+    try:
+        fo=io.BytesIO(content.encode('utf-8')); fo.name=f"{name}.txt"
+        fid=bot.send_document(cid,fo,caption=f"📄 {name}").message_id
+    except: pass
+    if fid:
+        s=gs(uid) or {}; s['last_file_msg_id']=fid; s['last_file_chat_id']=cid; sets(uid,s)
+    return fid
+def delete_last_file(uid):
+    s=gs(uid) or {}; mid=s.get('last_file_msg_id'); cid=s.get('last_file_chat_id')
+    if mid and cid:
+        try: bot.delete_message(cid,mid)
+        except: pass
+        s.pop('last_file_msg_id',None); s.pop('last_file_chat_id',None); sets(uid,s)
+def vs(tok,cid,ip):
+    ts=lt()
+    if tok not in ts: return False,"inv",None
+    td=ts[tok]; created=td.get('created_at')
+    if created:
+        try:
+            if (datetime.now(MSK)-datetime.fromisoformat(created)).total_seconds()>30*24*60*60:
+                rt(tok,"Token expired"); return False,"expired",None
+        except: pass
+    rc=td.get('computer_id')
+    if not rc: td['computer_id']=cid; ts[tok]=td; st(ts); rc=cid
+    if rc!=cid: rt(tok,"CID mismatch"); return False,"intr",None
+    return True,"ok",td
+def rt(tok,r="unknown"):
+    ts=lt()
+    if tok in ts:
+        td=ts.pop(tok); st(ts); us=lu(); pid=td.get('pending_id')
+        if pid and pid in us:
+            n=us[pid].get('name','?'); del us[pid]; su(us)
+            na(f"🚫 <b>ОТОЗВАН</b>\n🤖 <code>{safe(n)}</code>\n📝 {safe(r)}")
+def na(m):
+    for a in aia():
+        try: bot.send_message(a,m,parse_mode='HTML')
+        except: pass
 
+player_positions={}; player_vanish_since={}; player_file_lines={}; radar_first_seen={}; vanish_cooldown={}
 def is_teleport(name,x,z,ts):
     if name not in player_positions or len(player_positions[name])<3: return False
     pos=player_positions[name][-8:]; sp=[]
@@ -475,7 +527,6 @@ def is_teleport(name,x,z,ts):
         sp.append(d/dt)
     if len(sp)<2: return False
     if sp[-1]<50: return False
-    if max(sp[:-1])<5: return True
     return True
 def update_zone_status(name,x,z): return "standing"
 def is_player_in_tab(name):
@@ -495,7 +546,8 @@ def save_player_history(name,line,important):
     try:
         with open(fp,'a',encoding='utf-8') as f: f.write(line+'\n')
     except Exception as e: print(f"[Tracker] {name}: {e}",flush=True)
-    player_file_lines[name]=player_file_lines.get(name,0)+1
+    if name not in player_file_lines: player_file_lines[name]=0
+    player_file_lines[name]+=1
     if player_file_lines[name]>MAX_HISTORY*1.2:
         try:
             with open(fp,'r',encoding='utf-8') as f: lines=f.readlines()
@@ -510,74 +562,67 @@ def notify_vanish(name,x,z,dim):
     msg=(f"🚨 <b>ВАНИШ ОБНАРУЖЕН!</b>\n\n👤 <code>{safe(name)}</code>\n📍 <code>[{x:.0f}, {z:.0f}]</code> | {safe(dim)}\n⚠️ В радаре есть, в табе НЕТ\n⏰ {msk_now().strftime('%H:%M:%S')}")
     for a in admins:
         try:
-            st_=gs(a) or {}
-            if 'vanish_msg_id' in st_:
-                try: bot.edit_message_text(msg,a,st_['vanish_msg_id'],parse_mode='HTML')
+            s=gs(a) or {}
+            if 'vanish_msg_id' in s:
+                try: bot.edit_message_text(msg,a,s['vanish_msg_id'],parse_mode='HTML')
                 except:
-                    m=bot.send_message(a,msg,parse_mode='HTML'); st_['vanish_msg_id']=m.message_id; sets(a,st_)
+                    m=bot.send_message(a,msg,parse_mode='HTML'); s['vanish_msg_id']=m.message_id; sets(a,s)
             else:
-                m=bot.send_message(a,msg,parse_mode='HTML'); st_['vanish_msg_id']=m.message_id; sets(a,st_)
+                m=bot.send_message(a,msg,parse_mode='HTML'); s['vanish_msg_id']=m.message_id; sets(a,s)
         except Exception as e: print(f"[Vanish] {a}: {e}",flush=True)
 def clear_vanish_notifications():
     for a in get_vanish_tracking_admins():
-        st_=gs(a) or {}
-        if 'vanish_msg_id' in st_:
-            try: bot.delete_message(a,st_['vanish_msg_id'])
+        s=gs(a) or {}
+        if 'vanish_msg_id' in s:
+            try: bot.delete_message(a,s['vanish_msg_id'])
             except: pass
-            st_.pop('vanish_msg_id',None); sets(a,st_)
+            s.pop('vanish_msg_id',None); sets(a,s)
 def clear_vanish_for_player(name):
     player_vanish_since.pop(name,None); radar_first_seen.pop(name,None)
     clear_vanish_notifications()
 def process_player_data(data):
     if not isinstance(data,dict): return
-    now=time.time()
-    players_in_update=data.get('players',[])
+    now=time.time(); players_in_update=data.get('players',[])
     if not isinstance(players_in_update,list): return
     current_names=set()
     for p in players_in_update:
         if isinstance(p,dict) and isinstance(p.get('name'),str) and p['name'].strip(): current_names.add(p['name'].strip())
     for name in list(player_vanish_since.keys()):
         if name not in current_names: clear_vanish_for_player(name)
-    with players_lock:
-        for p in players_in_update:
-            if not isinstance(p,dict): continue
-            name=p.get('name')
-            if not isinstance(name,str) or not name.strip(): continue
-            name=name.strip()
-            if len(name)<2 or len(name)>16 or not re.match(r'^[A-Za-z0-9_]+$',name): continue
-            try:
-                x=float(p.get('x',0)); y=float(p.get('y',0)); z=float(p.get('z',0))
-                health=float(p.get('health',20)); maxhealth=float(p.get('maxHealth',20))
-                eye=float(p.get('eyeHeight',1.62)); yaw=float(p.get('yaw',0)); pitch=float(p.get('pitch',0))
-                ts=float(p.get('timestamp',now))
-            except (TypeError,ValueError): continue
-            dim=str(p.get('dimension','unknown'))[:32]; gamemode=str(p.get('gamemode','unknown'))[:16]
-            player_positions.setdefault(name,[]).append({'x':x,'y':y,'z':z,'timestamp':ts,'dimension':dim,'gamemode':gamemode})
-            if len(player_positions[name])>100: player_positions[name]=player_positions[name][-100:]
-            if name not in radar_first_seen: radar_first_seen[name]=ts
-            in_tab=is_player_in_tab(name)
-            if not in_tab and (ts-radar_first_seen.get(name,ts))>VANISH_GRACE:
-                if name not in player_vanish_since: player_vanish_since[name]=ts
-                if now-vanish_cooldown.get(name,0)>VANISH_NOTIFY_CD:
-                    vanish_cooldown[name]=now; notify_vanish(name,x,z,dim)
-            elif in_tab:
-                player_vanish_since.pop(name,None); radar_first_seen.pop(name,None)
-            vanish=name in player_vanish_since
-            tele=is_teleport(name,x,z,ts); status=update_zone_status(name,x,z)
-            imp=vanish or tele
-            since=get_online_since(name); online_sec=int(now-since) if since else 0
-            save_player_history(name,format_history_line(ts,x,y,z,dim,health,maxhealth,eye,yaw,pitch,status,in_tab,vanish,imp,online_sec,gamemode),imp)
+    for p in players_in_update:
+        if not isinstance(p,dict): continue
+        name=p.get('name')
+        if not isinstance(name,str) or not name.strip(): continue
+        name=name.strip()
+        if len(name)<2 or len(name)>16 or not re.match(r'^[A-Za-z0-9_]+$',name): continue
+        try:
+            x=float(p.get('x',0)); y=float(p.get('y',0)); z=float(p.get('z',0))
+            health=float(p.get('health',20)); maxhealth=float(p.get('maxHealth',20)); eye=float(p.get('eyeHeight',1.62))
+            yaw=float(p.get('yaw',0)); pitch=float(p.get('pitch',0)); ts=float(p.get('timestamp',now))
+        except (TypeError,ValueError): continue
+        dim=str(p.get('dimension','unknown'))[:32]; gamemode=str(p.get('gamemode','unknown'))[:16]
+        player_positions.setdefault(name,[]).append({'x':x,'y':y,'z':z,'timestamp':ts,'dimension':dim,'gamemode':gamemode})
+        if len(player_positions[name])>100: player_positions[name]=player_positions[name][-100:]
+        if name not in radar_first_seen: radar_first_seen[name]=ts
+        in_tab=is_player_in_tab(name)
+        if not in_tab and (ts-radar_first_seen.get(name,ts))>VANISH_GRACE:
+            if name not in player_vanish_since: player_vanish_since[name]=ts
+            if now-vanish_cooldown.get(name,0)>VANISH_NOTIFY_CD:
+                vanish_cooldown[name]=now; notify_vanish(name,x,z,dim)
+        elif in_tab:
+            player_vanish_since.pop(name,None); radar_first_seen.pop(name,None)
+        vanish=name in player_vanish_since
+        tele=is_teleport(name,x,z,ts); status=update_zone_status(name,x,z); imp=vanish or tele
+        since=get_online_since(name); online_sec=int(now-since) if since else 0
+        save_player_history(name,format_history_line(ts,x,y,z,dim,health,maxhealth,eye,yaw,pitch,status,in_tab,vanish,imp,online_sec,gamemode),imp)
 def vanish_checker_loop():
     while True:
         try:
             if not player_vanish_since: clear_vanish_notifications()
-        except Exception as e: print(f"[VanishChecker] err: {e}",flush=True)
+        except Exception as e: print(f"[VanishChecker] {e}",flush=True)
         time.sleep(5)
 
-# ============================================
-# TUNNEL HEALTH
-# ============================================
-tunnel_health={'status':'unknown','url':None,'type':None,'checks_total':0,'checks_ok':0,'last_error':None}
+tunnel_health={'status':'unknown','url':None,'checks_total':0,'checks_ok':0,'last_error':None}
 def sanitize_error(e):
     t=re.sub(r'<[^>]+>','',str(e)); return t.replace('<','').replace('>','')[:200]
 def check_tunnel_health():
@@ -585,45 +630,37 @@ def check_tunnel_health():
     try:
         url=tunnel()
         if not url:
-            with tunnel_health_lock: tunnel_health['status']='no_url'; tunnel_health['last_error']='No URL'
-            return
-        with tunnel_health_lock:
-            tunnel_health['url']=url; tunnel_health['type']=get_current_tunnel_type()
-            tunnel_health['checks_total']=tunnel_health.get('checks_total',0)+1
+            tunnel_health['status']='no_url'; return
+        tunnel_health['url']=url; tunnel_health['checks_total']+=1
         local_ok=False
         try:
             with urllib.request.urlopen(f'http://localhost:{PORT}/api/url',timeout=5) as r: local_ok=r.status==200
-        except Exception as e:
-            with tunnel_health_lock: tunnel_health['last_error']=f'Local: {sanitize_error(e)}'
+        except Exception as e: tunnel_health['last_error']=f'Localhost: {sanitize_error(e)}'
         try:
             req=urllib.request.Request(f'{url}/api/url',headers={'bypass-tunnel-reminder':'true','User-Agent':'HealthCheck/1.0'})
             with urllib.request.urlopen(req,timeout=10) as r:
                 if r.status==200:
-                    with tunnel_health_lock:
-                        tunnel_health['status']='ok'; tunnel_health['checks_ok']=tunnel_health.get('checks_ok',0)+1; tunnel_health['last_error']=None
+                    tunnel_health.update(status='ok',checks_ok=tunnel_health.get('checks_ok',0)+1,last_error=None)
                     with open(TUNNEL_HEALTH_FILE,'w',encoding='utf-8') as f: json.dump(tunnel_health,f,indent=2,default=str)
                     return
         except Exception as e:
-            with tunnel_health_lock:
-                tunnel_health['last_error']=f'Public: {sanitize_error(e)}'
-                tunnel_health['status']='tunnel_down' if local_ok else 'bot_down'
+            tunnel_health['last_error']=f'Public: {sanitize_error(e)}'
+            tunnel_health['status']='tunnel_down' if local_ok else 'bot_down'
         with open(TUNNEL_HEALTH_FILE,'w',encoding='utf-8') as f: json.dump(tunnel_health,f,indent=2,default=str)
-    except Exception as e: print(f"[TunnelHealth] err: {e}",flush=True)
+    except Exception as e: print(f"[TunnelHealth] {e}",flush=True)
 def tunnel_health_loop():
     time.sleep(5)
     while True:
         try: check_tunnel_health()
-        except Exception as e: print(f"[TunnelHealth] err: {e}",flush=True)
+        except Exception as e: print(f"[TunnelHealth] {e}",flush=True)
         time.sleep(60)
 def get_tunnel_status_text():
     try:
-        with tunnel_health_lock: h=dict(tunnel_health)
+        h=dict(tunnel_health); ttype=get_current_tunnel_type()
         s=h.get('status','unknown'); url=h.get('url') or tunnel() or 'не настроен'
-        t=h.get('type') or get_current_tunnel_type()
-        tinfo=f" ({t})" if t!='unknown' else ""
+        tinfo=f" ({ttype})" if ttype!='unknown' else ""
         if s=='ok':
-            tot=h.get('checks_total',0); okc=h.get('checks_ok',0)
-            rate=int(okc/tot*100) if tot else 100
+            tot=h.get('checks_total',0); okc=h.get('checks_ok',0); rate=int(okc/tot*100) if tot else 100
             return f"🟢 <b>Работает</b>{tinfo}\n{ui_row('Успех',f'{rate}%')}\n{ui_row('URL',url)}"
         if s=='tunnel_down': return f"🟡 <b>Туннель недоступен</b>{tinfo}\n{ui_row('URL',url)}"
         if s=='bot_down': return "🔴 <b>Бот недоступен</b>"
@@ -639,9 +676,6 @@ def update_url_from_log():
         except: pass
     return None
 
-# ============================================
-# САЙТ
-# ============================================
 def parse_site_status():
     global server_online_since
     try:
@@ -669,21 +703,19 @@ def parse_site_status():
             if n not in on: del player_online_since[n]
         save_online_tracking()
         result={'online':is_online,'players_online':len(players_list),'address':address,'players_list':players_list,
-            'server_online_since':server_online_since,
-            'server_uptime_sec':int(now-server_online_since) if (is_online and server_online_since) else 0}
+                'server_online_since':server_online_since,'server_uptime_sec':int(now-server_online_since) if (is_online and server_online_since) else 0}
         with open(SITE_STATUS_FILE,'w',encoding='utf-8') as f: json.dump(result,f,indent=2,ensure_ascii=False)
         return result
-    except Exception as e: print(f"[Site] err: {e}",flush=True); return None
+    except Exception as e: print(f"[Site] {e}",flush=True); return None
 def site_checker_loop():
     while True:
         try:
             s=parse_site_status()
             if s: print(f"[Site] {'🟢' if s['online'] else '🔴'} ({s['players_online']})",flush=True)
-        except Exception as e: print(f"[Site] err: {e}",flush=True)
+        except Exception as e: print(f"[Site] {e}",flush=True)
         time.sleep(60)
 def watcher_loop():
     GRACE=180
-    print("[Watcher] started (grace=180s)",flush=True)
     while True:
         try:
             time.sleep(30)
@@ -716,7 +748,7 @@ def watcher_loop():
                             hb2=lhb()
                             if cid in hb2: del hb2[cid]; shb(hb2)
                             if uid in users: del users[uid]; su(users)
-                            na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(name)}</code>\n⚠️ Нет пульса")
+                            na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(name)}</code>")
                         continue
                     lsv=heartbeats[cid].get('last_seen')
                     if not lsv: continue
@@ -726,33 +758,20 @@ def watcher_loop():
                     if delta>limit:
                         name=user.get('name','?'); at=user.get('api_token')
                         print(f"[Watcher] KICK {name} (offline)",flush=True)
-                        if at: rt(at,f"Авто-кик: offline")
+                        if at: rt(at,"Авто-кик: offline")
                         hb2=lhb()
                         if cid in hb2: del hb2[cid]; shb(hb2)
                         if uid in users: del users[uid]; su(users)
-                        na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(name)}</code>\n⏱ Offline")
-                except Exception as e: print(f"[Watcher] err {uid}: {e}",flush=True)
-        except Exception as e: print(f"[Watcher] loop err: {e}",flush=True)
-def rt(tok,r="unknown"):
-    ts=lt()
-    if tok in ts:
-        td=ts.pop(tok); st(ts); us=lu(); pid=td.get('pending_id')
-        if pid and pid in us:
-            n=us[pid].get('name','?'); del us[pid]; su(us)
-            na(f"🚫 <b>ОТОЗВАН</b>\n🤖 <code>{safe(n)}</code>\n📝 {safe(r)}")
-def na(m):
-    for a in aia():
-        try: bot.send_message(a,m,parse_mode='HTML')
-        except: pass
+                        na(f"🚫 <b>АВТО-КИК</b>\n🤖 <code>{safe(name)}</code>")
+                except Exception as e: print(f"[Watcher] {uid}: {e}",flush=True)
+        except Exception as e: print(f"[Watcher] loop: {e}",flush=True)
 
 def get_radar_stats():
-    users=lu(); heartbeats=lhb(); now=datetime.now(MSK)
-    total=online=offline=0
+    users=lu(); heartbeats=lhb(); now=datetime.now(MSK); total=online=offline=0
     for uid,u in users.items():
         if not u.get('is_bot'): continue
         if 'radar' not in u.get('assigned_pastes',[]): continue
-        total+=1
-        cid=u.get('computer_id')
+        total+=1; cid=u.get('computer_id')
         if cid and cid in heartbeats:
             try:
                 lsv=heartbeats[cid].get('last_seen')
@@ -761,9 +780,6 @@ def get_radar_stats():
         offline+=1
     return total,online,offline
 
-# ============================================
-# UI
-# ============================================
 def build_help_text():
     return (f"{ui_header('Справка v17.25','📖')}\n\n<b>🚀 Команды:</b>\n<code>/start</code> — Запуск\n<code>/menu</code> — Меню\n<code>/help</code> — Справка\n<code>/status</code> — Статус (авто 5с)\n<code>/api</code> — API\n<code>/api_reload</code> — Рестарт туннеля\n\n<b>📋 Пасты:</b>\n<code>/past</code> — Список\n<code>/past add name</code> — Создать\n<code>/past edit N</code> — Изменить\n<code>/past delete N</code> — Удалить\n\n<b>👥 Компьютеры:</b>\n<code>/all</code> — Список\n<code>/all assign COMP paste</code> — Привязать\n<code>/all perform COMP PASTE</code> — Запустить\n<code>/all kick COMP</code> — Кикнуть")
 def build_status_text():
@@ -775,9 +791,8 @@ def build_status_text():
                 with open(SITE_STATUS_FILE,'r',encoding='utf-8') as f: status=json.load(f)
         except: pass
     if not status: return None
-    state=ui_status(status.get('online')); players_list=status.get('players_list',[])
-    address=status.get('address','gmd.capscraft.com'); now=time.time()
-    txt=(f"{ui_header('Статус сервера','🌐')}\n\n{state}\n\n📡 <b>Адрес:</b> <code>{safe(address)}</code>\n")
+    state=ui_status(status.get('online')); players_list=status.get('players_list',[]); now=time.time()
+    txt=(f"{ui_header('Статус сервера','🌐')}\n\n{state}\n\n📡 <b>Адрес:</b> <code>{safe(status.get('address','gmd.capscraft.com'))}</code>\n")
     if status.get('online') and server_online_since: txt+=f"⏱ <b>Сервер онлайн:</b> <code>{fmt_duration(now-server_online_since)}</code>\n"
     txt+="\n"
     coords={}
@@ -815,12 +830,9 @@ def build_status_text():
     return txt
 def status_keyboard():
     kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🔄 Обновить",callback_data="refresh:status"),
-           types.InlineKeyboardButton("⏸ Стоп авто",callback_data="stop_auto_refresh"))
-    kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
-    return kb
+    kb.add(types.InlineKeyboardButton("🔄 Обновить",callback_data="refresh:status"),types.InlineKeyboardButton("⏸ Стоп авто",callback_data="stop_auto_refresh"))
+    kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb
 def status_auto_refresh_loop():
-    print("[Status] auto-refresh (5s)",flush=True)
     while True:
         try:
             time.sleep(STATUS_REFRESH_INTERVAL)
@@ -833,9 +845,9 @@ def status_auto_refresh_loop():
                 try: bot.edit_message_text(txt,chat_id,message_id,parse_mode='HTML',reply_markup=kb)
                 except Exception as e:
                     err=str(e)
-                    if "MESSAGE_EDIT_TIME_LIMIT" in err or "chat not found" in err or "Forbidden" in err or "can't be edited" in err:
+                    if "MESSAGE_EDIT_TIME_LIMIT" in err or "chat not found" in err or "Forbidden" in err or "message can't be edited" in err:
                         with active_status_lock: active_status_messages.pop(chat_id,None)
-        except Exception as e: print(f"[Status] err: {e}",flush=True)
+        except Exception as e: print(f"[Status] {e}",flush=True)
 def register_status_message(chat_id,message_id):
     with active_status_lock: active_status_messages[chat_id]=message_id
 def unregister_status_messages(chat_id):
@@ -847,8 +859,7 @@ def main_menu_keyboard(uid):
     kb.add(types.InlineKeyboardButton("📋 Пасты",callback_data="menu:past"),types.InlineKeyboardButton("👥 Компьютеры",callback_data="menu:all"))
     kb.add(types.InlineKeyboardButton("🌐 Сервер",callback_data="menu:status"),types.InlineKeyboardButton("🖥 API",callback_data="menu:api"))
     kb.add(types.InlineKeyboardButton(f"🕵️ Слежение: {em}",callback_data="toggle_vanish"))
-    kb.add(types.InlineKeyboardButton("❓ Помощь",callback_data="menu:help"))
-    return kb
+    kb.add(types.InlineKeyboardButton("❓ Помощь",callback_data="menu:help")); return kb
 def back_to_menu_keyboard():
     kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main")); return kb
 def bpk(ps,pg):
@@ -901,8 +912,8 @@ def confirm_keyboard(aid):
     kb=types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("✅ Да",callback_data=f"confirm:{aid}:yes"),types.InlineKeyboardButton("❌ Нет",callback_data=f"confirm:{aid}:no")); return kb
 def build_api_text():
-    tu=tunnel(); su_=tu or ("http://"+LIP+":"+str(PORT))
-    return (f"{ui_header('API Информация','🖥')}\n\n<b>⏱ Бот работает:</b> <code>{fmt_duration(bot_uptime_sec())}</code>\n\n<b>🔌 Подключение:</b>\n{ui_row('Тип',get_current_tunnel_type())}\n{ui_row('URL',su_)}\n{ui_row('Пароль',PASSWORD)}\n{ui_row('Порт',PORT)}\n\n<b>📡 Relay:</b>\n{ui_row('Канал',f'@{CHANNEL_USERNAME}')}\n{ui_row('Веб',f't.me/s/{CHANNEL_USERNAME}')}\n\n<b>🌐 Туннель:</b>\n{get_tunnel_status_text()}\n\n<b>🔧 Диагностика:</b>\n<code>{safe(su_)}/api/health</code>\n<code>{safe(su_)}/api/url</code>")
+    tu=tunnel(); su_=tu or ("http://"+LIP+":"+str(PORT)); ttype=get_current_tunnel_type()
+    return (f"{ui_header('API Информация','🖥')}\n\n<b>⏱ Бот работает:</b> <code>{fmt_duration(bot_uptime_sec())}</code>\n\n<b>🔌 Подключение:</b>\n{ui_row('Тип','☁️ cloudflared' if ttype=='cloudflared' else ('🔴 SSH' if ttype=='ssh' else '🏠 Локально'))}\n{ui_row('URL',su_)}\n{ui_row('Пароль',PASSWORD)}\n{ui_row('Порт',PORT)}\n\n<b>📡 Relay:</b>\n{ui_row('Канал',f'@{CHANNEL_USERNAME}')}\n{ui_row('Веб',f't.me/s/{CHANNEL_USERNAME}')}\n\n<b>🌐 Туннель:</b>\n{get_tunnel_status_text()}\n\n<b>🔧 Диагностика:</b>\n<code>{safe(su_)}/api/health</code>\n<code>{safe(su_)}/api/url</code>")
 def show_paste_profile(c,idx):
     ps=lp()
     if idx<0 or idx>=len(ps): bot.answer_callback_query(c.id,"❌"); return
@@ -919,67 +930,17 @@ def show_paste_profile(c,idx):
         if c.message: bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
     except: pass
     send_paste_file(c.message.chat.id if c.message else c.chat.id,c_,p['name'],c.from_user.id)
-def edit_or_send(c,t,kb=None,pm='HTML'):
-    if hasattr(c,'message') and c.message:
-        try: bot.edit_message_text(t,c.message.chat.id,c.message.message_id,parse_mode=pm,reply_markup=kb)
-        except Exception as e:
-            if "message is not modified" not in str(e):
-                try: bot.send_message(c.message.chat.id,t,parse_mode=pm,reply_markup=kb)
-                except: pass
-    elif hasattr(c,'chat'): bot.send_message(c.chat.id,t,parse_mode=pm,reply_markup=kb)
-def send_paste_file(cid,content,name,uid):
-    fid=None
-    try:
-        fo=io.BytesIO(content.encode('utf-8')); fo.name=f"{name}.txt"
-        fid=bot.send_document(cid,fo,caption=f"📄 {name}").message_id
-    except: pass
-    if fid:
-        s=gs(uid) or {}; s['last_file_msg_id']=fid; s['last_file_chat_id']=cid; sets(uid,s)
-    return fid
-def delete_last_file(uid):
-    s=gs(uid) or {}; mid=s.get('last_file_msg_id'); cid=s.get('last_file_chat_id')
-    if mid and cid:
-        try: bot.delete_message(cid,mid)
-        except: pass
-        s.pop('last_file_msg_id',None); s.pop('last_file_chat_id',None); sets(uid,s)
-def find_user_by_arg(arg,ul):
-    try:
-        i=int(arg)-1
-        if 0<=i<len(ul): return ul[i]
-    except ValueError: pass
-    al=arg.lower()
-    for tid,td in ul:
-        if (td.get('name') or '').lower()==al: return tid,td
-    for tid,td in ul:
-        if al in (td.get('name') or '').lower(): return tid,td
-    return None,None
-def find_paste_by_arg(arg,pl):
-    try:
-        i=int(arg)-1
-        if 0<=i<len(pl): return i,pl[i]
-    except ValueError: pass
-    al=arg.lower()
-    for i,p in enumerate(pl):
-        if p['name'].lower()==al: return i,p
-    for i,p in enumerate(pl):
-        if al in p['name'].lower(): return i,p
-    return None,None
 
-# ============================================
-# КОМАНДЫ
-# ============================================
-PUBLIC_COMMANDS=[types.BotCommand("start","🚀 Пуск"),types.BotCommand("menu","📱 Меню"),
-    types.BotCommand("help","❓ Помощь"),types.BotCommand("past","📋 Пасты"),types.BotCommand("all","👥 Компьютеры")]
-ADMIN_COMMANDS=PUBLIC_COMMANDS+[types.BotCommand("status","🌐 Статус (live)"),types.BotCommand("api","🖥 API"),
-    types.BotCommand("api_reload","🔄 Рестарт туннеля"),types.BotCommand("log","📄 Логи"),types.BotCommand("log_clear","🗑 Очистить")]
+PUBLIC_COMMANDS=[types.BotCommand("start","🚀 Пуск"),types.BotCommand("menu","📱 Меню"),types.BotCommand("help","❓ Помощь"),types.BotCommand("past","📋 Пасты"),types.BotCommand("all","👥 Компьютеры")]
+ADMIN_COMMANDS=PUBLIC_COMMANDS+[types.BotCommand("status","🌐 Статус (live)"),types.BotCommand("api","🖥 API"),types.BotCommand("api_reload","🔄 Рестарт туннеля"),types.BotCommand("log","📄 Логи"),types.BotCommand("log_clear","🗑 Очистить")]
 def admin_chat_ids():
     ids=set()
-    for s,d in lu().items():
+    for s in lu():
         try:
             if ia(int(s)): ids.add(int(s))
         except: pass
-    for uid in TRUSTED_PLAYERS:
-        if ia(uid): ids.add(uid)
+    for uid,name in TRUSTED_PLAYERS_INT.items():
+        if name==TECH or name in PROTECTED: ids.add(uid)
     return ids
 def update_command_menus():
     try: bot.set_my_commands(PUBLIC_COMMANDS)
@@ -987,15 +948,26 @@ def update_command_menus():
     for uid in admin_chat_ids():
         try: bot.set_my_commands(ADMIN_COMMANDS,scope=types.BotCommandScopeChat(uid))
         except Exception as e: print(f"[Menu] admin {uid}: {e}",flush=True)
-    print(f"[Menu] обновлены: public + {len(admin_chat_ids())} админов",flush=True)
+    print(f"[Menu] подсказки обновлены: public + {len(admin_chat_ids())} админов",flush=True)
 
 @bot.message_handler(commands=['api_reload'])
 def cmd_api_reload(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
     delete_last_file(m.from_user.id); unregister_status_messages(m.chat.id)
-    threading.Thread(target=lambda: force_reload_tunnel("manual_telegram"),daemon=True).start()
+    threading.Thread(target=lambda: force_reload_tunnel("manual"),daemon=True).start()
     bot.send_message(m.chat.id,"🔄 <b>Перезагрузка туннеля...</b>\nНовый URL появится в канале через 2-5с.",parse_mode='HTML')
+def force_reload_tunnel(reason="manual"):
+    global tunnel_last_activity
+    print(f"[Tunnel-RELOAD] {reason}",flush=True)
+    with tunnel_lock:
+        for proc in (tunnel_process,cloudflared_process):
+            if proc and proc.poll() is None:
+                try: proc.kill()
+                except: pass
+    tunnel_last_activity=time.time()
+    return True
+
 @bot.message_handler(commands=['log'])
 def cmd_log(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
@@ -1004,11 +976,11 @@ def cmd_log(m):
     sm=bot.send_message(m.chat.id,"📄 <b>Собираю логи...</b>",parse_mode='HTML')
     try:
         lc=get_last_log_lines()
-        if not lc: bot.edit_message_text("❌ Лог пустой",m.chat.id,sm.message_id); return
+        if not lc: bot.edit_message_text("❌ Лог пуст",m.chat.id,sm.message_id); return
         lb=lc.encode('utf-8'); fo=io.BytesIO(lb); fo.name=f"bot_log_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.log"
         try: bot.delete_message(m.chat.id,sm.message_id)
         except: pass
-        msg=bot.send_document(m.chat.id,fo,caption=f"📄 <code>{len(lb):,}</code> байт",parse_mode='HTML')
+        msg=bot.send_document(m.chat.id,fo,caption=f"📄 {len(lb):,} байт",parse_mode='HTML')
         s=gs(m.from_user.id) or {}; s['last_file_msg_id']=msg.message_id; s['last_file_chat_id']=m.chat.id; sets(m.from_user.id,s)
     except Exception as e:
         try: bot.edit_message_text(f"❌ {safe(str(e)[:200])}",m.chat.id,sm.message_id,parse_mode='HTML')
@@ -1019,10 +991,9 @@ def cmd_log_clear(m):
     if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
     delete_last_file(m.from_user.id); unregister_status_messages(m.chat.id)
     try:
-        sb=RUNTIME_LOG.stat().st_size if RUNTIME_LOG.exists() else 0
-        clear_log()
+        sb=RUNTIME_LOG.stat().st_size if RUNTIME_LOG.exists() else 0; clear_log()
         sa=RUNTIME_LOG.stat().st_size if RUNTIME_LOG.exists() else 0
-        bot.send_message(m.chat.id,f"✅ <b>Лог очищен</b>\nБыло: <code>{sb:,}</code> → <code>{sa:,}</code>",parse_mode='HTML')
+        bot.send_message(m.chat.id,f"✅ <b>Лог очищен</b>\nБыло: {sb:,} → Стало: {sa:,}",parse_mode='HTML')
     except Exception as e: bot.send_message(m.chat.id,f"❌ {safe(str(e)[:200])}",parse_mode='HTML')
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
@@ -1054,8 +1025,7 @@ def cmd_api(m):
     try: check_tunnel_health()
     except: pass
     kb=types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel"),types.InlineKeyboardButton("🔄 Рестарт туннеля",callback_data="reload_tunnel"))
-    kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
+    kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel")); kb.add(types.InlineKeyboardButton("🔄 Рестарт туннеля",callback_data="reload_tunnel")); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
     bot.send_message(m.chat.id,build_api_text(),parse_mode='HTML',reply_markup=kb)
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
@@ -1076,25 +1046,25 @@ def cmd_past(m):
     if s=='add':
         if len(pa)==2:
             n=tr(pa[1],MAX_PN).lower()
-            if any(p['name'].lower()==n for p in lp()): bot.send_message(m.chat.id,f"⚠️ <code>{safe(n)}</code> уже есть",parse_mode='HTML'); return
+            if any(p['name'].lower()==n for p in lp()): bot.send_message(m.chat.id,f"⚠️ Уже есть",parse_mode='HTML'); return
             sets(m.from_user.id,{'step':'add_file_wait','paste_name':n,'past_menu':True})
             bot.send_message(m.chat.id,f"📄 <b>Создание:</b> <code>{safe(n)}</code>\nОтправьте текст/файл или /cancel",parse_mode='HTML')
         elif len(pa)>=3:
             n=tr(pa[1],MAX_PN).lower(); c=' '.join(pa[2:])
-            if not c: bot.send_message(m.chat.id,"❌ Пустой текст"); return
-            if any(p['name'].lower()==n for p in lp()): bot.send_message(m.chat.id,f"⚠️ уже есть",parse_mode='HTML'); return
+            if not c: bot.send_message(m.chat.id,"❌ Пусто"); return
+            if any(p['name'].lower()==n for p in lp()): bot.send_message(m.chat.id,"⚠️ Уже есть",parse_mode='HTML'); return
             e=enc(c)
-            if not e: bot.send_message(m.chat.id,"❌ Ошибка шифрования"); return
+            if not e: bot.send_message(m.chat.id,"❌ enc"); return
             ps=lp(); ps.append({'name':n,'content':e,'hash':chash(c),'cid':m.from_user.id,'cn':dn(m.from_user.id),'created_at':datetime.now(MSK).isoformat()}); sp(ps)
-            bot.send_message(m.chat.id,f"{ui_header('Паст создан','✅')}\n{ui_row('Имя',n)}\n{ui_row('Размер',f'{len(c)} байт')}",parse_mode='HTML')
-        else: bot.send_message(m.chat.id,"❓ <code>/past add name [text]</code>",parse_mode='HTML')
+            bot.send_message(m.chat.id,f"{ui_header('Паст создан','✅')}\n{ui_row('Имя',n)}",parse_mode='HTML')
+        else: bot.send_message(m.chat.id,"❓ /past add name [text]",parse_mode='HTML')
     elif s=='edit':
         if len(pa)<2: bot.send_message(m.chat.id,"❓ /past edit N"); return
         idx,paste=find_paste_by_arg(pa[1],lp())
-        if idx is None: bot.send_message(m.chat.id,f"❌ Не найден"); return
+        if idx is None: bot.send_message(m.chat.id,"❌ Не найден"); return
         if paste.get('cid')!=m.from_user.id and not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Нет прав"); return
         c=dec(paste['content'])
-        if not c: bot.send_message(m.chat.id,"❌ Ошибка дешифрования"); return
+        if not c: bot.send_message(m.chat.id,"❌ dec"); return
         sets(m.from_user.id,{'step':'edit_file_wait','idx':idx,'past_menu':True})
         bot.send_message(m.chat.id,f"{ui_header('Редактирование','📝')}\n<b>📄 {safe(paste['name'])}</b>\n<pre>{safe(c[:500])}</pre>\nОтправьте текст/файл или /cancel",parse_mode='HTML')
     elif s=='delete':
@@ -1107,7 +1077,7 @@ def cmd_past(m):
 def spm(cid,pg,msg_to_edit=None):
     ps=lp()
     if not ps:
-        txt=f"{ui_header('Пасты','📋')}\n\n<i>📭 Пусто</i>\n<code>/past add name text</code>"
+        txt=f"{ui_header('Пасты','📋')}\n<i>📭 Пусто</i>\n<code>/past add name text</code>"
         if msg_to_edit: edit_or_send(msg_to_edit,txt,back_to_menu_keyboard())
         else: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=back_to_menu_keyboard())
         return
@@ -1120,24 +1090,24 @@ def cmd_all(m):
     if not reg(m.from_user.id): bot.send_message(m.chat.id,"/start"); return
     delete_last_file(m.from_user.id); unregister_status_messages(m.chat.id)
     us=lu(); my=us.get(str(m.from_user.id))
-    if not my or my.get('is_bot') or not my.get('name'): bot.send_message(m.chat.id,"⚠️ Только для пользователей"); return
+    if not my or my.get('is_bot') or not my.get('name'): bot.send_message(m.chat.id,"⚠️ Только пользователи"); return
     pa=m.text.split()[1:]
     if not pa: sam(m.chat.id,0); return
     s=pa[0].lower()
     if s=='assign':
-        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
-        if len(pa)<3: bot.send_message(m.chat.id,"❓ <code>/all assign COMP paste</code>",parse_mode='HTML'); return
+        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Админ"); return
+        if len(pa)<3: bot.send_message(m.chat.id,"❓ /all assign COMP paste",parse_mode='HTML'); return
         tid,td=find_user_by_arg(pa[1],list(us.items()))
         if tid is None: bot.send_message(m.chat.id,"❌ Не найден"); return
         if not td.get('is_bot'): bot.send_message(m.chat.id,"❌ Не компьютер"); return
         pn=pa[2].lower()
         if not any(p['name'].lower()==pn for p in lp()): bot.send_message(m.chat.id,"❌ Паст не найден",parse_mode='HTML'); return
-        cp=td.get('assigned_pastes',[])
-        if pn in cp: bot.send_message(m.chat.id,"⚠️ уже привязан"); return
-        cp.append(pn); us[tid]['assigned_pastes']=cp; su(us)
+        cp_=td.get('assigned_pastes',[])
+        if pn in cp_: bot.send_message(m.chat.id,"⚠️ Уже привязан"); return
+        cp_.append(pn); us[tid]['assigned_pastes']=cp_; su(us)
         bot.send_message(m.chat.id,f"{ui_header('Привязан','✅')}\n{ui_row('🤖',td.get('name',''))}\n{ui_row('📄',pn)}",parse_mode='HTML')
     elif s=='unassign':
-        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
+        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Админ"); return
         if len(pa)<2: bot.send_message(m.chat.id,"❓ /all unassign COMP"); return
         tid,td=find_user_by_arg(pa[1],list(us.items()))
         if tid is None: bot.send_message(m.chat.id,"❌ Не найден"); return
@@ -1145,18 +1115,18 @@ def cmd_all(m):
         rc=len(td.get('assigned_pastes',[])); us[tid]['assigned_pastes']=[]; su(us)
         bot.send_message(m.chat.id,f"{ui_header('Отвязано','✅')}\n{ui_row('🗑',rc)}",parse_mode='HTML')
     elif s=='perform':
-        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
-        if len(pa)<3: bot.send_message(m.chat.id,"❓ <code>/all perform COMP PASTE</code>",parse_mode='HTML'); return
+        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Админ"); return
+        if len(pa)<3: bot.send_message(m.chat.id,"❓ /all perform COMP PASTE",parse_mode='HTML'); return
         tid,td=find_user_by_arg(pa[1],list(us.items()))
         if tid is None: bot.send_message(m.chat.id,"❌ Не найден"); return
         if not td.get('is_bot'): bot.send_message(m.chat.id,"❌ Не компьютер"); return
         pi,paste=find_paste_by_arg(pa[2],lp())
         if pi is None: bot.send_message(m.chat.id,"❌ Паст не найден"); return
-        cp=td.get('assigned_pastes',[]); act="Уже привязан" if paste['name'] in cp else "Добавлен и запущен"
-        if paste['name'] not in cp: cp.append(paste['name']); us[tid]['assigned_pastes']=cp; su(us)
+        cp_=td.get('assigned_pastes',[]); act="Уже привязан" if paste['name'] in cp_ else "Добавлен и запущен"
+        if paste['name'] not in cp_: cp_.append(paste['name']); us[tid]['assigned_pastes']=cp_; su(us)
         bot.send_message(m.chat.id,f"{ui_header('Выполнено','✅')}\n{ui_row('🤖',td.get('name',''))}\n{ui_row('📄',paste['name'])}\n{ui_row('📊',act)}",parse_mode='HTML')
     elif s=='kick':
-        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
+        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Админ"); return
         if len(pa)<2: bot.send_message(m.chat.id,"❓ /all kick COMP"); return
         tid,td=find_user_by_arg(pa[1],list(us.items()))
         if tid is None: bot.send_message(m.chat.id,"❌ Не найдено"); return
@@ -1165,7 +1135,7 @@ def cmd_all(m):
         if str(m.from_user.id)==tid: bot.send_message(m.chat.id,"❌ Нельзя себя"); return
         bot.send_message(m.chat.id,f"⚠️ <b>Кикнуть?</b>\n🤖 <code>{safe(tn)}</code>",parse_mode='HTML',reply_markup=confirm_keyboard(f"kick:{tid}"))
     elif s=='kiktime':
-        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Только администраторы"); return
+        if not ia(m.from_user.id): bot.send_message(m.chat.id,"❌ Админ"); return
         if len(pa)<2:
             try:
                 with open(CFG,'r',encoding='utf-8') as f: gm=json.load(f).get('kiktime_minutes',10)
@@ -1185,7 +1155,7 @@ def cmd_all(m):
                 with open(CFG,'r',encoding='utf-8') as f: c=json.load(f)
                 c['kiktime_minutes']=nm
                 with open(CFG,'w',encoding='utf-8') as f: json.dump(c,f,indent=2,ensure_ascii=False)
-                bot.send_message(m.chat.id,f"{ui_header('Глобальный лимит','✅')}\n{ui_row('⏱',f'{nm} мин')}",parse_mode='HTML')
+                bot.send_message(m.chat.id,f"{ui_header('Глобальный лимит','✅')}\n{ui_row('Новое',f'{nm} мин')}",parse_mode='HTML')
             except Exception as e: bot.send_message(m.chat.id,f"❌ {safe(e)}")
 def sam(cid,pg,msg_to_edit=None):
     us=lu()
@@ -1227,17 +1197,17 @@ def handle_document(m):
     step=state.get('step')
     if step not in ['add_file_wait','edit_file_wait']: return
     doc=m.document
-    if doc.file_size>1024*1024: bot.send_message(m.chat.id,"❌ Макс 1MB"); return
+    if doc.file_size>MAX_CONTENT_LENGTH: bot.send_message(m.chat.id,"❌ Слишком большой"); return
     try:
         fi=bot.get_file(doc.file_id); content=bot.download_file(fi.file_path).decode('utf-8',errors='ignore')
     except Exception as e: bot.send_message(m.chat.id,f"❌ {safe(e)}"); return
-    if not content.strip(): bot.send_message(m.chat.id,"❌ Пустой"); return
+    if not content.strip(): bot.send_message(m.chat.id,"❌ Пусто"); return
     if step=='add_file_wait':
         name=state.get('paste_name')
         if not name: cs(m.from_user.id); return
-        if any(p['name'].lower()==name for p in lp()): cs(m.from_user.id); bot.send_message(m.chat.id,"⚠️ уже есть"); return
+        if any(p['name'].lower()==name for p in lp()): cs(m.from_user.id); bot.send_message(m.chat.id,"⚠️ Уже есть"); return
         e=enc(content)
-        if not e: bot.send_message(m.chat.id,"❌ Ошибка шифрования"); return
+        if not e: bot.send_message(m.chat.id,"❌ enc"); return
         ps=lp(); ps.append({'name':name,'content':e,'hash':chash(content),'cid':m.from_user.id,'cn':dn(m.from_user.id),'created_at':datetime.now(MSK).isoformat()}); sp(ps)
         cs(m.from_user.id)
         bot.send_message(m.chat.id,f"{ui_header('Паст создан','✅')}\n{ui_row('Имя',name)}",parse_mode='HTML')
@@ -1246,7 +1216,7 @@ def handle_document(m):
         if idx is None or idx<0 or idx>=len(ps): cs(m.from_user.id); bot.send_message(m.chat.id,"❌ Не найден"); return
         if ps[idx].get('cid')!=m.from_user.id and not ia(m.from_user.id): cs(m.from_user.id); bot.send_message(m.chat.id,"❌ Нет прав"); return
         e=enc(content)
-        if not e: bot.send_message(m.chat.id,"❌ Ошибка шифрования"); return
+        if not e: bot.send_message(m.chat.id,"❌ enc"); return
         ps[idx]['content']=e; ps[idx]['hash']=chash(content); ps[idx]['edited_at']=datetime.now(MSK).isoformat(); sp(ps)
         cs(m.from_user.id)
         bot.send_message(m.chat.id,f"{ui_header('Обновлён','✅')}\n{ui_row('Имя',ps[idx]['name'])}",parse_mode='HTML')
@@ -1259,8 +1229,7 @@ def cb(c):
         if d=="stop_auto_refresh":
             unregister_status_messages(c.message.chat.id); bot.answer_callback_query(c.id,"⏸")
             try:
-                kb=types.InlineKeyboardMarkup()
-                kb.add(types.InlineKeyboardButton("🔄 Обновить",callback_data="refresh:status"),types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
+                kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔄 Обновить",callback_data="refresh:status")); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
                 bot.edit_message_reply_markup(c.message.chat.id,c.message.message_id,reply_markup=kb)
             except: pass
             return
@@ -1269,14 +1238,13 @@ def cb(c):
             try: check_tunnel_health()
             except: pass
             kb=types.InlineKeyboardMarkup(row_width=2)
-            kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel"),types.InlineKeyboardButton("🔄 Рестарт",callback_data="reload_tunnel"))
-            kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
+            kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel")); kb.add(types.InlineKeyboardButton("🔄 Рестарт",callback_data="reload_tunnel")); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
             edit_or_send(c,build_api_text(),kb); return
         if d=="reload_tunnel":
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
             bot.answer_callback_query(c.id,"🔄")
-            threading.Thread(target=lambda: force_reload_tunnel("manual_button"),daemon=True).start()
-            try: bot.send_message(c.message.chat.id,"🔄 <b>Перезагрузка туннеля...</b>",parse_mode='HTML')
+            threading.Thread(target=lambda: force_reload_tunnel("button"),daemon=True).start()
+            try: bot.send_message(c.message.chat.id,"🔄 Перезагрузка туннеля...",parse_mode='HTML')
             except: pass
             return
         if d=="toggle_vanish":
@@ -1286,7 +1254,7 @@ def cb(c):
             cur=users[uid].get('vanish_tracking',False); users[uid]['vanish_tracking']=not cur; su(users)
             bot.answer_callback_query(c.id,f"🕵️ {'ВКЛ' if not cur else 'ВЫКЛ'}")
             us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
-            txt=f"{ui_header('Главное меню','📱')}\n{ui_row('🤖',bc)}\n{ui_row('👤',len(us)-bc)}\n{ui_row('📄',len(lp()))}"
+            txt=f"{ui_header('Главное меню','📱')}\n{ui_row('🤖',bc)}\n{ui_row('👤',len(us)-bc)}\n{ui_row('📄',len(lp()))}\nВыберите раздел:"
             try: bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=main_menu_keyboard(c.from_user.id))
             except: pass
             return
@@ -1296,7 +1264,7 @@ def cb(c):
                 delete_last_file(c.from_user.id); unregister_status_messages(c.message.chat.id)
             if sec=="main":
                 us=lu(); bc=sum(1 for u in us.values() if u.get('is_bot'))
-                edit_or_send(c,f"{ui_header('Главное меню','📱')}\n{ui_row('🤖',bc)}\n{ui_row('👤',len(us)-bc)}\n{ui_row('📄',len(lp()))}",main_menu_keyboard(c.from_user.id))
+                edit_or_send(c,f"{ui_header('Главное меню','📱')}\n{ui_row('🤖',bc)}\n{ui_row('👤',len(us)-bc)}\n{ui_row('📄',len(lp()))}\nВыберите раздел:",main_menu_keyboard(c.from_user.id))
             elif sec=="past": spm(c.message.chat.id,0,msg_to_edit=c)
             elif sec=="all": sam(c.message.chat.id,0,msg_to_edit=c)
             elif sec=="status":
@@ -1306,13 +1274,13 @@ def cb(c):
                         bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=status_keyboard())
                         register_status_message(c.message.chat.id,c.message.message_id)
                     except: pass
+                else: bot.answer_callback_query(c.id,"❌")
             elif sec=="api":
                 update_url_from_log()
                 try: check_tunnel_health()
                 except: pass
                 kb=types.InlineKeyboardMarkup(row_width=2)
-                kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel"),types.InlineKeyboardButton("🔄 Рестарт",callback_data="reload_tunnel"))
-                kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
+                kb.add(types.InlineKeyboardButton("🔄 Проверить",callback_data="check_tunnel")); kb.add(types.InlineKeyboardButton("🔄 Рестарт",callback_data="reload_tunnel")); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
                 edit_or_send(c,build_api_text(),kb)
             elif sec=="help":
                 kb=types.InlineKeyboardMarkup(); kb.add(types.InlineKeyboardButton("🔙 Меню",callback_data="menu:main"))
@@ -1373,8 +1341,7 @@ def cb(c):
             if uk not in us or not us[uk].get('is_bot'): bot.answer_callback_query(c.id,"❌"); return
             cm=us[uk].get('mode','normal'); nm='normal' if cm=='service' else 'service'
             us[uk]['mode']=nm; su(us)
-            bot.answer_callback_query(c.id,f"🔄 {nm}")
-            sbp(c.message.chat.id,c.message.message_id,uk); return
+            bot.answer_callback_query(c.id,f"🔄 {nm}"); sbp(c.message.chat.id,c.message.message_id,uk); return
         if d.startswith("kt_set:"):
             uk=d.split(":")[1]
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
@@ -1386,25 +1353,23 @@ def cb(c):
             us=lu()
             if uk in us and 'kiktime_override' in us[uk]:
                 del us[uk]['kiktime_override']; su(us)
-                bot.answer_callback_query(c.id,"✅ Сброшен"); sbp(c.message.chat.id,c.message.message_id,uk)
-            else: bot.answer_callback_query(c.id,"⚠️"); return
+                bot.answer_callback_query(c.id,"✅"); sbp(c.message.chat.id,c.message.message_id,uk)
+            else: bot.answer_callback_query(c.id,"⚠️")
+            return
         if d.startswith("hb_menu:"):
             uk=d.split(":")[1]
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
-            bot.edit_message_reply_markup(c.message.chat.id,c.message.message_id,reply_markup=hb_keyboard(uk))
-            bot.answer_callback_query(c.id); return
+            bot.edit_message_reply_markup(c.message.chat.id,c.message.message_id,reply_markup=hb_keyboard(uk)); bot.answer_callback_query(c.id); return
         if d.startswith("hb_set:"):
             parts=d.split(":"); uk=parts[1]; sec=validate_hb_interval(parts[2])
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
             us=lu()
             if uk in us: us[uk]['heartbeat_interval']=sec; su(us)
-            bot.answer_callback_query(c.id,f"💓 {hb_category(sec)}")
-            sbp(c.message.chat.id,c.message.message_id,uk); return
+            bot.answer_callback_query(c.id,f"💓 {hb_category(sec)}"); sbp(c.message.chat.id,c.message.message_id,uk); return
         if d.startswith("hb_custom:"):
             uk=d.split(":")[1]
             if not ia(c.from_user.id): bot.answer_callback_query(c.id,"❌"); return
-            sets(c.from_user.id,{'step':'hb_wait','target':uk})
-            bot.answer_callback_query(c.id,"⏱ Введите секунды"); return
+            sets(c.from_user.id,{'step':'hb_wait','target':uk}); bot.answer_callback_query(c.id,"⏱ Секунды"); return
         if d.startswith("pp:"): delete_last_file(c.from_user.id); spm(c.message.chat.id,int(d.split(":")[1]),msg_to_edit=c); bot.answer_callback_query(c.id); return
         if d.startswith("ap:"): sam(c.message.chat.id,int(d.split(":")[1]),msg_to_edit=c); bot.answer_callback_query(c.id); return
         if d.startswith("pv:"): show_paste_profile(c,int(d.split(":")[1])); bot.answer_callback_query(c.id); return
@@ -1426,7 +1391,7 @@ def cb(c):
             bot.answer_callback_query(c.id,"⚠️"); return
         bot.answer_callback_query(c.id)
     except Exception as e:
-        print(f"[CB] err: {e}",flush=True)
+        print(f"[CB] {e}",flush=True)
         try: bot.answer_callback_query(c.id)
         except: pass
 def sbp(cid,mid,uk):
@@ -1439,17 +1404,17 @@ def sbp(cid,mid,uk):
         try: bot.edit_message_text(txt,cid,mid,parse_mode='HTML',reply_markup=kb)
         except: bot.send_message(cid,txt,parse_mode='HTML',reply_markup=kb)
         return
-    at=u.get('api_token','?'); hb=lhb(); ci=u.get('computer_id'); ht="❓"
-    if ci in hb:
+    at=u.get('api_token','?'); hb_data=lhb(); ci=u.get('computer_id'); ht="❓"
+    if ci in hb_data:
         try:
-            lm=int((datetime.now(MSK)-datetime.fromisoformat(hb[ci]['last_seen'])).total_seconds()/60)
+            lm=int((datetime.now(MSK)-datetime.fromisoformat(hb_data[ci]['last_seen'])).total_seconds()/60)
             ht="🟢 Только что" if lm<1 else (f"🟢 {lm}м" if lm<10 else f"🔴 {lm}м")
         except: pass
     kt=f"{u['kiktime_override']} мин (перс.)" if u.get('kiktime_override') else "Глобальный"
-    ap=u.get('assigned_pastes',[])
-    txt=(f"{ui_header(u.get('name',''),'🤖')}\n{ui_row('🆔 CID',ci)}\n{ui_row('🆔 UID',uk)}\n{ui_row('🔑',(at[:12]+'...') if len(at)>12 else at)}\n{ui_row('🎯',ui_mode(u.get('mode','normal')))}\n{ui_row('💓 Пульс',ht)}\n{ui_row('💓 Интервал',hb_category(u.get('heartbeat_interval',30)))}\n{ui_row('⏱ Лимит',kt)}\n")
+    ap=u.get('assigned_pastes',[]); hbi=u.get('heartbeat_interval',30)
+    txt=(f"{ui_header(u.get('name',''),'🤖')}\n{ui_row('🆔 CID',ci)}\n{ui_row('🆔 UID',uk)}\n{ui_row('🔑 Токен',(at[:12]+'...') if len(at)>12 else at)}\n{ui_row('🎯 Режим',ui_mode(u.get('mode','normal')))}\n{ui_row('💓 Пульс',ht)}\n{ui_row('💓 Интервал',hb_category(hbi))}\n{ui_row('⏱ Лимит',kt)}\n")
     if ap:
-        txt+="<b>📋 Скрипты:</b>\n"
+        txt+=f"<b>📋 Скрипты ({len(ap)}):</b>\n"
         for p in ap[:10]: txt+=f"  • <code>{safe(p)}</code>\n"
     else: txt+="<b>📋 Скрипты:</b> <i>нет</i>\n"
     try: bot.edit_message_text(txt,cid,mid,parse_mode='HTML',reply_markup=bbpk(uk))
@@ -1462,21 +1427,25 @@ def hm(m):
     if s:
         stp=s.get('step')
         if stp=='wp':
+            ok,_=check_rate_limit(f"pw:{u}")
+            if not ok:
+                bot.send_message(m.chat.id,f"⏳ Много попыток, ждите {RATE_LIMIT_WINDOW}с"); log_failed_login(f"pw:{u}","rate"); return
             if t==PASSWORD:
                 if s.get('is_bot'):
                     us=lu(); us[str(u)]={'name':None,'username':s.get('username'),'is_bot':True,'is_admin':False,'registered_at':datetime.now(MSK).isoformat()}; su(us); cs(u)
-                    bot.send_message(m.chat.id,"✅ <b>Доступ разрешён</b>",parse_mode='HTML')
+                    bot.send_message(m.chat.id,"✅ Доступ разрешён",parse_mode='HTML')
                 else:
                     ns=dict(s); ns['step']='wn'; sets(u,ns)
-                    bot.send_message(m.chat.id,"✅ <b>Пароль верный</b>\n👤 Введите имя:",parse_mode='HTML')
-            else: bot.send_message(m.chat.id,"❌ <b>Неверный пароль</b>",parse_mode='HTML')
+                    bot.send_message(m.chat.id,"✅ Пароль верный\n👤 Введите имя:",parse_mode='HTML')
+            else:
+                bot.send_message(m.chat.id,"❌ Неверный пароль",parse_mode='HTML'); log_failed_login(f"pw:{u}","bad")
             return
         if stp=='wn':
             n=tr(t,MAX_N); us=lu()
-            if n.lower() in [x.get('name','').lower() for x in us.values() if x.get('name')]: bot.send_message(m.chat.id,"⚠️ Имя занято"); return
+            if n.lower() in [x.get('name','').lower() for x in us.values() if x.get('name')]: bot.send_message(m.chat.id,"⚠️ Занято"); return
             f=len(us)==0; aa=f or (n.lower() in [p.lower() for p in PROTECTED])
             us[str(u)]={'name':n,'username':s.get('username'),'is_bot':False,'is_admin':aa,'registered_at':datetime.now(MSK).isoformat()}; su(us); cs(u)
-            bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','🎉')}\n👤 <b>{safe(n)}</b>\n{'👑 <b>Админ</b>\n' if (f or aa) else ''}📱 /menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
+            bot.send_message(m.chat.id,f"{ui_header('Добро пожаловать','🎉')}\n👤 <b>{safe(n)}</b>\n{'👑 Админ\n' if (f or aa) else ''}📱 /menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
             return
         if stp=='hb_wait':
             sec=validate_hb_interval(t); tgt=s.get('target'); us=lu()
@@ -1486,9 +1455,9 @@ def hm(m):
             if t.lower() in ['/cancel','cancel']: cs(u); bot.send_message(m.chat.id,"❌"); return
             name=s.get('paste_name')
             if not name: cs(u); return
-            if any(p['name'].lower()==name for p in lp()): cs(u); bot.send_message(m.chat.id,"⚠️ уже есть"); return
+            if any(p['name'].lower()==name for p in lp()): cs(u); bot.send_message(m.chat.id,"⚠️ Уже есть"); return
             e=enc(t)
-            if not e: bot.send_message(m.chat.id,"❌ Ошибка шифрования"); return
+            if not e: bot.send_message(m.chat.id,"❌ enc"); return
             ps=lp(); ps.append({'name':name,'content':e,'hash':chash(t),'cid':u,'cn':dn(u),'created_at':datetime.now(MSK).isoformat()}); sp(ps)
             cs(u); bot.send_message(m.chat.id,f"{ui_header('Создан','✅')}\n{ui_row('Имя',name)}",parse_mode='HTML'); return
         if stp=='edit_file_wait':
@@ -1497,7 +1466,7 @@ def hm(m):
             if idx is None or idx<0 or idx>=len(ps): cs(u); bot.send_message(m.chat.id,"❌"); return
             if ps[idx].get('cid')!=u and not ia(u): cs(u); bot.send_message(m.chat.id,"❌ Нет прав"); return
             e=enc(t)
-            if not e: bot.send_message(m.chat.id,"❌ Ошибка шифрования"); return
+            if not e: bot.send_message(m.chat.id,"❌ enc"); return
             ps[idx]['content']=e; ps[idx]['hash']=chash(t); ps[idx]['edited_at']=datetime.now(MSK).isoformat(); sp(ps)
             cs(u); bot.send_message(m.chat.id,f"{ui_header('Обновлён','✅')}\n{ui_row('Имя',ps[idx]['name'])}",parse_mode='HTML'); return
         if stp=='dc':
@@ -1517,19 +1486,17 @@ def hm(m):
             if nm<1 or nm>1440: bot.send_message(m.chat.id,"❌ 1-1440"); return
             us=lu()
             if tgt in us: us[tgt]['kiktime_override']=nm; su(us); cs(u); bot.send_message(m.chat.id,f"{ui_header('Лимит','✅')}\n{ui_row('⏱',f'{nm} мин')}",parse_mode='HTML')
-            else: cs(u); bot.send_message(m.chat.id,"❌"); return
+            else: cs(u); bot.send_message(m.chat.id,"❌")
+            return
         return
     if t.startswith('/'):
         cn=t.split()[0][1:].lower().split('@')[0]
-        if cn not in KNOWN: bot.send_message(m.chat.id,"❓ <b>Неизвестная команда</b>\n/help",parse_mode='HTML'); return
+        if cn not in KNOWN: bot.send_message(m.chat.id,"❓ Неизвестная команда\n/help",parse_mode='HTML'); return
     if not reg(u):
         un=m.from_user.username or ("id_"+str(u)); sets(u,{'step':'wp','username':un,'is_bot':m.from_user.is_bot})
         bot.send_message(m.chat.id,f"{ui_header('Авторизация','👤')}\n👋 <b>{safe(un)}</b>\n🔐 Пароль:",parse_mode='HTML'); return
-    bot.send_message(m.chat.id,"💡 <b>Меню</b>\n/menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
+    bot.send_message(m.chat.id,"💡 Меню\n/menu",parse_mode='HTML',reply_markup=main_menu_keyboard(u))
 
-# ============================================
-# HTTP API
-# ============================================
 class TS(ThreadingMixIn,HTTPServer): daemon_threads=True; allow_reuse_address=True; request_queue_size=128
 class AH(BaseHTTPRequestHandler):
     def log_message(self,f,*a):
@@ -1552,10 +1519,10 @@ class AH(BaseHTTPRequestHandler):
             try: self.wfile.write(b); self.wfile.flush()
             except (BrokenPipeError,ConnectionResetError): pass
         except (BrokenPipeError,ConnectionResetError): pass
-        except Exception as e: print(f"[API] err: {e}",flush=True)
+        except Exception as e: print(f"[API] {e}",flush=True)
     def _b(self):
         l=int(self.headers.get('Content-Length',0))
-        if l>10*1024*1024: return None
+        if l>MAX_CONTENT_LENGTH: return None
         return self.rfile.read(l).decode() if l>0 else ""
     def _check_friend_auth(self):
         k=self.headers.get('X-Server-Key','')
@@ -1571,8 +1538,8 @@ class AH(BaseHTTPRequestHandler):
             us=lu(); pid=ti.get('pending_id')
             if pid in us and us[pid].get('is_bot'): ib=True
         if ib and ci:
-            td=ts.get(tok); rc=td.get('computer_id')
-            if rc and rc!=ci: return tok,ib,False,"intr",None
+            ok,r,sd=vs(tok,ci,self.client_address[0])
+            if not ok: return tok,ib,False,r,sd
         return tok,ib,True,"ok",ti
     def do_OPTIONS(self):
         try:
@@ -1587,24 +1554,23 @@ class AH(BaseHTTPRequestHandler):
     def do_GET(self):
         try: self._get()
         except (BrokenPipeError,ConnectionResetError): pass
-        except Exception as e: print(f"[API] GET err: {e}",flush=True)
+        except Exception as e: print(f"[API GET] {e}",flush=True)
     def _get(self):
         if not API_EN: self._j(503,{"error":"Disabled"}); return
         tok,ib,v,r,ti=self._a(); p=self.path.split('?')[0]
         if p=='/api/health':
             try: check_tunnel_health()
             except: pass
-            with tunnel_health_lock: h=dict(tunnel_health)
-            h.update(bot_status='running',bot_version='17.25',bot_uptime_sec=bot_uptime_sec(),
-                bot_uptime=fmt_duration(bot_uptime_sec()),
-                server_uptime_sec=int(time.time()-server_online_since) if server_online_since else 0,
-                registered_bots=sum(1 for u in lu().values() if u.get('is_bot')),total_pastes=len(lp()))
+            h=dict(tunnel_health)
+            h.update(bot_status='running',bot_version='17.25',bot_uptime_sec=bot_uptime_sec(),bot_uptime=fmt_duration(bot_uptime_sec()),
+                     server_uptime_sec=int(time.time()-server_online_since) if server_online_since else 0,
+                     registered_bots=sum(1 for u in lu().values() if u.get('is_bot')),total_pastes=len(lp()))
             self._j(200,h); return
         if p=='/api/reload':
             if not tok: self._j(401,{"error":"no token"}); return
             if not v: self._j(403,{"error":"invalid"}); return
-            threading.Thread(target=lambda: force_reload_tunnel("api_request"),daemon=True).start()
-            self._j(200,{"ok":True,"message":"reload requested"}); return
+            threading.Thread(target=lambda: force_reload_tunnel("api"),daemon=True).start()
+            self._j(200,{"ok":True}); return
         if p=='/api/url':
             update_url_from_log(); u=tunnel()
             if u: self._j(200,{"url":u,"timestamp":datetime.now(MSK).isoformat()})
@@ -1612,7 +1578,7 @@ class AH(BaseHTTPRequestHandler):
             return
         if p=='/api/relay_url':
             u=get_current_tunnel_url()
-            if u: self._j(200,{"url":u,"channel":f"https://t.me/s/{CHANNEL_USERNAME}","relay":"telegram"})
+            if u: self._j(200,{"url":u,"timestamp":datetime.now(MSK).isoformat(),"channel":f"https://t.me/s/{CHANNEL_USERNAME}","relay":"telegram"})
             else: self._j(503,{"error":"no tunnel yet"})
             return
         if p=='/api/check':
@@ -1627,8 +1593,7 @@ class AH(BaseHTTPRequestHandler):
         if p.startswith('/api/players') or p.startswith('/api/player/') or p.startswith('/api/locations'):
             if not self._check_friend_auth(): self._j(403,{"error":"Unauthorized"}); return
             if p=='/api/players/list':
-                pl=[f.stem for f in PLAYERS_DIR.glob('*.txt')]
-                self._j(200,{"players":pl,"count":len(pl)}); return
+                pl=[f.stem for f in PLAYERS_DIR.glob('*.txt')]; self._j(200,{"players":pl,"count":len(pl)}); return
             elif p=='/api/players/all':
                 res={}
                 for f in PLAYERS_DIR.glob('*.txt'):
@@ -1640,7 +1605,7 @@ class AH(BaseHTTPRequestHandler):
                 name=p.split('/')[-1]
                 if not name or not re.match(r'^[A-Za-z0-9_]{2,16}$',name): self._j(400,{"error":"invalid name"}); return
                 fp=PLAYERS_DIR/f"{name}.txt"
-                if not fp.exists(): self._j(404,{"error":"Not found"}); return
+                if not fp.exists: self._j(404,{"error":"Not found"}); return
                 try:
                     parsed=[]
                     with open(fp,'r',encoding='utf-8') as f:
@@ -1648,12 +1613,12 @@ class AH(BaseHTTPRequestHandler):
                             parts=line.split('|')
                             if len(parts)>=13:
                                 try:
-                                    e={"time":parts[0],"x":float(parts[1].split(',')[0]),"y":float(parts[1].split(',')[1]),"z":float(parts[1].split(',')[2]),
-                                        "dimension":parts[2],"health":float(parts[3]),"maxHealth":float(parts[4]),"eyeHeight":float(parts[5]),
-                                        "yaw":float(parts[6]),"pitch":float(parts[7]),"status":parts[8],
-                                        "in_tab":parts[9]=="true","vanish":parts[10]=="true","important":parts[11]=="true","online_sec":int(parts[12])}
-                                    if len(parts)>=14: e["gamemode"]=parts[13]
-                                    parsed.append(e)
+                                    entry={"time":parts[0],"x":float(parts[1].split(',')[0]),"y":float(parts[1].split(',')[1]),"z":float(parts[1].split(',')[2]),
+                                           "dimension":parts[2],"health":float(parts[3]),"maxHealth":float(parts[4]),"eyeHeight":float(parts[5]),
+                                           "yaw":float(parts[6]),"pitch":float(parts[7]),"status":parts[8],"in_tab":parts[9]=="true",
+                                           "vanish":parts[10]=="true","important":parts[11]=="true","online_sec":int(parts[12])}
+                                    if len(parts)>=14: entry["gamemode"]=parts[13]
+                                    parsed.append(entry)
                                 except: continue
                     self._j(200,{"name":name,"history":parsed,"count":len(parsed)}); return
                 except Exception as e: self._j(500,{"error":str(e)}); return
@@ -1683,8 +1648,7 @@ class AH(BaseHTTPRequestHandler):
                 us=lu(); pid=ti.get('pending_id')
                 al=[x.lower() for x in us[pid].get('assigned_pastes',[])] if pid and pid in us else []
                 if not al or n not in al:
-                    rt(tok,"PANIC"); na("🚨 <b>PANIC!</b>")
-                    self._j(403,{"error":"PANIC","code":"PANIC"}); return
+                    rt(tok,"PANIC"); na("🚨 PANIC!"); self._j(403,{"error":"PANIC","code":"PANIC"}); return
             for x in lp():
                 if x['name'].lower()==n:
                     c=dec(x['content'])
@@ -1699,7 +1663,7 @@ class AH(BaseHTTPRequestHandler):
     def do_POST(self):
         try: self._post()
         except (BrokenPipeError,ConnectionResetError): pass
-        except Exception as e: print(f"[API] POST err: {e}",flush=True)
+        except Exception as e: print(f"[API POST] {e}",flush=True)
     def _post(self):
         if not API_EN: self._j(503,{"error":"Disabled"}); return
         tok,ib,v,r,ti=self._a(); p=self.path.split('?')[0]
@@ -1715,8 +1679,7 @@ class AH(BaseHTTPRequestHandler):
         if p=='/api/locations/create':
             if not self._check_friend_auth(): self._j(403,{"error":"Unauthorized"}); return
             try:
-                d=json.loads(b) if b else {}
-                name=d.get('name'); pts=d.get('points',[])
+                d=json.loads(b) if b else {}; name=d.get('name'); pts=d.get('points',[])
                 if not name or len(pts)<3: self._j(400,{"error":"Need name+3pts"}); return
                 locs=rj(LOCATIONS_FILE,{}); locs[name]=pts; wj(LOCATIONS_FILE,locs)
                 self._j(201,{"ok":True,"location":name}); return
@@ -1724,8 +1687,7 @@ class AH(BaseHTTPRequestHandler):
         if p=='/api/locations/delete':
             if not self._check_friend_auth(): self._j(403,{"error":"Unauthorized"}); return
             try:
-                d=json.loads(b) if b else {}
-                name=d.get('name')
+                d=json.loads(b) if b else {}; name=d.get('name')
                 if not name: self._j(400,{"error":"Need name"}); return
                 locs=rj(LOCATIONS_FILE,{})
                 if name in locs: del locs[name]; wj(LOCATIONS_FILE,locs); self._j(200,{"ok":True}); return
@@ -1733,10 +1695,14 @@ class AH(BaseHTTPRequestHandler):
             except Exception as e: self._j(500,{"error":str(e)}); return
         if p=='/api/login':
             cip=self.client_address[0]
+            ok,_=check_rate_limit(f"login:{cip}")
+            if not ok:
+                self._j(429,{"error":"rate limit","retry_after":RATE_LIMIT_WINDOW}); log_failed_login(cip,"rate"); return
             try: d=json.loads(b) if b else {}
             except: d={}
             pw=d.get('password',''); n=d.get('name','PC_'+uuid.uuid4().hex[:6]); lci=d.get('computer_id',ci or 'unk')
-            if pw!=PASSWORD: self._j(401,{"error":"Wrong password"}); return
+            if pw!=PASSWORD:
+                self._j(401,{"error":"Wrong password"}); log_failed_login(cip,"wrong"); return
             us=lu(); ts=lt()
             for uid,ud in us.items():
                 if ud.get('is_bot') and ud.get('computer_id')==lci:
@@ -1760,8 +1726,9 @@ class AH(BaseHTTPRequestHandler):
             except: d={}
             cv=ti.get('computer_id')
             if not cv: self._j(400,{"error":"no cid"}); return
-            hb=lhb(); hb[cv]={'last_seen':datetime.now(MSK).isoformat(),'name':ti.get('name'),'mode':d.get('mode'),'scripts_running':d.get('scripts_running',[]),'strikes':d.get('strikes',0)}; shb(hb)
-            self._j(200,{"ok":True}); return
+            hb_data=lhb()
+            hb_data[cv]={'last_seen':datetime.now(MSK).isoformat(),'name':ti.get('name'),'mode':d.get('mode'),'scripts_running':d.get('scripts_running',[]),'strikes':d.get('strikes',0)}
+            shb(hb_data); self._j(200,{"ok":True}); return
         if p.startswith('/api/paste/'):
             if not v: self._j(401,{"error":"no"}); return
             if ib: self._j(403,{"error":"no"}); return
@@ -1782,8 +1749,8 @@ class AH(BaseHTTPRequestHandler):
                 ps[f]['content']=e; ps[f]['hash']=chash(c); ps[f]['edited_at']=datetime.now(MSK).isoformat(); sp(ps)
                 self._j(200,{"ok":True,"action":"updated","name":n})
             else:
-                ps.append({'name':n,'content':e,'hash':chash(c),'cid':0,'cn':'API','created_at':datetime.now(MSK).isoformat()}); sp(ps)
-                self._j(201,{"ok":True,"action":"created","name":n})
+                ps.append({'name':n,'content':e,'hash':chash(c),'cid':0,'cn':'API','created_at':datetime.now(MSK).isoformat()})
+                sp(ps); self._j(201,{"ok":True,"action":"created","name":n})
             return
         self._j(404,{"error":"no"})
 
@@ -1797,18 +1764,19 @@ def start_api():
             print("[API] Ready v17.25",flush=True)
             srv.serve_forever()
         except OSError as e:
-            if e.errno==98: os.system(f"fuser -k {PORT}/tcp 2>/dev/null"); time.sleep(2)
+            if e.errno==98:
+                os.system(f"fuser -k {PORT}/tcp 2>/dev/null"); time.sleep(2)
             else: time.sleep(5)
-        except Exception as e: print(f"[API] err: {e}",flush=True); time.sleep(5)
+        except Exception as e: print(f"[API] {e}",flush=True); time.sleep(5)
         finally:
             if srv:
                 try: srv.server_close()
                 except: pass
 
 def main():
-    print("Starting bot v17.25 (5G-ready + max survivability)...",flush=True)
+    print("Starting bot v17.25 (cloudflared 5G-safe)...",flush=True)
     load_online_tracking(); update_url_from_log()
-    threading.Thread(target=tunnel_supervisor,daemon=True).start()
+    threading.Thread(target=start_tunnel,daemon=True).start()
     threading.Thread(target=tunnel_watchdog_loop,daemon=True).start()
     time.sleep(2)
     threading.Thread(target=start_api,daemon=True).start()
