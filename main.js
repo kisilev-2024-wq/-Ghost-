@@ -1,11 +1,5 @@
-// VERSION: 3.2.0
-// main.js — Roboflow вариант A (публичная модель captchas-gz2yx/funtimecaptcha/1) + голосование по обеим стенам + горизонтальные полоски
-// FIX v3.2.0: Roboflow через SOCKS-туннель (прямые HTTPS режет ECONNRESET), ретраи socks/direct, уменьшенный PNG (scale 1) на модель
-// FIX v3.1.2: устойчивое чтение config.json (strict -> soft clean -> extract object -> regex fallback)
-//             приоритет bot_env\config.json над корневым ..\config.json
-//             диагностика proxy.host / changeIpUrl / config parse strategy в логе
-//             починен rotateIp: таймаут 15с, повторы, реальные ошибки, редиректы, TLS fallback
-//             отложенный выход в конце, чтобы лог не обрезался process.exit()
+// VERSION: 3.3.0 изучи
+// main.js// FIX v3.3.0: кластеризация координат + швы по чернилам + 4 ориентации + seamPenalty
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -288,7 +282,7 @@ function plainGet(urlStr, timeoutMs) {
       const opts = {
         timeout: timeoutMs,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.2.0',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.3.0',
           'Accept': '*/*'
         }
       }
@@ -464,7 +458,7 @@ async function rotateIp() {
   return currentRunIp
 }
 
-// ========================= ROBLOW API (v3.2.0: SOCKS-first транспорт) =========================
+// ========================= ROBLOW API (v3.3.0: логирование attempts) =========================
 const ROBOFLOW = {
   enabled: cfgGet(CFG, 'roboflow.enabled', true),
   apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
@@ -482,7 +476,6 @@ function rfMultipart(buf, filename, boundary) {
   return Buffer.concat([head, buf, tail])
 }
 
-// SOCKS-туннель для Roboflow: прямой HTTPS режет ECONNRESET, а через прокси (как currentIp/mineflayer) проходит.
 function socksConnectSocket(host, port, useTls) {
   return new Promise((resolve, reject) => {
     if (!PROXY.host) {
@@ -579,7 +572,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
 
     const h = Object.assign({
-      'User-Agent': 'MC_Bot/3.2.0',
+      'User-Agent': 'MC_Bot/3.3.0',
       'Accept': 'application/json,*/*',
       'Accept-Encoding': 'identity',
       'Connection': 'close',
@@ -693,25 +686,33 @@ async function rfPost(url, headers, body) {
   const timeoutMs = 30000
   const canSocks = !!PROXY.host
 
-  // Прямые HTTPS к Roboflow режутся ECONNRESET -> сначала SOCKS, потом direct, с ретраями.
   const transports = canSocks
     ? ['socks', 'direct', 'socks', 'direct']
     : ['direct', 'direct']
 
   const delays = [0, 2000, 4000, 6000]
   let last = null
+  const attemptsLog = []
 
   for (let i = 0; i < transports.length; i++) {
     if (delays[i] > 0) await sleep(delays[i])
     const tr = transports[i]
     if (tr === 'socks' && !canSocks) continue
     const r = await rfPostOnce(tr, url, headers, body, timeoutMs)
+    attemptsLog.push(tr + ':' + r.status + ':' + String(r.body || '').slice(0, 50).replace(/\s+/g,' '))
     last = r
     const st = Number(r.status || 0)
-    if (st >= 200 && st < 400) return r
-    if (st === 401 || st === 403 || st === 404) return r
+    if (st >= 200 && st < 400) {
+      last._attempts = attemptsLog
+      return last
+    }
+    if (st === 401 || st === 403 || st === 404) {
+      last._attempts = attemptsLog
+      return last
+    }
   }
 
+  if (last) last._attempts = attemptsLog
   return last || { status: 0, body: 'no transport', via: 'none' }
 }
 
@@ -865,6 +866,7 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
       predictions,
       metrics,
       raw: String(r.body || '').slice(0, 3000),
+      attempts: r._attempts || [],
       error: ok ? null : (String(r.body || '').replace(/\s+/g, ' ').slice(0, 300) || 'HTTP ' + r.status)
     }
 
@@ -873,7 +875,7 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
         fs.mkdirSync(debugDir, { recursive: true })
         fs.writeFileSync(
           path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'),
-          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nATTEMPT: ' + at.name + '\nURL: ' + at.url + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n'
+          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nATTEMPT: ' + at.name + '\nATTEMPTS_LOG: ' + JSON.stringify(r._attempts || []) + '\nURL: ' + at.url + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n'
         )
       } catch (e) {}
     }
@@ -881,6 +883,7 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
     if (label && typeof step === 'function') {
       step(
         label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') +
+        (r._attempts ? ' [' + r._attempts.join(', ') + ']' : '') +
         (ok
           ? ' OK digits=' + metrics.n + ' row=' + metrics.row + ' avg=' + metrics.avg + ' text="' + metrics.text + '"'
           : ' ' + String(item.raw || '').replace(/\s+/g, ' ').slice(0, 140))
@@ -1367,7 +1370,7 @@ function pickOcr(vars, W, H) {
   return best
 }
 
-// ========================= СТЕНЫ + СБОРКА ТОЛЬКО ПО ГОРИЗОНТАЛИ =========================
+// ========================= СТЕНЫ + СБОРКА v3.3.0 (INK SEAMS + 4 ORIENTATIONS) =========================
 function rotQ(d,q){
   q=((q%4)+4)%4
   if(!q)return Uint8Array.from(d)
@@ -1409,27 +1412,135 @@ function clusterWalls(frames){
   return walls
 }
 
-function wallCells(wall,tiles){
-  const horiz=wall.axis==='x'?'z':'x'
-  const asc=wall.axis==='z'?wall.fSign>0:wall.fSign<0
-  const hs=[...new Set(wall.frames.map(f=>Math.round(f[horiz])))].sort((a,b)=>asc?a-b:b-a)
-  const ys=[...new Set(wall.frames.map(f=>Math.round(f.y)))].sort((a,b)=>b-a)
-  const cols=hs.length,rows=ys.length
-  if(cols*rows!==wall.frames.length)return null
-  const cells=new Array(cols*rows).fill(null)
-  for(const f of wall.frames){
-    const c=hs.indexOf(Math.round(f[horiz]))
-    const r=ys.indexOf(Math.round(f.y))
-    if(c<0||r<0||!tiles.has(f.mapId))continue
-    cells[r*cols+c]=f
+function clusterCoords(vals) {
+  if (!vals || !vals.length) return []
+  const sorted = vals.slice().sort((a, b) => a - b)
+  const clusters = []
+  let cur = [sorted[0]]
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] - cur[0] < 0.6) {
+      cur.push(sorted[i])
+    } else {
+      clusters.push(cur.reduce((s, x) => s + x, 0) / cur.length)
+      cur = [sorted[i]]
+    }
   }
-  if(cells.some(c=>!c))return null
-  return{cells,cols,rows}
+  clusters.push(cur.reduce((s, x) => s + x, 0) / cur.length)
+  return clusters
+}
+
+function wallCellsAdvanced(wall) {
+  const horiz = wall.axis === 'x' ? 'z' : 'x'
+  const hVals = wall.frames.map(f => f[horiz])
+  const yVals = wall.frames.map(f => f.y)
+  
+  const hCenters = clusterCoords(hVals)
+  const yCenters = clusterCoords(yVals)
+  
+  const orientations = [
+    { hAsc: true,  yAsc: false, name: 'hAsc_yDesc' },
+    { hAsc: false, yAsc: false, name: 'hDesc_yDesc' },
+    { hAsc: true,  yAsc: true,  name: 'hAsc_yAsc' },
+    { hAsc: false, yAsc: true,  name: 'hDesc_yAsc' }
+  ]
+  
+  const cols = hCenters.length
+  const rows = yCenters.length
+  
+  if (cols * rows !== wall.frames.length) return null
+  
+  const results = []
+  
+  for (const ori of orientations) {
+    const hs = ori.hAsc ? hCenters.slice() : hCenters.slice().reverse()
+    const ys = ori.yAsc ? yCenters.slice() : yCenters.slice().reverse()
+    
+    const cells = new Array(cols * rows).fill(null)
+    let missing = 0
+    for (const f of wall.frames) {
+      let bestH = 0, minDh = 1e9
+      for (let i = 0; i < hs.length; i++) {
+        const d = Math.abs(f[horiz] - hs[i])
+        if (d < minDh) { minDh = d; bestH = i }
+      }
+      let bestY = 0, minDy = 1e9
+      for (let i = 0; i < ys.length; i++) {
+        const d = Math.abs(f.y - ys[i])
+        if (d < minDy) { minDy = d; bestY = i }
+      }
+      const idx = bestY * cols + bestH
+      if (cells[idx]) missing++
+      cells[idx] = f
+    }
+    
+    if (missing > 0 || cells.some(c => !c)) continue
+    
+    results.push({ cells, cols, rows, ori })
+  }
+  
+  return results.length ? results : null
+}
+
+function seamV_ink(inkA, inkB) {
+  let cost = 0
+  for (let y = 0; y < 128; y++) {
+    const va = inkA[y * 128 + 127]
+    const vb = inkB[y * 128 + 0]
+    if (va !== vb) {
+      const va1 = y > 0 ? inkA[(y - 1) * 128 + 127] : 0
+      const va2 = y < 127 ? inkA[(y + 1) * 128 + 127] : 0
+      const vb1 = y > 0 ? inkB[(y - 1) * 128 + 0] : 0
+      const vb2 = y < 127 ? inkB[(y + 1) * 128 + 0] : 0
+      const vaL = inkA[y * 128 + 126]
+      const vbR = inkB[y * 128 + 1]
+      
+      if (va === vb1 || va === vb2 || vaL === vb || va1 === vb || va2 === vb) {
+        cost += 2
+      } else {
+        cost += 10
+      }
+    }
+  }
+  return cost
+}
+
+function seamH_ink(inkA, inkB) {
+  let cost = 0
+  for (let x = 0; x < 128; x++) {
+    const va = inkA[127 * 128 + x]
+    const vb = inkB[0 * 128 + x]
+    if (va !== vb) {
+      const vaL = x > 0 ? inkA[127 * 128 + x - 1] : 0
+      const vaR = x < 127 ? inkA[127 * 128 + x + 1] : 0
+      const vbL = x > 0 ? inkB[0 * 128 + x - 1] : 0
+      const vbR = x < 127 ? inkB[0 * 128 + x + 1] : 0
+      const vaU = inkA[126 * 128 + x]
+      const vbD = inkB[1 * 128 + x]
+      
+      if (va === vbL || va === vbR || vaL === vb || vaR === vb || vaU === vb || va === vbD) {
+        cost += 2
+      } else {
+        cost += 10
+      }
+    }
+  }
+  return cost
+}
+
+function perms(arr) {
+  if (arr.length <= 1) return [arr.slice()]
+  const res = []
+  for (let i = 0; i < arr.length; i++) {
+    const rest = arr.slice(0, i).concat(arr.slice(i + 1))
+    for (const p of perms(rest)) res.push([arr[i]].concat(p))
+  }
+  return res
 }
 
 function assembleWall(wall,tiles,raw){
-  const wc=wallCells(wall,tiles)
-  if(!wc)return null
+  const wca = wallCellsAdvanced(wall)
+  if(!wca || !wca.length) return null
+  const wc = wca[0]
   const W=wc.cols*128,H=wc.rows*128
   const out=new Uint8Array(W*H)
   let placed=0
@@ -1446,59 +1557,86 @@ function assembleWall(wall,tiles,raw){
   return{data:out,W,H,placed,wc}
 }
 
-function perms(arr) {
-  if (arr.length <= 1) return [arr.slice()]
-  const res = []
-  for (let i = 0; i < arr.length; i++) {
-    const rest = arr.slice(0, i).concat(arr.slice(i + 1))
-    for (const p of perms(rest)) res.push([arr[i]].concat(p))
-  }
-  return res
-}
-
-function tilePatch(cell, tiles) {
-  if (!cell) return new Uint8Array(16384)
-  const t = tiles.get(cell.mapId)
-  if (!t) return new Uint8Array(16384)
-  return rotQ(t, (cell.rotation || 0) % 4)
-}
-
-function seamV(A, B) {
-  let s = 0
-  for (let y = 0; y < 128; y++) s += Math.abs(A[y*128+127] - B[y*128])
-  return s
-}
-
-// FIX: перебираем ТОЛЬКО перестановки колонок, строки остаются в исходном порядке
 function assembleWallAuto(wall, tiles) {
-  const wc = wallCells(wall, tiles)
-  if (!wc) return null
-  const cols = wc.cols, rows = wc.rows
-  const P = []
-  for (let i = 0; i < wc.cells.length; i++) P.push(tilePatch(wc.cells[i], tiles))
-  const colPerms = perms([...Array(cols).keys()])
-  let best = null
-  for (const cp of colPerms) {
-    let cost = 0
-    for (let k = 0; k < cols - 1; k++) {
+  const wca = wallCellsAdvanced(wall)
+  if (!wca || !wca.length) return null
+  
+  let globalBest = null
+  
+  for (const wc of wca) {
+    const { cells, cols, rows, ori } = wc
+    const colPerms = perms([...Array(cols).keys()])
+    
+    const P = []
+    const Ink = []
+    for (let i = 0; i < cells.length; i++) {
+      const cell = cells[i]
+      const t = tiles.get(cell.mapId)
+      let d = new Uint8Array(16384)
+      let ink = new Uint8Array(16384)
+      if (t) {
+        d = rotQ(t, (cell.rotation || 0) % 4)
+        const im = inkMaskWall(d, 128, 128)
+        ink = im.ink
+      }
+      P.push(d)
+      Ink.push(ink)
+    }
+    
+    for (const cp of colPerms) {
+      let cost = 0
+      
       for (let r = 0; r < rows; r++) {
-        cost += seamV(P[r*cols+cp[k]], P[r*cols+cp[k+1]])
+        for (let k = 0; k < cols - 1; k++) {
+          cost += seamV_ink(Ink[r * cols + cp[k]], Ink[r * cols + cp[k + 1]])
+        }
+      }
+      
+      for (let k = 0; k < cols; k++) {
+        for (let r = 0; r < rows - 1; r++) {
+          cost += seamH_ink(Ink[r * cols + cp[k]], Ink[(r + 1) * cols + cp[k]])
+        }
+      }
+      
+      if (!globalBest || cost < globalBest.cost) {
+        globalBest = { cost, cp, rp: [...Array(rows).keys()], ori, cells, cols, rows }
       }
     }
-    if (!best || cost < best.cost) best = { cost: cost, cp: cp, rp: [...Array(rows).keys()] }
   }
-  const W = cols*128, H = rows*128
-  const out = new Uint8Array(W*H)
+  
+  if (!globalBest) return null
+  
+  const { cp, cells, cols, rows, ori } = globalBest
+  const W = cols * 128, H = rows * 128
+  const out = new Uint8Array(W * H)
   let placed = 0
+  
   for (let k = 0; k < cols; k++) {
     for (let m = 0; m < rows; m++) {
-      const c = best.cp[k], r = m
-      if (wc.cells[r*cols+c]) placed++
-      const patch = P[r*cols+c]
-      for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) out[(m*128+y)*W + (k*128+x)] = patch[y*128+x]
+      const c = cp[k]
+      const r = m
+      const cell = cells[r * cols + c]
+      if (cell && tiles.has(cell.mapId)) placed++
+      
+      const t = tiles.get(cell.mapId)
+      let patch = new Uint8Array(16384)
+      if (t) patch = rotQ(t, (cell.rotation || 0) % 4)
+      
+      for (let y = 0; y < 128; y++) {
+        for (let x = 0; x < 128; x++) {
+          out[(m * 128 + y) * W + (k * 128 + x)] = patch[y * 128 + x]
+        }
+      }
     }
   }
-  return { data: out, W, H, placed, wc, colPerm: best.cp, rowPerm: best.rp, seamCost: best.cost }
+  
+  return { 
+    data: out, W, H, placed, 
+    wc: { cells, cols, rows }, 
+    colPerm: cp, rowPerm: [...Array(rows).keys()], 
+    seamCost: globalBest.cost,
+    ori: ori.name
+  }
 }
 
 function buildVariants(ink, digitMask, W, H){
@@ -1567,8 +1705,10 @@ async function saveRecord(outDir, snap, label) {
     const dot = wallDot(w, snap.view)
     const confAdj = pick.conf * (nRow >= 8 ? 0.3 : 1)
     const dotBonus = (dot !== null && dot * VIEW_SIGN >= 0.85) ? 400 : 0
+    
+    // v3.3.0: Штраф за разрывы линий на швах (ink seams)
+    const seamPenalty = asm.seamCost * 0.5
 
-    // ===== ROBLOW: на диск — scale 2, в модель — scale 1 (меньше тело, меньше шанс ECONNRESET) =====
     let rf = { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'not sent' }
 
     try {
@@ -1597,9 +1737,9 @@ async function saveRecord(outDir, snap, label) {
 
     const rfScore = rf.ok ? (rf.metrics && rf.metrics.score ? rf.metrics.score : 0) : 0
 
-    // Roboflow — главный судья: если модель нашла цифры, стена почти наверняка настоящая.
-    const score = rfScore * 100000 + confAdj * 3000 + (pick.plausible ? 800 : 0) + nRow * 100 + ac.dmColor * 30 + Math.round(th / 100) + dotBonus
-    stats.push({ w, asm, ink, drop, clean, digitMask: ac.digitMask, inkCount: im.inkCount, th, dmDrop, dmClean, dmColor: ac.dmColor, nRow, vars, pick, dot, confAdj, dotBonus, rf, rfScore, score })
+    // v3.3.0: вычитаем seamPenalty, чтобы рваные стены проигрывали
+    const score = rfScore * 100000 + confAdj * 3000 + (pick.plausible ? 800 : 0) + nRow * 100 + ac.dmColor * 30 + Math.round(th / 100) + dotBonus - seamPenalty
+    stats.push({ w, asm, ink, drop, clean, digitMask: ac.digitMask, inkCount: im.inkCount, th, dmDrop, dmClean, dmColor: ac.dmColor, nRow, vars, pick, dot, confAdj, dotBonus, rf, rfScore, score, seamPenalty })
   }
 
   if (!stats.length) {
@@ -1622,7 +1762,7 @@ async function saveRecord(outDir, snap, label) {
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_digits.png'), bwPng(best.digitMask, asm.W, asm.H, 2))
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask_ascii.txt'), asciiMask(ink, asm.W, asm.H, 2))
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_raw.bin'), Buffer.from(asm.data))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_layout_seams.txt'), 'colPerm=' + JSON.stringify(asm.colPerm) + ' rowPerm=' + JSON.stringify(asm.rowPerm) + ' seamCost=' + asm.seamCost)
+  fs.writeFileSync(path.join(outDir, 'ORIGINAL_layout_seams.txt'), 'colPerm=' + JSON.stringify(asm.colPerm) + ' rowPerm=' + JSON.stringify(asm.rowPerm) + ' seamCost=' + asm.seamCost + ' ori=' + asm.ori)
 
   for (const s of stats.slice(1)) {
     fs.writeFileSync(path.join(outDir, 'DECOY_NOT_ORIGINAL_' + s.w.tag + '.png'), colorPng(s.asm.data, s.asm.W, s.asm.H, 2))
@@ -1656,9 +1796,10 @@ async function saveRecord(outDir, snap, label) {
 
   const WHY = []
   WHY.push('ПОЧЕМУ ' + w.tag + ' СЧИТАЕТСЯ ОРИГИНАЛОМ (ORIGINAL_CAPTCHA.png)')
-  WHY.push('Сборка v3.1: ТОЛЬКО горизонтальные перестановки колонок (строки НЕ переставляются)')
-  WHY.push('Селектор v3.1: rfScore*100000 + confAdj*3000 + plausible*800 + nRow*100 + dmColor*30 + th/100 + dotBonus')
-  WHY.push('  rfScore = балл публичной модели Roboflow (captchas-gz2yx/funtimecaptcha/1) по монолитной стене')
+  WHY.push('Сборка v3.3: кластеризация координат + перебор 4 ориентаций + перестановка колонок по швам чернил (ink seams)')
+  WHY.push('Селектор v3.3: rfScore*100000 + confAdj*3000 + plausible*800 + nRow*100 + dmColor*30 + th/100 + dotBonus - seamPenalty')
+  WHY.push('  seamPenalty = seamCost * 0.5 (штраф за разрывы линий капчи на швах)')
+  WHY.push('  rfScore = балл публичной модели Roboflow по монолитной стене')
   WHY.push('')
 
   for (const s of stats) {
@@ -1675,6 +1816,8 @@ async function saveRecord(outDir, snap, label) {
       ' dmColor=' + s.dmColor +
       ' dot=' + (s.dot === null ? 'n/a' : s.dot.toFixed(2)) +
       ' seam=' + s.asm.seamCost +
+      ' seamPen=' + Math.round(s.seamPenalty) +
+      ' ori=' + s.asm.ori +
       ' colPerm=' + JSON.stringify(s.asm.colPerm) +
       ' ocr="' + s.pick.text + '" (' + s.pick.name + ') score=' + s.score
     )
@@ -1691,6 +1834,7 @@ async function saveRecord(outDir, snap, label) {
     ' dmColor=' + s.dmColor +
     ' dot=' + (s.dot === null ? 'n/a' : s.dot.toFixed(2)) +
     ' seam=' + s.asm.seamCost +
+    ' seamPen=' + Math.round(s.seamPenalty) +
     ' thick=' + s.th +
     ' ocr="' + s.pick.text + '" (' + s.pick.name + ') score=' + s.score
   ).join('\n'))
@@ -1706,7 +1850,7 @@ async function saveRecord(outDir, snap, label) {
 
   const A = []
   A.push('=== ASCII DUMP ' + label + ' === ' + new Date().toISOString())
-  A.push('RAMP: "' + RAMP + '" | ORIGINAL = ' + w.tag + ' | сборка v3.1 (только горизонтальные перестановки) | селектор v3.1 (Roboflow голосование)')
+  A.push('RAMP: "' + RAMP + '" | ORIGINAL = ' + w.tag + ' | сборка v3.3 (ink seams + 4 ориентации) | селектор v3.3 (Roboflow + seamPenalty)')
 
   for (const s of stats) {
     const tag = (s === best ? 'ORIGINAL ' : 'DECOY(не ориг.) ') + s.w.tag
@@ -1719,6 +1863,8 @@ async function saveRecord(outDir, snap, label) {
       ' nRow=' + s.nRow +
       ' dot=' + (s.dot === null ? 'n/a' : s.dot.toFixed(2)) +
       ' seam=' + s.asm.seamCost +
+      ' seamPen=' + Math.round(s.seamPenalty) +
+      ' ori=' + s.asm.ori +
       ' colPerm=' + JSON.stringify(s.asm.colPerm) +
       ' ocr="' + s.pick.text + '" LUM (step 4) ---'
     )
@@ -1737,6 +1883,8 @@ async function saveRecord(outDir, snap, label) {
     ' nRow=' + best.nRow +
     ' dot=' + (best.dot === null ? 'n/a' : best.dot.toFixed(2)) +
     ' seam=' + best.asm.seamCost +
+    ' seamPen=' + Math.round(best.seamPenalty) +
+    ' ori=' + best.asm.ori +
     ' colPerm=' + JSON.stringify(best.asm.colPerm) +
     ' ocr="' + best.pick.text + '" (' + best.pick.name + ')' +
     ' | decoy: ' + stats.slice(1).map(s =>
@@ -1744,7 +1892,8 @@ async function saveRecord(outDir, snap, label) {
       '(rf=' + (s.rf && s.rf.metrics ? s.rf.metrics.n : 0) +
       ',conf=' + s.pick.conf.toFixed(2) +
       ',row=' + s.nRow +
-      ',seam=' + s.asm.seamCost + ')'
+      ',seam=' + s.asm.seamCost +
+      ',pen=' + Math.round(s.seamPenalty) + ')'
     ).join(',') +
     ' -> ' + outDir
   )
@@ -1762,6 +1911,8 @@ async function saveRecord(outDir, snap, label) {
     conf: best.pick.conf,
     confAdj: best.confAdj,
     seamCost: best.asm.seamCost,
+    seamPenalty: best.seamPenalty,
+    ori: best.asm.ori,
     colPerm: best.asm.colPerm,
     ocrText: best.pick.text,
     ocrVia: best.pick.name,
@@ -1781,6 +1932,8 @@ async function saveRecord(outDir, snap, label) {
       nRow: s.nRow,
       dot: s.dot,
       seam: s.asm.seamCost,
+      seamPenalty: s.seamPenalty,
+      ori: s.asm.ori,
       ocr: s.pick.text,
       rfOk: s.rf && s.rf.ok,
       rfDigits: s.rf && s.rf.metrics ? s.rf.metrics.n : 0,
@@ -1951,7 +2104,7 @@ function connectAndCapture(tag) {
               }
             }
 
-            if (typeof val === 'number' && (e.key === 9 || e.key === 10)) f.rotation = val
+            if (typeof val === 'number' && (e.key === 9 || e.key === 10 || e.key === 8)) f.rotation = val
           }
         } catch (e) {}
       })
@@ -2035,11 +2188,11 @@ async function main() {
   const tGlobal = Date.now()
   let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.2.0 — Roboflow через SOCKS + голосование + горизонтальные полоски + robust config/IP === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.3.0 — INK SEAMS + 4 ORIENTATIONS + CLUSTER COORDS === ' + STAMP)
   step('config: ' + CFG_PATH)
   step('config parse: strategy=' + CFG_STRATEGY + (CFG_PATCHED.length ? ' patched=' + CFG_PATCHED.join(',') : ''))
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)') + ' port=' + PROXY.port + ' changeIpUrl=' + (PROXY.changeIpUrl ? 'задан' : '(не задан)'))
-  step('roboflow: enabled=' + ROBOFLOW.enabled + ' model=' + ROBOFLOW.modelId + ' key=' + (ROBOFLOW.apiKey ? ROBOFLOW.apiKey.slice(0, 6) + '...' : 'ПУСТО') + ' transport=socks-first')
+  step('roboflow: enabled=' + ROBOFLOW.enabled + ' model=' + ROBOFLOW.modelId + ' key=' + (ROBOFLOW.apiKey ? ROBOFLOW.apiKey.slice(0, 6) + '...' : 'ПУСТО'))
 
   currentRunIp = await rotateIp()
   step('IP забега: ' + (currentRunIp || '?'))
@@ -2106,6 +2259,8 @@ async function main() {
         ' nRow=' + rec.nRow +
         ' dot=' + (rec.dot === null ? 'n/a' : rec.dot.toFixed(2)) +
         ' seam=' + rec.seamCost +
+        ' seamPen=' + Math.round(rec.seamPenalty) +
+        ' ori=' + rec.ori +
         ' perm=' + JSON.stringify(rec.colPerm) +
         ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected +
         ' ocr="' + rec.ocrText + '" via ' + rec.ocrVia
@@ -2120,7 +2275,7 @@ async function main() {
 
   const ALL = [
     '=== ASCII ALL ROUNDS ' + STAMP + ' ===',
-    'RAMP: "' + RAMP + '" | ORIGINAL = ORIGINAL_CAPTCHA.png | сборка v3.1 (только горизонтальные перестановки) | селектор v3.1 (Roboflow голосование)',
+    'RAMP: "' + RAMP + '" | ORIGINAL = ORIGINAL_CAPTCHA.png | сборка v3.3 (ink seams + 4 ориентации) | селектор v3.3 (Roboflow + seamPenalty)',
     ''
   ]
 
@@ -2140,6 +2295,8 @@ async function main() {
       ' nRow=' + rr.nRow +
       ' dot=' + (rr.dot === null ? 'n/a' : rr.dot.toFixed(2)) +
       ' seam=' + rr.seamCost +
+      ' seamPen=' + Math.round(rr.seamPenalty) +
+      ' ori=' + rr.ori +
       ' perm=' + JSON.stringify(rr.colPerm) +
       ' ocr="' + rr.ocrText + '" via ' + rr.ocrVia +
       ' | decoy: ' + rr.stats.filter(s => s.tag !== rr.wall).map(s =>
@@ -2147,7 +2304,8 @@ async function main() {
         '(rf=' + s.rfDigits +
         ',conf=' + s.conf.toFixed(2) +
         ',row=' + s.nRow +
-        ',seam=' + s.seam + ')'
+        ',seam=' + s.seam +
+        ',pen=' + Math.round(s.seamPenalty) + ')'
       ).join(',') +
       ' ---'
     )
@@ -2178,6 +2336,8 @@ async function main() {
           ' nRow=' + x.rec.nRow +
           ' dot=' + (x.rec.dot === null ? 'n/a' : x.rec.dot.toFixed(2)) +
           ' seam=' + x.rec.seamCost +
+          ' seamPen=' + Math.round(x.rec.seamPenalty) +
+          ' ori=' + x.rec.ori +
           ' perm=' + JSON.stringify(x.rec.colPerm) +
           ' ocr="' + x.rec.ocrText + '" via ' + x.rec.ocrVia +
           (x.rec.plausible ? ' (plausible)' : '')
@@ -2213,7 +2373,6 @@ async function main() {
   console.log('')
   console.log(L.join('\n'))
 
-  // Отложенный выход, чтобы stdout успел отрендериться полностью.
   setTimeout(() => process.exit(0), 2000)
 }
 
