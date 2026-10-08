@@ -1,1 +1,29 @@
-
+{
+  "files": [
+    {
+      "url": "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/main.js",
+      "target": "main.js",
+      "type": "js"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/configuration",
+      "target": "config.json",
+      "type": "json"
+    }
+  ],
+  "dependencies": [
+    "mineflayer",
+    "socks"
+  ],
+  "devDependencies": [],
+  "optional": [
+    "node-telegram-bot-api",
+    "axios"
+  ],
+  "notes": {
+    "mineflayer": "основная библиотека для Minecraft-бота (версия >=4.0)",
+    "socks": "SOCKS5-клиент для прокси (используется SocksClient)",
+    "node-telegram-bot-api": "(опционально) для отправки отчётов в Telegram, если добавите эту функцию",
+    "axios": "(опционально) для более удобных HTTP-запросов, сейчас используется встроенный http/https"
+  }
+}
