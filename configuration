@@ -1,10 +1,14 @@
 {
   "minecraft": { "server": "connect.funtime.su", "port": 25565, "version": "1.21.1" },
   "proxy": {
-    "host": "bproxy.site", "port": 23750, "username": "YC9mYB", "password": "nUp8nYk6YZ4Y",
+    "host": "bproxy.site",
+    "port": 23750,
+    "username": "YC9mYB",
+    "password": "nUp8nYk6YZ4Y",
     "type": 5,
     "changeIpUrl": "https://changeip.mobileproxy.space/?proxy_key=08a7964ab67274e7ceeb0f9f8f39c779",
-    "waitAfterIpChangeSec": 12, "altHosts": ["mproxy.site"]
+    "waitAfterIpChangeSec": 12,
+    "altHosts": ["mproxy.site"]
   },
   "accounts": { "nickPrefix": "Player", "countDefault": 1, "sessionMinutes": 10 },
   "telegram": {
@@ -16,10 +20,11 @@
     "enabled": true,
     "apiKey": "kTAPmOyqKcxeBTyi18FD",
     "modelId": "captchas-gz2yx/funtimecaptcha/1",
-    "detectUrl": "http://localhost:9001",
-    "serverlessUrl": "http://localhost:9001",
+    "detectUrl": "https://detect.roboflow.com",
+    "serverlessUrl": "https://serverless.roboflow.com",
     "confidence": 25,
-    "overlap": 20
+    "overlap": 20,
+    "socksProxy": "socks5://5xBLgY:S8hzBU@45.130.129.70:8000"
   },
   "autostart": { "enabled": false },
   "update": {
