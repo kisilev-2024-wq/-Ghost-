@@ -20,11 +20,10 @@
     "enabled": true,
     "apiKey": "kTAPmOyqKcxeBTyi18FD",
     "modelId": "captchas-gz2yx/funtimecaptcha/1",
-    "detectUrl": "https://detect.roboflow.com",
-    "serverlessUrl": "https://serverless.roboflow.com",
+    "detectUrl": "http://localhost:9001",
+    "serverlessUrl": "http://localhost:9001",
     "confidence": 25,
-    "overlap": 20,
-    "socksProxy": "socks5://5xBLgY:S8hzBU@45.130.129.70:8000"
+    "overlap": 20
   },
   "autostart": { "enabled": false },
   "update": {
