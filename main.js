@@ -1,6 +1,6 @@
-// VERSION: 3.5.1
+// VERSION: 3.6.0
 // main.js
-// v3.5.1: отдельный SOCKS-прокси для Roboflow + localhost direct + ink seams + 4 ориентации + seamPenalty
+// v3.6.0: локальный Roboflow Inference Server (http://localhost:9001) + fallback на cloud
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -22,8 +22,8 @@ const LOGIN_TIMEOUT_MS = 15000
 const MAX_ROTATIONS_ON_FAIL = 4
 const VIEW_SIGN = 1
 
-// v3.5.0: быстрые таймауты для localhost vs cloud
-const LOCAL_RF_TIMEOUT_MS = 5000
+// v3.6.0: увеличен для локального сервера (первый инференс может быть медленным)
+const LOCAL_RF_TIMEOUT_MS = 30000
 const CLOUD_RF_TIMEOUT_MS = 20000
 
 // ========================= КОНФИГ =========================
@@ -164,7 +164,7 @@ function regexCfg(raw) {
     put('roboflow', 'confidence', grabNumIn(rf, 'confidence'))
     put('roboflow', 'overlap', grabNumIn(rf, 'overlap'))
     put('roboflow', 'httpProxy', grabIn(rf, 'httpProxy'))
-    put('roboflow', 'socksProxy', grabIn(rf, 'socksProxy')) // v3.5.1
+    put('roboflow', 'socksProxy', grabIn(rf, 'socksProxy'))
   }
   return cfg
 }
@@ -290,7 +290,7 @@ function plainGet(urlStr, timeoutMs) {
       const opts = {
         timeout: timeoutMs,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.5.1',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.6.0',
           'Accept': '*/*'
         }
       }
@@ -466,18 +466,22 @@ async function rotateIp() {
   return currentRunIp
 }
 
-// ========================= ROBLOW API (v3.5.1: rf_socks + http_proxy + localhost direct) =========================
+// ========================= ROBLOW API (v3.6.0: localhost + cloud fallback) =========================
 const ROBOFLOW = {
   enabled: cfgGet(CFG, 'roboflow.enabled', true),
   apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
   modelId: cfgGet(CFG, 'roboflow.modelId', 'captchas-gz2yx/funtimecaptcha/1'),
-  detectUrl: cfgGet(CFG, 'roboflow.detectUrl', 'https://detect.roboflow.com'),
-  serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', 'https://serverless.roboflow.com'),
+  detectUrl: cfgGet(CFG, 'roboflow.detectUrl', 'http://localhost:9001'),
+  serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', 'http://localhost:9001'),
   confidence: cfgGet(CFG, 'roboflow.confidence', 25),
   overlap: cfgGet(CFG, 'roboflow.overlap', 20),
   httpProxy: cfgGet(CFG, 'roboflow.httpProxy', ''),
-  socksProxy: cfgGet(CFG, 'roboflow.socksProxy', '') // v3.5.1
+  socksProxy: cfgGet(CFG, 'roboflow.socksProxy', '')
 }
+
+// v3.6.0: кэш проверки работоспособности localhost
+let localhostChecked = false
+let localhostAlive = true
 
 function rfMultipart(buf, filename, boundary) {
   const safe = String(filename || 'captcha.png').replace(/"/g, '')
@@ -486,7 +490,6 @@ function rfMultipart(buf, filename, boundary) {
   return Buffer.concat([head, buf, tail])
 }
 
-// Minecraft SOCKS (bproxy.site)
 function socksConnectSocket(host, port, useTls) {
   return new Promise((resolve, reject) => {
     if (!PROXY.host) {
@@ -572,7 +575,6 @@ function socksConnectSocket(host, port, useTls) {
   })
 }
 
-// v3.5.1: парсинг socks5://user:pass@host:port
 function parseSocksUrl(urlStr) {
   const m = String(urlStr).match(/^socks5[h]?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/?$/i)
   if (!m) throw new Error('bad socks url: ' + urlStr)
@@ -584,7 +586,6 @@ function parseSocksUrl(urlStr) {
   }
 }
 
-// v3.5.1: отдельный SOCKS-прокси для Roboflow (например, Telegram-прокси)
 function rfSocksConnect(socksUrl, targetHost, targetPort, useTls) {
   return new Promise((resolve, reject) => {
     let parsed
@@ -664,7 +665,6 @@ function rfSocksConnect(socksUrl, targetHost, targetPort, useTls) {
   })
 }
 
-// HTTP CONNECT через HTTP-прокси
 function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
   return new Promise((resolve, reject) => {
     let proxyUrl
@@ -681,7 +681,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
       'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\n' +
       'Host: ' + targetHost + ':' + targetPort + '\r\n' +
       (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') +
-      'User-Agent: MC_Bot/3.5.1\r\n\r\n'
+      'User-Agent: MC_Bot/3.6.0\r\n\r\n'
 
     const socket = net.createConnection({ host: proxyHost, port: proxyPort })
     let settled = false
@@ -765,7 +765,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
 
     const h = Object.assign({
-      'User-Agent': 'MC_Bot/3.5.1',
+      'User-Agent': 'MC_Bot/3.6.0',
       'Accept': 'application/json,*/*',
       'Accept-Encoding': 'identity',
       'Connection': 'close',
@@ -868,7 +868,6 @@ async function rfPostOnce(transport, url, headers, body, timeoutMs) {
     } finally { try { sk.cleanup() } catch (e) {} }
   }
 
-  // v3.5.1: отдельный SOCKS для Roboflow
   if (transport === 'rf_socks') {
     let sk = null
     try { sk = await rfSocksConnect(ROBOFLOW.socksProxy, hostname, port, useTls) }
@@ -886,7 +885,6 @@ async function rfPostOnce(transport, url, headers, body, timeoutMs) {
     } finally { try { sk.cleanup() } catch (e) {} }
   }
 
-  // обычный minecraft socks
   let sk = null
   try { sk = await socksConnectSocket(hostname, port, useTls) }
   catch (e) {
@@ -904,12 +902,29 @@ async function rfPostOnce(transport, url, headers, body, timeoutMs) {
   } finally { try { sk.cleanup() } catch (e) {} }
 }
 
-// v3.5.0: localhost определяется и идёт только direct
 function isLocalhost(hostname) {
   return /^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)$/i.test(hostname)
 }
 
-// v3.5.1: порядок транспортов — rf_socks → http_proxy → socks(MC) → direct
+// v3.6.0: проверка жив ли локальный сервер (один раз при старте)
+async function checkLocalhostHealth() {
+  const u = String(ROBOFLOW.detectUrl || '')
+  const m = u.match(/^https?:\/\/([^:\/]+)/)
+  if (!m) return false
+  const hostname = m[1]
+  if (!isLocalhost(hostname)) return false
+  
+  return new Promise(resolve => {
+    const req = http.get(u + '/', { timeout: 2000 }, res => {
+      resolve(res.statusCode === 200)
+      try { res.resume() } catch (e) {}
+    })
+    req.on('error', () => resolve(false))
+    req.on('timeout', () => { req.destroy(); resolve(false) })
+  })
+}
+
+// v3.6.0: умная логика транспортов с fallback
 async function rfPost(url, headers, body) {
   let u
   try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL', via: 'none' } }
@@ -918,12 +933,15 @@ async function rfPost(url, headers, body) {
   const timeoutMs = isLocal ? LOCAL_RF_TIMEOUT_MS : CLOUD_RF_TIMEOUT_MS
 
   const transports = []
+  
   if (isLocal) {
+    // v3.6.0: для localhost — только direct
+    // Если localhost не отвечает — пропускаем (не ломаем бота)
     transports.push('direct')
   } else {
-    if (ROBOFLOW.socksProxy) transports.push('rf_socks')   // v3.5.1
+    if (ROBOFLOW.socksProxy) transports.push('rf_socks')
     if (ROBOFLOW.httpProxy) transports.push('http_proxy')
-    if (PROXY.host) transports.push('socks')               // minecraft socks (MC-only, скорее всего отклонит)
+    if (PROXY.host) transports.push('socks')
     transports.push('direct')
   }
 
@@ -951,10 +969,16 @@ async function rfPost(url, headers, body) {
       }
 
       const bodyStr = String(r.body || '')
-      if (bodyStr.includes('rejected') || bodyStr.includes('PROXY CONNECT ERR') || bodyStr.includes('Connection refused')) {
+      if (bodyStr.includes('rejected') || bodyStr.includes('PROXY CONNECT ERR') || bodyStr.includes('Connection refused') || bodyStr.includes('ECONNREFUSED')) {
         badTransports.add(tr)
+        if (isLocal && tr === 'direct') {
+          // localhost не отвечает — отмечаем и прекращаем попытки
+          localhostAlive = false
+          break
+        }
       }
     }
+    if (isLocal && !localhostAlive) break
   }
 
   if (last) last._attempts = attemptsLog
@@ -1058,10 +1082,22 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
     }
   }
 
+  // v3.6.0: если localhost упал в прошлый раз — пропускаем RF совсем (не ломаем бота)
+  if (!localhostAlive && isLocalhost(String(ROBOFLOW.detectUrl).replace(/^https?:\/\//, '').split(/[:\/]/)[0])) {
+    return {
+      ok: false,
+      status: 0,
+      attempt: 'localhost_dead',
+      predictions: [],
+      metrics: rfMetrics([]),
+      error: 'localhost не отвечает (inference server не запущен)'
+    }
+  }
+
   const key = String(ROBOFLOW.apiKey)
   const model = String(ROBOFLOW.modelId || 'captchas-gz2yx/funtimecaptcha/1').replace(/^\/+|\/+$/g, '')
-  const detectBase = String(ROBOFLOW.detectUrl || 'https://detect.roboflow.com').replace(/\/+$/, '')
-  const serverlessBase = String(ROBOFLOW.serverlessUrl || 'https://serverless.roboflow.com').replace(/\/+$/, '')
+  const detectBase = String(ROBOFLOW.detectUrl || 'http://localhost:9001').replace(/\/+$/, '')
+  const serverlessBase = String(ROBOFLOW.serverlessUrl || 'http://localhost:9001').replace(/\/+$/, '')
   const conf = encodeURIComponent(ROBOFLOW.confidence || 25)
   const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
   const boundary = '----MCBotRF' + Date.now() + Math.floor(Math.random() * 1000000)
@@ -1126,9 +1162,9 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
     }
 
     if (label && typeof step === 'function') {
+      const t = r.timeMs || '?'
       step(
         label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') +
-        (r._attempts ? ' [' + r._attempts.join(', ') + ']' : '') +
         (ok
           ? ' OK digits=' + metrics.n + ' row=' + metrics.row + ' avg=' + metrics.avg + ' text="' + metrics.text + '"'
           : ' ' + String(item.raw || '').replace(/\s+/g, ' ').slice(0, 140))
@@ -1137,6 +1173,12 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
 
     if (ok) return item
     last = item
+    
+    // v3.6.0: если localhost ответил ECONNREFUSED — не продолжаем другие попытки
+    if (isLocalhost(u.hostname) && String(r.body || '').includes('ECONNREFUSED')) {
+      localhostAlive = false
+      break
+    }
   }
 
   return last || {
@@ -1615,7 +1657,7 @@ function pickOcr(vars, W, H) {
   return best
 }
 
-// ========================= СТЕНЫ + СБОРКА v3.3 (INK SEAMS + 4 ORIENTATIONS) =========================
+// ========================= СТЕНЫ + СБОРКА (INK SEAMS + 4 ORIENTATIONS) =========================
 function rotQ(d,q){
   q=((q%4)+4)%4
   if(!q)return Uint8Array.from(d)
@@ -2039,10 +2081,9 @@ async function saveRecord(outDir, snap, label) {
 
   const WHY = []
   WHY.push('ПОЧЕМУ ' + w.tag + ' СЧИТАЕТСЯ ОРИГИНАЛОМ (ORIGINAL_CAPTCHA.png)')
-  WHY.push('Сборка v3.5: кластеризация координат + перебор 4 ориентаций + перестановка колонок по швам чернил (ink seams)')
-  WHY.push('Селектор v3.5: rfScore*100000 + confAdj*3000 + plausible*800 + nRow*100 + dmColor*30 + th/100 + dotBonus - seamPenalty')
-  WHY.push('  seamPenalty = seamCost * 0.5 (штраф за разрывы линий капчи на швах)')
-  WHY.push('  rfScore = балл модели Roboflow (через rf_socks/http_proxy/direct)')
+  WHY.push('Сборка v3.6: кластеризация координат + перебор 4 ориентаций + перестановка колонок по швам чернил (ink seams)')
+  WHY.push('Селектор v3.6: rfScore*100000 + confAdj*3000 + plausible*800 + nRow*100 + dmColor*30 + th/100 + dotBonus - seamPenalty')
+  WHY.push('  rfScore = балл локальной модели (inference server @ localhost:9001)')
   WHY.push('')
 
   for (const s of stats) {
@@ -2093,7 +2134,7 @@ async function saveRecord(outDir, snap, label) {
 
   const A = []
   A.push('=== ASCII DUMP ' + label + ' === ' + new Date().toISOString())
-  A.push('RAMP: "' + RAMP + '" | ORIGINAL = ' + w.tag + ' | сборка v3.5 (ink seams + 4 ориентации) | селектор v3.5 (Roboflow + seamPenalty)')
+  A.push('RAMP: "' + RAMP + '" | ORIGINAL = ' + w.tag + ' | сборка v3.6 (ink seams + 4 ориентации) | селектор v3.6 (localhost RF + seamPenalty)')
 
   for (const s of stats) {
     const tag = (s === best ? 'ORIGINAL ' : 'DECOY(не ориг.) ') + s.w.tag
@@ -2431,13 +2472,25 @@ async function main() {
   const tGlobal = Date.now()
   let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.5.1 — rf_socks + localhost direct + ink seams === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.6.0 — локальный inference server === ' + STAMP)
   step('config: ' + CFG_PATH)
   step('config parse: strategy=' + CFG_STRATEGY + (CFG_PATCHED.length ? ' patched=' + CFG_PATCHED.join(',') : ''))
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)') + ' port=' + PROXY.port + ' changeIpUrl=' + (PROXY.changeIpUrl ? 'задан' : '(не задан)'))
-  step('roboflow: enabled=' + ROBOFLOW.enabled + ' model=' + ROBOFLOW.modelId + ' detectUrl=' + ROBOFLOW.detectUrl +
-    ' socksProxy=' + (ROBOFLOW.socksProxy ? 'задан' : '(нет)') +
-    ' httpProxy=' + (ROBOFLOW.httpProxy ? 'задан' : '(нет)'))
+  step('roboflow: enabled=' + ROBOFLOW.enabled + ' model=' + ROBOFLOW.modelId + ' detectUrl=' + ROBOFLOW.detectUrl)
+  
+  // v3.6.0: проверка локального сервера
+  if (isLocalhost(String(ROBOFLOW.detectUrl).replace(/^https?:\/\//, '').split(/[:\/]/)[0])) {
+    const alive = await checkLocalhostHealth()
+    localhostAlive = alive
+    localhostChecked = true
+    if (alive) {
+      step('✅ Локальный inference server ОТВЕЧАЕТ (' + ROBOFLOW.detectUrl + ')')
+    } else {
+      step('⚠️  Локальный inference server НЕ отвечает!')
+      step('   Запустите: inference server start --port 9001')
+      step('   RF будет пропущен, бот будет работать только на OCR')
+    }
+  }
 
   currentRunIp = await rotateIp()
   step('IP забега: ' + (currentRunIp || '?'))
@@ -2520,7 +2573,7 @@ async function main() {
 
   const ALL = [
     '=== ASCII ALL ROUNDS ' + STAMP + ' ===',
-    'RAMP: "' + RAMP + '" | ORIGINAL = ORIGINAL_CAPTCHA.png | сборка v3.5 (ink seams + 4 ориентации) | селектор v3.5 (Roboflow + seamPenalty)',
+    'RAMP: "' + RAMP + '" | ORIGINAL = ORIGINAL_CAPTCHA.png | сборка v3.6 (ink seams + 4 ориентации) | селектор v3.6 (localhost RF + seamPenalty)',
     ''
   ]
 
