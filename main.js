@@ -1,27 +1,46 @@
-// test_roboflow.js
-// Тестовый скрипт для проверки локального Roboflow Inference Server
-const http = require('http')
+// test_rf.js — Автономный тест подключения к Roboflow
+// Не требует установки Python, Docker или inference server
+// Просто: node test_rf.js
+
 const https = require('https')
+const http = require('http')
+const zlib = require('zlib')
 const fs = require('fs')
 const path = require('path')
-const zlib = require('zlib')
 
-// ========================= Чтение конфига =========================
+// ========================= Читаем конфиг =========================
 const CFG_PATH = path.join(__dirname, 'config.json')
-const raw = fs.readFileSync(CFG_PATH, 'utf8').replace(/^\uFEFF/, '')
-const CFG = JSON.parse(raw)
-const RF = CFG.roboflow
+let RF_CFG = {
+  apiKey: 'kTAPmOyqKcxeBTyi18FD',
+  modelId: 'captchas-gz2yx/funtimecaptcha/1',
+  detectUrl: 'http://localhost:9001',
+  confidence: 25,
+  overlap: 20
+}
 
-console.log('=== Roboflow connection test ===')
-console.log('apiKey:', RF.apiKey)
-console.log('modelId:', RF.modelId)
-console.log('detectUrl:', RF.detectUrl)
-console.log('serverlessUrl:', RF.serverlessUrl)
-console.log('confidence:', RF.confidence, 'overlap:', RF.overlap)
+if (fs.existsSync(CFG_PATH)) {
+  try {
+    const raw = fs.readFileSync(CFG_PATH, 'utf8').replace(/^\uFEFF/, '')
+    const cfg = JSON.parse(raw)
+    if (cfg.roboflow) Object.assign(RF_CFG, cfg.roboflow)
+    console.log('[CFG] Загружен config.json')
+  } catch (e) {
+    console.log('[CFG] Не удалось прочитать config.json: ' + e.message)
+  }
+}
+
+console.log('')
+console.log('╔══════════════════════════════════════════════════════════╗')
+console.log('║   ТЕСТ ROBLOX API ПОДКЛЮЧЕНИЯ  (без установки ничего)   ║')
+console.log('╚══════════════════════════════════════════════════════════╝')
+console.log('')
+console.log('  apiKey:     ' + (RF_CFG.apiKey ? RF_CFG.apiKey.slice(0, 8) + '...' : '❌ ПУСТО'))
+console.log('  modelId:    ' + RF_CFG.modelId)
+console.log('  detectUrl:  ' + RF_CFG.detectUrl)
+console.log('  confidence: ' + RF_CFG.confidence)
 console.log('')
 
 // ========================= Генерация тестового PNG =========================
-// Генерируем простой 128x128 PNG с цифрой "5" для теста
 const CRC = []
 for (let n = 0; n < 256; n++) {
   let c = n
@@ -49,32 +68,33 @@ function encodePng(w, h, rgba) {
 }
 
 function makeTestPng() {
-  // Простое изображение 200x200 с цифрой "5" (белый фон, чёрные пиксели)
+  // 200x200 белая картинка с простой "капчей" - цифра "5" в центре
   const W = 200, H = 200
   const rgba = Buffer.alloc(W * H * 4)
-  // Фон белый
   for (let i = 0; i < W * H; i++) {
     rgba[i*4] = 255; rgba[i*4+1] = 255; rgba[i*4+2] = 255; rgba[i*4+3] = 255
   }
-  // Простая цифра "5" в центре (30x50 пикселей)
+  // Рисуем цифру "5" 30x42 пикселя
   const digit5 = [
-    "11111",
-    "10000",
-    "11110",
-    "00001",
-    "11110",
-    "10001",
-    "01110"
+    "111111",
+    "100000",
+    "100000",
+    "111110",
+    "000001",
+    "000001",
+    "111110",
+    "100001",
+    "111110"
   ]
-  const ox = 85, oy = 75
-  const sx = 6, sy = 7
-  for (let py = 0; py < 7; py++) {
-    for (let px = 0; px < 5; px++) {
+  const ox = 85, oy = 79
+  const sx = 5, sy = 5
+  for (let py = 0; py < digit5.length; py++) {
+    for (let px = 0; px < digit5[py].length; px++) {
       if (digit5[py][px] === '1') {
         for (let y = 0; y < sy; y++) {
           for (let x = 0; x < sx; x++) {
             const i = ((oy + py*sy + y) * W + (ox + px*sx + x)) * 4
-            rgba[i] = 0; rgba[i+1] = 0; rgba[i+2] = 0
+            rgba[i] = 30; rgba[i+1] = 30; rgba[i+2] = 30
           }
         }
       }
@@ -83,30 +103,27 @@ function makeTestPng() {
   return encodePng(W, H, rgba)
 }
 
-const testPng = makeTestPng()
-console.log('Тестовый PNG: ' + testPng.length + ' байт')
-
-// Ищем также реальный PNG из records/, если есть
+// Также попробуем найти реальный PNG из records/
 let realPng = null
-const recordsDir = path.join(__dirname, 'records')
-if (fs.existsSync(recordsDir)) {
-  const rounds = fs.readdirSync(recordsDir).filter(d => d.startsWith('live_round'))
-  for (const r of rounds.slice(-3).reverse()) {
-    const p = path.join(recordsDir, r, 'ORIGINAL_CAPTCHA.png')
-    if (fs.existsSync(p)) {
-      realPng = { path: p, buf: fs.readFileSync(p) }
-      console.log('Найден реальный PNG: ' + p + ' (' + realPng.buf.length + ' байт)')
-      break
+try {
+  const recordsDir = path.join(__dirname, 'records')
+  if (fs.existsSync(recordsDir)) {
+    const rounds = fs.readdirSync(recordsDir).filter(d => d.startsWith('live_round')).sort().reverse()
+    for (const r of rounds) {
+      const p = path.join(recordsDir, r, 'ORIGINAL_CAPTCHA.png')
+      if (fs.existsSync(p)) {
+        realPng = { path: p, buf: fs.readFileSync(p) }
+        break
+      }
     }
   }
-}
+} catch (e) {}
 
 // ========================= HTTP helper =========================
-function httpPost(urlStr, headers, body, timeoutMs = 15000) {
+function httpPost(urlStr, headers, body, timeoutMs) {
   return new Promise((resolve, reject) => {
     let u
     try { u = new URL(urlStr) } catch (e) { return reject(new Error('bad url: ' + e.message)) }
-    
     const mod = u.protocol === 'https:' ? https : http
     const opts = {
       hostname: u.hostname,
@@ -114,19 +131,18 @@ function httpPost(urlStr, headers, body, timeoutMs = 15000) {
       path: u.pathname + u.search,
       method: 'POST',
       headers: headers,
-      timeout: timeoutMs
+      timeout: timeoutMs,
+      // Игнорируем самоподписанные сертификаты (если есть локальный сервер)
+      rejectUnauthorized: false
     }
-    
     const t0 = Date.now()
     const req = mod.request(opts, res => {
       const chunks = []
       res.on('data', c => chunks.push(c))
       res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8')
         resolve({
           status: res.statusCode,
-          headers: res.headers,
-          body: body,
+          body: Buffer.concat(chunks).toString('utf8'),
           timeMs: Date.now() - t0
         })
       })
@@ -139,28 +155,25 @@ function httpPost(urlStr, headers, body, timeoutMs = 15000) {
   })
 }
 
-function httpGet(urlStr, timeoutMs = 5000) {
+function httpGet(urlStr, timeoutMs) {
   return new Promise((resolve, reject) => {
     let u
     try { u = new URL(urlStr) } catch (e) { return reject(new Error('bad url: ' + e.message)) }
-    
     const mod = u.protocol === 'https:' ? https : http
     const t0 = Date.now()
     const req = mod.get({
       hostname: u.hostname,
       port: u.port || (u.protocol === 'https:' ? 443 : 80),
       path: u.pathname + u.search,
-      timeout: timeoutMs
+      timeout: timeoutMs,
+      rejectUnauthorized: false
     }, res => {
       const chunks = []
       res.on('data', c => chunks.push(c))
       res.on('end', () => {
-        resolve({
-          status: res.statusCode,
-          body: Buffer.concat(chunks).toString('utf8'),
-          timeMs: Date.now() - t0
-        })
+        resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8'), timeMs: Date.now() - t0 })
       })
+      res.on('error', e => reject(e))
     })
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout ' + timeoutMs + 'ms')) })
     req.on('error', e => reject(e))
@@ -168,62 +181,103 @@ function httpGet(urlStr, timeoutMs = 5000) {
 }
 
 // ========================= Тесты =========================
-async function test1_health() {
-  console.log('\n===== TEST 1: Health check =====')
-  const base = RF.detectUrl.replace(/\/+$/, '')
-  const url = base + '/'
+
+async function testLocalServer() {
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+  console.log('⚙️  TEST 1: Проверка локального сервера на ' + RF_CFG.detectUrl)
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   
   try {
-    const r = await httpGet(url, 5000)
-    console.log('GET ' + url + ' -> ' + r.status + ' (' + r.timeMs + 'ms)')
-    console.log('Body (first 500 chars):')
-    console.log(r.body.slice(0, 500))
-    return r.status === 200
+    const r = await httpGet(RF_CFG.detectUrl + '/', 2000)
+    console.log('  ✅ Локальный сервер ОТВЕЧАЕТ: HTTP ' + r.status + ' (' + r.timeMs + 'ms)')
+    return true
   } catch (e) {
-    console.log('FAIL: ' + e.message)
-    console.log('')
-    console.log('⚠️  Сервер не отвечает! Проверьте:')
-    console.log('   1. Запущен ли Roboflow Inference Server')
-    console.log('   2. Команда запуска: pip install inference && inference server start')
-    console.log('   3. Docker: docker run -p 9001:9001 roboflow/roboflow-inference-server-cpu')
+    console.log('  ⚠️  Локальный сервер НЕ отвечает: ' + e.message)
+    console.log('  → Это нормально, если вы ещё не запустили inference server.')
     return false
   }
 }
 
-async function test2_models() {
-  console.log('\n===== TEST 2: List available models =====')
-  const base = RF.detectUrl.replace(/\/+$/, '')
-  const url = base + '/model/registry'
+async function testCloudRoboflow(pngBuffer, label) {
+  console.log('')
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+  console.log('☁️  TEST 2: Cloud Roboflow (detect.roboflow.com) [' + label + ']')
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+  
+  const model = String(RF_CFG.modelId).replace(/^\/+|\/+$/g, '')
+  const url = 'https://detect.roboflow.com/' + model + 
+              '?api_key=' + encodeURIComponent(RF_CFG.apiKey) +
+              '&confidence=' + (RF_CFG.confidence || 25) +
+              '&overlap=' + (RF_CFG.overlap || 20)
+  
+  console.log('  URL: POST ' + url)
+  console.log('  Размер картинки: ' + pngBuffer.length + ' байт')
   
   try {
-    const r = await httpGet(url, 5000)
-    console.log('GET ' + url + ' -> ' + r.status + ' (' + r.timeMs + 'ms)')
-    if (r.status === 200) {
+    const r = await httpPost(url, {
+      'Content-Type': 'image/png',
+      'Content-Length': pngBuffer.length,
+      'User-Agent': 'MC_Bot_Test/1.0'
+    }, pngBuffer, 15000)
+    
+    console.log('  Статус: ' + r.status + ' (' + r.timeMs + 'ms)')
+    
+    if (r.status >= 200 && r.status < 300) {
       try {
         const j = JSON.parse(r.body)
-        console.log('Available models:')
-        console.log(JSON.stringify(j, null, 2).slice(0, 2000))
+        const preds = j.predictions || j.results || []
+        console.log('  ✅ УСПЕХ! Получено предсказаний: ' + preds.length)
+        
+        if (preds.length > 0) {
+          console.log('')
+          console.log('  Первые 5 результатов:')
+          for (const p of preds.slice(0, 5)) {
+            const cls = p.class || p.class_name || p.label || '?'
+            const conf = p.confidence != null ? (p.confidence > 1 ? p.confidence.toFixed(1) + '%' : (p.confidence*100).toFixed(1) + '%') : '?'
+            const x = p.x != null ? 'x=' + Math.round(p.x) : ''
+            const y = p.y != null ? 'y=' + Math.round(p.y) : ''
+            console.log('    • ' + cls.padEnd(10) + ' conf=' + conf.padEnd(7) + ' ' + x + ' ' + y)
+          }
+        } else {
+          console.log('  ⚠️  Ответ валидный, но предсказаний 0 (картинка не похожа на капчу)')
+          console.log('  Body (first 500): ' + r.body.slice(0, 500))
+        }
+        return { ok: true, status: r.status, preds: preds.length }
       } catch (e) {
-        console.log('Body: ' + r.body.slice(0, 500))
+        console.log('  ⚠️  Ответ получен, но не JSON: ' + r.body.slice(0, 300))
+        return { ok: false, status: r.status }
       }
     } else {
-      console.log('Body: ' + r.body.slice(0, 500))
+      console.log('  ❌ HTTP ' + r.status + ': ' + r.body.slice(0, 300).replace(/\n/g, ' '))
+      if (r.status === 401) console.log('     → Неверный API ключ. Проверьте roboflow.apiKey в config.json')
+      if (r.status === 404) console.log('     → Модель не найдена. Проверьте roboflow.modelId')
+      if (r.status === 429) console.log('     → Лимит запросов исчерпан. Подождите или используйте другой ключ')
+      return { ok: false, status: r.status }
     }
   } catch (e) {
-    console.log('FAIL: ' + e.message)
+    console.log('  ❌ ОШИБКА: ' + e.message)
+    if (/ECONNREFUSED|ETIMEDOUT/.test(e.message)) {
+      console.log('     → Cloud Roboflow недоступен из вашей сети (блокировка провайдера/РКН).')
+      console.log('     → Потребуется HTTP-прокси для обхода блокировки.')
+    }
+    return { ok: false, error: e.message }
   }
 }
 
-async function test3_infer_direct(pngBuffer, label) {
-  console.log('\n===== TEST 3: Inference (direct detect) [' + label + '] =====')
-  const base = RF.detectUrl.replace(/\/+$/, '')
-  const model = String(RF.modelId).replace(/^\/+|\/+$/g, '')
-  const url = base + '/' + model + '?api_key=' + encodeURIComponent(RF.apiKey) + 
-              '&confidence=' + (RF.confidence || 25) + 
-              '&overlap=' + (RF.overlap || 20)
+async function testLocalInfer(pngBuffer, label) {
+  console.log('')
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+  console.log('🏠 TEST 3: Inference на локальном сервере [' + label + ']')
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   
-  console.log('POST ' + url)
-  console.log('Image size: ' + pngBuffer.length + ' bytes')
+  const base = RF_CFG.detectUrl.replace(/\/+$/, '')
+  const model = String(RF_CFG.modelId).replace(/^\/+|\/+$/g, '')
+  const url = base + '/' + model + 
+              '?api_key=' + encodeURIComponent(RF_CFG.apiKey) +
+              '&confidence=' + (RF_CFG.confidence || 25) +
+              '&overlap=' + (RF_CFG.overlap || 20)
+  
+  console.log('  URL: POST ' + url)
   
   try {
     const r = await httpPost(url, {
@@ -231,135 +285,135 @@ async function test3_infer_direct(pngBuffer, label) {
       'Content-Length': pngBuffer.length
     }, pngBuffer, 30000)
     
-    console.log('Status: ' + r.status + ' (' + r.timeMs + 'ms)')
-    console.log('Content-Type: ' + r.headers['content-type'])
+    console.log('  Статус: ' + r.status + ' (' + r.timeMs + 'ms)')
     
     if (r.status >= 200 && r.status < 300) {
       try {
         const j = JSON.parse(r.body)
-        console.log('✅ УСПЕХ! Предсказаний: ' + (j.predictions ? j.predictions.length : 'n/a'))
-        console.log(JSON.stringify(j, null, 2).slice(0, 2000))
-        return true
+        const preds = j.predictions || j.results || []
+        console.log('  ✅ УСПЕХ! Предсказаний: ' + preds.length)
+        for (const p of preds.slice(0, 5)) {
+          const cls = p.class || p.class_name || p.label || '?'
+          const conf = p.confidence != null ? (p.confidence > 1 ? p.confidence.toFixed(1) + '%' : (p.confidence*100).toFixed(1) + '%') : '?'
+          console.log('    • ' + cls + ' (' + conf + ')')
+        }
+        return { ok: true, status: r.status }
       } catch (e) {
-        console.log('Body (не JSON): ' + r.body.slice(0, 500))
+        console.log('  ⚠️  Не JSON: ' + r.body.slice(0, 300))
+        return { ok: false, status: r.status }
       }
     } else {
-      console.log('❌ Body: ' + r.body.slice(0, 1000))
+      console.log('  ❌ ' + r.body.slice(0, 300))
+      return { ok: false, status: r.status }
     }
-    return false
   } catch (e) {
-    console.log('FAIL: ' + e.message)
-    return false
+    console.log('  ❌ ' + e.message)
+    return { ok: false, error: e.message }
   }
 }
 
-async function test4_infer_multipart(pngBuffer, label) {
-  console.log('\n===== TEST 4: Inference (multipart) [' + label + '] =====')
-  const base = RF.serverlessUrl.replace(/\/+$/, '')
-  const model = String(RF.modelId).replace(/^\/+|\/+$/g, '')
-  const url = base + '/infer?model_id=' + model
-  
-  const boundary = '----TestBoundary' + Date.now()
-  const head = Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="test.png"\r\nContent-Type: image/png\r\n\r\n')
-  const tail = Buffer.from('\r\n--' + boundary + '--\r\n')
-  const body = Buffer.concat([head, pngBuffer, tail])
-  
-  console.log('POST ' + url)
-  console.log('Multipart size: ' + body.length + ' bytes')
-  
-  try {
-    const r = await httpPost(url, {
-      'Content-Type': 'multipart/form-data; boundary=' + boundary,
-      'Content-Length': body.length,
-      'Authorization': 'Bearer ' + RF.apiKey
-    }, body, 30000)
-    
-    console.log('Status: ' + r.status + ' (' + r.timeMs + 'ms)')
-    
-    if (r.status >= 200 && r.status < 300) {
-      try {
-        const j = JSON.parse(r.body)
-        console.log('✅ УСПЕХ! Предсказаний: ' + (j.predictions ? j.predictions.length : 'n/a'))
-        console.log(JSON.stringify(j, null, 2).slice(0, 2000))
-        return true
-      } catch (e) {
-        console.log('Body (не JSON): ' + r.body.slice(0, 500))
-      }
-    } else {
-      console.log('❌ Body: ' + r.body.slice(0, 1000))
-    }
-    return false
-  } catch (e) {
-    console.log('FAIL: ' + e.message)
-    return false
-  }
-}
-
-async function test5_cloud_roboflow(pngBuffer) {
-  console.log('\n===== TEST 5: Cloud Roboflow (detect.roboflow.com) =====')
-  console.log('⚠️  Этот тест идёт напрямую на detect.roboflow.com БЕЗ прокси.')
-  console.log('   Если у вас заблокирован roboflow.com на уровне сети — будет ECONNREFUSED.')
-  
-  const model = String(RF.modelId).replace(/^\/+|\/+$/g, '')
-  const url = 'https://detect.roboflow.com/' + model + '?api_key=' + encodeURIComponent(RF.apiKey) + 
-              '&confidence=' + (RF.confidence || 25) + 
-              '&overlap=' + (RF.overlap || 20)
-  
-  console.log('POST ' + url)
-  
-  try {
-    const r = await httpPost(url, {
-      'Content-Type': 'image/png',
-      'Content-Length': pngBuffer.length
-    }, pngBuffer, 15000)
-    
-    console.log('Status: ' + r.status + ' (' + r.timeMs + 'ms)')
-    if (r.status >= 200 && r.status < 300) {
-      try {
-        const j = JSON.parse(r.body)
-        console.log('✅ Cloud Roboflow работает! Предсказаний: ' + (j.predictions ? j.predictions.length : 'n/a'))
-        console.log(JSON.stringify(j, null, 2).slice(0, 1500))
-      } catch (e) {
-        console.log('Body: ' + r.body.slice(0, 500))
-      }
-    } else {
-      console.log('❌ Body: ' + r.body.slice(0, 500))
-    }
-  } catch (e) {
-    console.log('FAIL: ' + e.message)
-    console.log('   Cloud Roboflow недоступен напрямую — нужен HTTP/HTTPS прокси')
-  }
-}
+// ========================= Главная функция =========================
 
 async function main() {
-  const ok1 = await test1_health()
-  
-  if (!ok1) {
-    console.log('\n❌ Сервер не запущен. Дальнейшие тесты бессмысленны.')
-    process.exit(1)
-  }
-  
-  await test2_models()
-  
-  // Тест на синтетическом PNG
-  await test3_infer_direct(testPng, 'синтетический PNG "5"')
-  
-  // Тест на реальном PNG из records/, если есть
+  const testPng = makeTestPng()
+  console.log('[PNG] Синтетическая картинка: ' + testPng.length + ' байт (цифра "5" на белом фоне)')
   if (realPng) {
-    await test3_infer_direct(realPng.buf, 'реальная капча')
-    await test4_infer_multipart(realPng.buf, 'реальная капча multipart')
+    console.log('[PNG] Найден реальный PNG из records: ' + realPng.path + ' (' + realPng.buf.length + ' байт)')
+  }
+  console.log('')
+  
+  // TEST 1: локальный сервер
+  const localUp = await testLocalServer()
+  
+  let cloudOk = false
+  let localOk = false
+  
+  // TEST 2: Cloud Roboflow (всегда проверяем)
+  const cloud1 = await testCloudRoboflow(testPng, 'синтетика')
+  if (cloud1.ok) cloudOk = true
+  if (!cloud1.ok && realPng) {
+    const cloud2 = await testCloudRoboflow(realPng.buf, 'реальная капча')
+    if (cloud2.ok) cloudOk = true
   }
   
-  await test5_cloud_roboflow(testPng)
+  // TEST 3: локальный сервер (только если он отвечает)
+  if (localUp) {
+    const loc1 = await testLocalInfer(testPng, 'синтетика')
+    if (loc1.ok) localOk = true
+    if (!loc1.ok && realPng) {
+      const loc2 = await testLocalInfer(realPng.buf, 'реальная капча')
+      if (loc2.ok) localOk = true
+    }
+  }
   
-  console.log('\n=== ИТОГО ===')
-  console.log('Если TEST 3/4 прошли — локальный сервер работает, проблема была только в SOCKS.')
-  console.log('Если TEST 5 прошёл — cloud Roboflow тоже доступен напрямую (без прокси).')
-  console.log('Если TEST 5 упал с ECONNREFUSED — нужен HTTP-прокси для cloud.')
+  // ========================= ИТОГОВЫЙ ОТЧЁТ =========================
+  console.log('')
+  console.log('╔══════════════════════════════════════════════════════════╗')
+  console.log('║                     ИТОГ                                ║')
+  console.log('╚══════════════════════════════════════════════════════════╝')
+  console.log('')
+  console.log('  Cloud Roboflow:  ' + (cloudOk ? '✅ РАБОТАЕТ' : '❌ НЕ РАБОТАЕТ'))
+  console.log('  Local Server:    ' + (localUp ? (localOk ? '✅ РАБОТАЕТ' : '⚠️  Запущен, но inference не проходит') : '❌ НЕ ЗАПУЩЕН'))
+  console.log('')
+  
+  if (cloudOk) {
+    console.log('🎉 ОТЛИЧНО! Cloud Roboflow работает с вашим API ключом.')
+    console.log('')
+    console.log('Что делать дальше:')
+    console.log('')
+    console.log('  ┌───────────────────────────────────────────────────────┐')
+    console.log('  │ ВАРИАНТ A: Использовать Cloud (просто и быстро)       │')
+    console.log('  ├───────────────────────────────────────────────────────┤')
+    console.log('  │ В config.json измените:                               │')
+    console.log('  │   "detectUrl": "https://detect.roboflow.com",         │')
+    console.log('  │   "serverlessUrl": "https://serverless.roboflow.com", │')
+    console.log('  │                                                       │')
+    console.log('  │ Но: нужен HTTP-прокси для обхода блокировок РФ.       │')
+    console.log('  │ Добавьте в roboflow:                                  │')
+    console.log('  │   "httpProxy": "http://user:pass@proxy.com:8080"      │')
+    console.log('  └───────────────────────────────────────────────────────┘')
+    console.log('')
+    console.log('  ┌───────────────────────────────────────────────────────┐')
+    console.log('  │ ВАРИАНТ B: Локальный сервер (быстрее, без прокси)     │')
+    console.log('  ├───────────────────────────────────────────────────────┤')
+    console.log('  │ 1. Установите Python 3.9+ с python.org                │')
+    console.log('  │ 2. pip install inference                              │')
+    console.log('  │ 3. inference server start --port 9001                 │')
+    console.log('  │                                                       │')
+    console.log('  │ Тогда оставьте в конфиге:                             │')
+    console.log('  │   "detectUrl": "http://localhost:9001"                │')
+    console.log('  │   (и НЕ нужен httpProxy)                              │')
+    console.log('  └───────────────────────────────────────────────────────┘')
+    console.log('')
+    console.log('main.js v3.5.0 автоматически определит localhost и пойдёт')
+    console.log('напрямую без SOCKS-прокси, а для cloud — через httpProxy.')
+  } else if (localOk) {
+    console.log('✅ Локальный сервер работает. Cloud недоступен (блокировка сети).')
+    console.log('')
+    console.log('Используйте localhost:9001 — он у вас уже работает.')
+  } else {
+    console.log('❌ НЕ РАБОТАЕТ ни cloud, ни локальный сервер.')
+    console.log('')
+    console.log('Возможные причины:')
+    console.log('  1. Cloud Roboflow заблокирован провайдером/РКН')
+    console.log('     → Решается HTTP-прокси (прокси-сервис с HTTPS-поддержкой)')
+    console.log('  2. Неверный API ключ (попробуйте получить новый на roboflow.com)')
+    console.log('  3. Лимит бесплатных запросов исчерпан')
+    console.log('  4. Локальный сервер не установлен/не запущен')
+    console.log('')
+    console.log('Рекомендация: установите inference server локально.')
+    console.log('  pip install inference')
+    console.log('  inference server start --port 9001')
+  }
+  
+  console.log('')
+  console.log('═══════════════════════════════════════════════════════════')
+  console.log('Тест завершён.')
+  console.log('═══════════════════════════════════════════════════════════')
 }
 
 main().catch(e => {
-  console.error('FATAL:', e.message)
+  console.error('FATAL: ' + e.message)
   console.error(e.stack)
   process.exit(1)
 })
