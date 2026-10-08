@@ -1,6 +1,6 @@
-// VERSION: 3.7.0
+// VERSION: 3.7.1
 // main.js
-// v3.7.0: автоустановка и автозапуск inference server через pip
+// v3.7.1: автоустановка Python 3.12 + inference server + ink seams + 4 ориентации + seamPenalty
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -169,7 +169,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE SERVER =========================
+// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.1) =========================
 let localhostAlive = false
 
 function checkLocalhostHealth() {
@@ -183,14 +183,90 @@ function checkLocalhostHealth() {
   })
 }
 
-function findPython() {
+// v3.7.1: находим Python 3.8-3.12 (поддерживаемые версии)
+function findSupportedPython() {
+  // Сначала ищем конкретные версии
+  for (const cmd of ['py -3.12', 'py -3.11', 'py -3.10', 'py -3.9', 'py -3.8']) {
+    try {
+      const v = execSync(cmd + ' --version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      const m = v.match(/Python 3\.(\d+)/)
+      if (m && parseInt(m[1]) >= 8 && parseInt(m[1]) <= 12) {
+        step('[RF] Найден поддерживаемый Python: ' + cmd + ' (' + v.trim() + ')')
+        return cmd
+      }
+    } catch (e) {}
+  }
+
+  // Пробуем общий python
   for (const cmd of ['python', 'py', 'python3']) {
     try {
       const v = execSync(cmd + ' --version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-      if (/Python 3\.\d+/.test(v)) return cmd
+      const m = v.match(/Python 3\.(\d+)/)
+      if (m) {
+        const minor = parseInt(m[1])
+        if (minor >= 8 && minor <= 12) {
+          step('[RF] Найден поддерживаемый Python: ' + cmd + ' (' + v.trim() + ')')
+          return cmd
+        } else {
+          step('[RF] ⚠️  ' + cmd + ' = Python 3.' + minor + ' (не поддерживается inference)')
+        }
+      }
     } catch (e) {}
   }
   return null
+}
+
+// v3.7.1: автоматическая установка Python 3.12
+async function installPython312() {
+  step('[RF] Устанавливаю Python 3.12 (это займёт 1-2 минуты)...')
+  
+  const installerUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe'
+  const installerPath = path.join(__dirname, 'python-3.12.9-installer.exe')
+  
+  // Скачиваем установщик
+  step('[RF] Скачивание установщика Python 3.12.9...')
+  try {
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(installerPath)
+      https.get(installerUrl, response => {
+        if (response.statusCode !== 200) {
+          reject(new Error('HTTP ' + response.statusCode))
+          return
+        }
+        response.pipe(file)
+        file.on('finish', () => { file.close(); resolve() })
+      }).on('error', e => { try { fs.unlinkSync(installerPath) } catch (x) {}; reject(e) })
+    })
+    step('[RF] ✅ Установщик скачан')
+  } catch (e) {
+    step('[RF] ❌ Не удалось скачать Python: ' + e.message)
+    step('[RF] Скачайте вручную: https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe')
+    return false
+  }
+  
+  // Запускаем установщик в тихом режиме
+  step('[RF] Установка Python 3.12 (тихий режим, с добавлением в PATH)...')
+  try {
+    execSync('"' + installerPath + '" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0', {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 180000 // 3 минуты
+    })
+    step('[RF] ✅ Python 3.12 установлен')
+    
+    // Удаляем установщик
+    try { fs.unlinkSync(installerPath) } catch (e) {}
+    
+    // Ждём пока Python станет доступен
+    await sleep(5000)
+    return true
+  } catch (e) {
+    step('[RF] ❌ Установка Python не удалась: ' + e.message)
+    step('[RF] Попробуйте установить вручную:')
+    step('[RF]   1. Скачайте: ' + installerUrl)
+    step('[RF]   2. Запустите с галочкой "Add Python to PATH"')
+    return false
+  }
 }
 
 function isInferenceInstalled(py) {
@@ -217,7 +293,7 @@ async function installInference(py) {
         resolve(true)
       } else {
         step('[RF] ❌ pip install завершился с кодом ' + code)
-        step('[RF] Вывод: ' + output.slice(-300).replace(/\n/g, ' '))
+        step('[RF] Вывод: ' + output.slice(-500).replace(/\n/g, ' '))
         resolve(false)
       }
     })
@@ -274,16 +350,28 @@ async function ensureInferenceServer() {
     return true
   }
 
-  // Ищем Python
-  const py = findPython()
+  // v3.7.1: Ищем поддерживаемый Python (3.8-3.12)
+  let py = findSupportedPython()
+  
   if (!py) {
-    step('[RF] ⚠️  Python не найден на системе')
-    step('[RF]    Установите Python 3.9+ с https://python.org/downloads/')
-    step('[RF]    (обязательно с галочкой "Add to PATH")')
-    step('[RF]    Без Python RF будет пропущен, бот работает только на OCR')
-    return false
+    step('[RF] ⚠️  Не найден Python 3.8-3.12 (требуется для inference)')
+    step('[RF] Пытаюсь установить Python 3.12 автоматически...')
+    
+    const installed = await installPython312()
+    if (!installed) {
+      step('[RF] ❌ Без Python 3.12 RF не заработает')
+      step('[RF] Бот продолжит работу только на OCR')
+      return false
+    }
+    
+    // Проверяем ещё раз после установки
+    py = findSupportedPython()
+    if (!py) {
+      step('[RF] ❌ Python 3.12 установлен, но не найден в PATH')
+      step('[RF] Перезапустите бота или добавьте Python в PATH вручную')
+      return false
+    }
   }
-  step('[RF] Python найден: ' + py)
 
   // Проверяем, установлен ли inference
   if (!isInferenceInstalled(py)) {
@@ -291,7 +379,7 @@ async function ensureInferenceServer() {
     const ok = await installInference(py)
     if (!ok) {
       step('[RF] ❌ Установка inference не удалась')
-      step('[RF]    Попробуйте вручную: ' + py + ' -m pip install inference')
+      step('[RF] Попробуйте вручную: ' + py + ' -m pip install inference')
       return false
     }
   } else {
@@ -320,7 +408,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.0', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.1', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -442,7 +530,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.0\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.1\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -467,7 +555,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.0', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.1', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -846,7 +934,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.0 — автоустановка inference === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.1 — автоустановка Python 3.12 + inference === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
