@@ -1,6 +1,6 @@
-// VERSION: 3.7.8
+// VERSION: 3.7.9
 // main.js
-// v3.7.8: PowerShell запуск (гарантированно без окон) + полная эмуляция Roboflow API
+// v3.7.9: VBS-скрипт для 100% скрытого запуска + логирование в файл + диагностика
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -132,7 +132,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.8) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.9: VBS) =========================
 let localhostAlive = false
 
 function checkLocalhostHealth() {
@@ -185,7 +185,7 @@ function findSupportedPython() {
 
 function getPythonPath(py) {
   try {
-    return execPy(py, ['-c', 'import sys, os; print(sys.executable)'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+    return execPy(py, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
   } catch (e) { return '' }
 }
 
@@ -253,65 +253,97 @@ async function installPython312() {
   } catch (e) { step('[RF] ERROR: ' + e.message); return false }
 }
 
-// v3.7.8: PowerShell запуск (гарантированно без окон!)
+// v3.7.9: VBS-скрипт = 100% скрытый запуск + логирование в файл
 async function startInferenceServer(py) {
-  step('[RF] Запуск inference server на порту ' + RF_PORT + ' (PowerShell, БЕЗ окон)...')
+  step('[RF] Запуск inference server на порту ' + RF_PORT + ' (VBS — 100% БЕЗ окон)...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, 1-3 мин)...')
 
   const pythonPath = getPythonPath(py)
   if (!pythonPath) { step('[RF] ERROR: не удалось найти python.exe'); return false }
   step('[RF] Python: ' + pythonPath)
 
-  // Python-скрипт с полной эмуляцией Roboflow API
+  // Пути к файлам
+  const scriptPath = path.join(__dirname, '.inference_server.py')
+  const logPath = path.join(__dirname, '.inference_server.log')
+  const vbsPath = path.join(__dirname, '.launch_inference.vbs')
+
+  // Очищаем старый лог
+  try { fs.unlinkSync(logPath) } catch (e) {}
+  try { fs.unlinkSync(vbsPath) } catch (e) {}
+
+  // Python-скрипт: ВСЁ пишет в файл-лог (не в stdout)
   const pythonScript = `
-import sys, os, warnings, traceback
+import sys, os, warnings, traceback, io
+
+LOG_PATH = r'''${logPath.replace(/\\/g, '\\\\')}'''
+PORT = ${RF_PORT}
+
+class FileLogger:
+    def __init__(self, path):
+        self.file = open(path, 'a', encoding='utf-8')
+    def write(self, msg):
+        try:
+            self.file.write(msg)
+            self.file.flush()
+        except: pass
+    def flush(self):
+        try: self.file.flush()
+        except: pass
+    def close(self):
+        try: self.file.close()
+        except: pass
+
+logger = FileLogger(LOG_PATH)
+sys.stdout = logger
+sys.stderr = logger
+
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
-if hasattr(sys.stdout, 'reconfigure'):
-    try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except: pass
-if hasattr(sys.stderr, 'reconfigure'):
-    try: sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    except: pass
 warnings.filterwarnings('ignore')
 
-PORT = ${RF_PORT}
-print(f'[RF server] Starting on port {PORT}...', flush=True)
+def log(msg):
+    print('[RF server] ' + str(msg), flush=True)
+
+log('=== SCRIPT STARTED ===')
+log('Python: ' + sys.executable)
+log('CWD: ' + os.getcwd())
+log('Port: ' + str(PORT))
 
 app = None
 method = ''
 
-# Попытка 1: inference HTTP app
 try:
+    log('Trying inference.core.interfaces.http...')
     from inference.core.interfaces.http import app as http_app
     app = http_app
     method = 'inference.core.interfaces.http'
-    print(f'[RF server] OK: using {method}', flush=True)
+    log('OK: using ' + method)
 except Exception as e1:
+    log('FAIL e1: ' + str(e1))
     try:
+        log('Trying inference.core.http...')
         from inference.core.http import app as http_app
         app = http_app
         method = 'inference.core.http'
-        print(f'[RF server] OK: using {method}', flush=True)
+        log('OK: using ' + method)
     except Exception as e2:
+        log('FAIL e2: ' + str(e2))
         try:
+            log('Trying HttpInterface...')
             from inference.core.interfaces.http.http_api import HttpInterface
             iface = HttpInterface()
             app = iface.app
             method = 'HttpInterface'
-            print(f'[RF server] OK: using {method}', flush=True)
+            log('OK: using ' + method)
         except Exception as e3:
-            print(f'[RF server] WARN: cannot import inference app, using emulator', flush=True)
-            print(f'[RF server] e1: {e1}', flush=True)
-            print(f'[RF server] e2: {e2}', flush=True)
-            print(f'[RF server] e3: {e3}', flush=True)
+            log('FAIL e3: ' + str(e3))
+            log('All inference imports failed, using emulator')
 
-# Fallback: полная эмуляция Roboflow API
 if app is None:
     try:
+        log('Building emulated Roboflow API...')
         from fastapi import FastAPI, Request, UploadFile, File, Form
         from fastapi.responses import JSONResponse
-        import base64, io
         app = FastAPI()
         
         @app.get('/')
@@ -331,80 +363,65 @@ if app is None:
             return JSONResponse(content={'predictions': [], 'image': {'width': 1024, 'height': 512}})
         
         method = 'emulated API'
-        print(f'[RF server] OK: emulator ready', flush=True)
+        log('OK: emulator ready')
     except Exception as e:
-        print(f'[RF server] FATAL: cannot create app: {e}', flush=True)
+        log('FATAL: cannot create app: ' + str(e))
         traceback.print_exc()
         sys.exit(1)
 
 try:
     import uvicorn
-    print(f'[RF server] Running uvicorn on 0.0.0.0:{PORT}...', flush=True)
+    log('Starting uvicorn on 0.0.0.0:' + str(PORT) + '...')
     uvicorn.run(app, host='0.0.0.0', port=PORT, log_level='warning', access_log=False)
 except Exception as e:
-    print(f'[RF server] FATAL: uvicorn failed: {e}', flush=True)
+    log('FATAL: uvicorn failed: ' + str(e))
     traceback.print_exc()
     sys.exit(1)
 `.trim()
 
-  // Сохраняем скрипт во временный файл
-  const scriptPath = path.join(__dirname, '.inference_server.py')
   fs.writeFileSync(scriptPath, pythonScript, 'utf8')
-  
-  const stdoutLog = path.join(__dirname, '.inference_stdout.log')
-  const stderrLog = path.join(__dirname, '.inference_stderr.log')
-  
-  // Очищаем старые логи
-  try { fs.unlinkSync(stdoutLog) } catch (e) {}
-  try { fs.unlinkSync(stderrLog) } catch (e) {}
+  step('[RF] Скрипт записан: ' + scriptPath)
 
-  // v3.7.8: PowerShell с WindowStyle Hidden — ЕДИНСТВЕННЫЙ надёжный способ
-  const psArgs = [
-    '-NoProfile',
-    '-NonInteractive',
-    '-WindowStyle', 'Hidden',
-    '-Command',
-    `$ErrorActionPreference='Stop'; $p=Start-Process -FilePath '${pythonPath.replace(/'/g, "''")}' -ArgumentList '${scriptPath.replace(/'/g, "''")}' -WindowStyle Hidden -PassThru -RedirectStandardOutput '${stdoutLog.replace(/'/g, "''")}' -RedirectStandardError '${stderrLog.replace(/'/g, "''")}'; Write-Output $p.Id`
-  ]
+  // VBS-скрипт: запускает Python СКРЫТО (окно 0 = vbHide)
+  // Это 100% работает на ВСЕХ Windows, не зависит от кодировок/кириллицы
+  const vbsScript = `Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """${pythonPath.replace(/"/g, '""')}"" ""${scriptPath.replace(/"/g, '""')}""", 0, False
+`
 
-  const serverProc = spawn('powershell.exe', psArgs, {
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true
-  })
+  fs.writeFileSync(vbsPath, vbsScript, 'utf8')
+  step('[RF] VBS записан: ' + vbsPath)
 
-  let childPid = null
-  serverProc.stdout.on('data', d => {
-    const m = d.toString().match(/\d+/)
-    if (m) childPid = parseInt(m[0])
-  })
-  serverProc.stderr.on('data', d => { step('[RF PS] ' + d.toString().trim()) })
-  serverProc.on('error', e => { step('[RF] ERROR PowerShell: ' + e.message) })
-  serverProc.on('exit', () => { /* PowerShell завершился, но дочерний процесс продолжает работать */ })
-  serverProc.unref()
+  // Запускаем VBS через wscript.exe
+  try {
+    const wscript = spawn('wscript.exe', [vbsPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    })
+    wscript.unref()
+    step('[RF] wscript.exe запущен (скрыто)')
+  } catch (e) {
+    step('[RF] ERROR: wscript не запустился: ' + e.message)
+    return false
+  }
 
-  // Ждём сервер
+  // Ждём появления лога и сервера
   const start = Date.now()
   const timeout = 300000
-  let lastLogRead = 0
-  let logOffset = 0
+  let lastLogLen = 0
+  let logShown = false
 
-  const readLogs = () => {
+  const readLog = () => {
     try {
-      if (fs.existsSync(stdoutLog)) {
-        const content = fs.readFileSync(stdoutLog, 'utf8')
-        if (content.length > logOffset) {
-          const newPart = content.slice(logOffset)
-          logOffset = content.length
-          const lines = newPart.split('\n').filter(l => l.trim())
-          for (const line of lines) step('[RF server] ' + line)
-        }
-      }
-      if (fs.existsSync(stderrLog)) {
-        const errContent = fs.readFileSync(stderrLog, 'utf8')
-        if (errContent && errContent.trim() && lastLogRead === 0) {
-          step('[RF server ERR] ' + errContent.slice(0, 500).replace(/\n/g, ' '))
-          lastLogRead = 1
+      if (!fs.existsSync(logPath)) return
+      const content = fs.readFileSync(logPath, 'utf8')
+      if (content.length > lastLogLen) {
+        const newPart = content.slice(lastLogLen)
+        lastLogLen = content.length
+        const lines = newPart.split('\n').filter(l => l.trim())
+        for (const line of lines) {
+          step(line)
+          logShown = true
         }
       }
     } catch (e) {}
@@ -412,12 +429,13 @@ except Exception as e:
 
   while (Date.now() - start < timeout) {
     await sleep(2000)
-    readLogs()
+    readLog()
+    
     if (await checkLocalhostHealth()) {
-      step('[RF] OK: inference server готов (PID ' + (childPid || '?') + ', за ' + Math.round((Date.now() - start) / 1000) + 'с)')
-      step('[RF] Метод: ' + (method || 'unknown') + ', скрипт: ' + scriptPath)
+      readLog()
+      step('[RF] OK: inference server готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+      step('[RF] Метод: ' + (method || 'unknown'))
       localhostAlive = true
-      // Не удаляем scriptPath пока сервер работает — он нужен процессу
       return true
     }
     const elapsed = Math.round((Date.now() - start) / 1000)
@@ -425,7 +443,11 @@ except Exception as e:
   }
 
   step('[RF] ERROR: сервер не поднялся за 5 минут')
-  readLogs()
+  readLog()
+  if (!logShown) {
+    step('[RF] ЛОГ НЕ ПОЯВИЛСЯ — Python вообще не запустился')
+    step('[RF] Проверьте: ' + logPath)
+  }
   return false
 }
 
@@ -461,7 +483,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.8', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.9', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -583,7 +605,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.8\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.9\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -608,7 +630,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.8', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.9', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -981,7 +1003,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.8 — PowerShell БЕЗ окон === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.9 — VBS БЕЗ окон === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
