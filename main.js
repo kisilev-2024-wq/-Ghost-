@@ -1,6 +1,6 @@
-// VERSION: 3.7.14
+// VERSION: 3.7.15
 // main.js
-// v3.7.14: абсолютный путь python.exe + getShortPath только для файлов
+// v3.7.15: spawnPy вместо spawn — правильный парсинг команд типа "py -3.12"
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,10 +134,9 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.14) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.15) =========================
 let localhostAlive = false
 let PY_EXE = ''
-let PY_EXE_SHORT = ''
 
 function q(s) { s = String(s); return /[\s"]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s }
 
@@ -157,12 +156,14 @@ function checkLocalhostHealth() {
   })
 }
 
-// v3.7.14: getShortPath ТОЛЬКО для реальных абсолютных путей
+// v3.7.15: getShortPath ТОЛЬКО для существующих абсолютных путей
 function getShortPath(p) {
-  if (!p || !/^[A-Za-z]:\\/.test(p)) return ''
-  if (!fs.existsSync(p)) return ''
+  if (!p || typeof p !== 'string') return ''
+  const clean = p.replace(/^"|"$/g, '')
+  if (!/^[A-Za-z]:\\/.test(clean)) return ''
+  if (!fs.existsSync(clean)) return ''
   try {
-    const out = execSync('cmd /c for %I in (' + q(p) + ') do @echo %~sI', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+    const out = execSync('cmd /c for %I in (' + q(clean) + ') do @echo %~sI', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
     const lines = String(out || '').trim().split(/\r?\n/)
     const last = (lines.pop() || '').trim()
     if (last && /^[A-Za-z]:\\/.test(last) && !/[^\x20-\x7E]/.test(last)) return last
@@ -170,32 +171,36 @@ function getShortPath(p) {
   return ''
 }
 
-// v3.7.14: умный парсер команд (поддерживает 'py -3.12' и 'C:\...\python.exe')
+// v3.7.15: умный парсер — различает "py -3.12" и "C:\...\python.exe"
 function parsePyCmd(py) {
-  if (/^[A-Za-z]:\\/.test(py) || py.startsWith('"')) {
-    return { cmd: py.replace(/^"|"$/g, ''), baseArgs: [] }
-  }
-  const parts = String(py || '').split(/\s+/).filter(Boolean)
-  return { cmd: parts[0] || 'py', baseArgs: parts.slice(1) }
+  if (typeof py !== 'string' || !py) return { cmd: 'py', baseArgs: [] }
+  const clean = py.trim().replace(/^"|"$/g, '')
+  // Абсолютный путь к python.exe
+  if (/^[A-Za-z]:\\/.test(clean)) return { cmd: clean, baseArgs: [] }
+  // Команда типа "py -3.12" или "python"
+  const parts = clean.split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return { cmd: 'py', baseArgs: [] }
+  return { cmd: parts[0], baseArgs: parts.slice(1) }
 }
 
+// v3.7.15: spawn с правильным парсингом — ключевое исправление!
 function spawnPy(exe, args, opts) {
   const { cmd, baseArgs } = parsePyCmd(exe)
-  return spawn(cmd, [...baseArgs, ...args], winOpts(opts))
+  // Короткий путь ТОЛЬКО для cmd (не для всей команды)
+  const cmdShort = getShortPath(cmd) || cmd
+  return spawn(cmdShort, [...baseArgs, ...(args || [])], winOpts(opts))
 }
 
 function execPy(exe, args, opts) {
   const { cmd, baseArgs } = parsePyCmd(exe)
-  const line = [cmd, ...baseArgs, ...args].map(q).join(' ')
+  const line = [cmd, ...baseArgs, ...(args || [])].map(q).join(' ')
   return execSync(line, winOpts(opts))
 }
 
-// v3.7.14: находит РЕАЛЬНЫЙ python.exe из команды 'py -3.12'
+// v3.7.15: находит РЕАЛЬНЫЙ python.exe из команды 'py -3.12'
 function resolvePythonExe(pyCmd) {
   try {
-    const { cmd, baseArgs } = parsePyCmd(pyCmd)
-    const line = [cmd, ...baseArgs, '-c', 'import sys, os; sys.stdout.write(os.path.abspath(sys.executable))'].map(q).join(' ')
-    const out = execSync(line, winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }))
+    const out = execPy(pyCmd, ['-c', 'import sys, os; sys.stdout.write(os.path.abspath(sys.executable))'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 })
     const lines = String(out || '').trim().split(/\r?\n/)
     for (let i = lines.length - 1; i >= 0; i--) {
       const full = lines[i].trim()
@@ -203,7 +208,9 @@ function resolvePythonExe(pyCmd) {
         return full
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    step('[RF] [DEBUG] resolvePythonExe error: ' + e.message)
+  }
   return ''
 }
 
@@ -325,13 +332,14 @@ function writeVbsUnicode(p, content) {
   fs.writeFileSync(p, Buffer.concat([bom, body]))
 }
 
+// v3.7.15: spawnPy вместо spawn — главное исправление
 async function startInferenceServer(exe) {
   step('[RF] Запуск inference server на порту ' + RF_PORT + '...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, 1-3 мин)...')
 
-  const spawnExe = getShortPath(exe) || exe
-  step('[RF] Python exe: ' + exe)
-  if (spawnExe !== exe) step('[RF] Короткий путь 8.3: ' + spawnExe)
+  step('[RF] Команда: ' + exe)
+  const parsed = parsePyCmd(exe)
+  step('[RF] Парсинг: cmd="' + parsed.cmd + '", baseArgs=' + JSON.stringify(parsed.baseArgs))
 
   const scriptPath = path.join(__dirname, '.inference_server.py')
   const logPath = path.join(__dirname, '.inference_server.log')
@@ -445,15 +453,17 @@ except Exception as e:
 
   let launched = 'direct'
   try {
-    const serverProc = spawn(spawnExe, [scriptPath], winOpts({
+    // v3.7.15: spawnPy правильно парсит "py -3.12" как cmd="py" + args=["-3.12"]
+    const serverProc = spawnPy(exe, [scriptPath], {
       detached: true,
       stdio: 'ignore',
       env: env,
       cwd: path.dirname(scriptPath)
-    }))
+    })
     serverProc.on('error', e => { step('[RF] ERROR direct spawn: ' + e.message); launched = '' })
     serverProc.unref()
-    step('[RF] direct spawn: ' + spawnExe + ' (скрыто, без окон)')
+    const cmdShort = getShortPath(parsed.cmd) || parsed.cmd
+    step('[RF] direct spawn: ' + cmdShort + (parsed.baseArgs.length ? ' ' + parsed.baseArgs.join(' ') : '') + ' (скрыто, без окон)')
   } catch (e) {
     step('[RF] ERROR direct spawn: ' + e.message)
     launched = ''
@@ -493,15 +503,20 @@ except Exception as e:
     const elapsed = Math.round((Date.now() - start) / 1000)
     if (!vbsTried && elapsed >= 20 && !hasLog) {
       vbsTried = true
-      step('[RF] Direct spawn не дал лога, пробую VBS fallback (UTF-16, //B)...')
+      step('[RF] Direct spawn не дал лога, пробую VBS fallback...')
       try {
+        // v3.7.15: VBS с правильным парсингом команды
+        const cmdShort = getShortPath(parsed.cmd) || parsed.cmd
+        const baseArgsStr = parsed.baseArgs.map(q).join(' ')
         const vbs = 'Set WshShell = CreateObject("WScript.Shell")\r\n' +
-          'WshShell.Run """' + spawnExe.replace(/"/g, '""') + '" "' + scriptPath.replace(/"/g, '""') + '"", 0, False\r\n'
+          'WshShell.Run """' + cmdShort.replace(/"/g, '""') + '"' + 
+          (baseArgsStr ? ' ' + baseArgsStr : '') + 
+          ' "' + scriptPath.replace(/"/g, '""') + '"", 0, False\r\n'
         writeVbsUnicode(vbsPath, vbs)
         const wp = spawn('wscript.exe', ['//B', '//Nologo', vbsPath], winOpts({ detached: true, stdio: 'ignore' }))
         wp.unref()
         launched = 'vbs'
-        step('[RF] VBS fallback запущен (//B — без диалогов)')
+        step('[RF] VBS запущен (cmd=' + cmdShort + ', args=' + baseArgsStr + ')')
       } catch (e) { step('[RF] ERROR VBS: ' + e.message) }
     }
 
@@ -545,11 +560,8 @@ async function ensureInferenceServer() {
     step('[RF] Найден реальный python.exe: ' + PY_EXE)
   } else {
     PY_EXE = py
-    step('[RF] [WARN] Не удалось разрешить python.exe, использую: ' + PY_EXE)
+    step('[RF] Использую команду как есть: ' + PY_EXE + ' (через лаунчер)')
   }
-
-  PY_EXE_SHORT = getShortPath(PY_EXE) || PY_EXE
-  if (PY_EXE_SHORT !== PY_EXE) step('[RF] Короткий путь 8.3: ' + PY_EXE_SHORT)
 
   const missing = checkAllPackages(PY_EXE)
   if (missing.length > 0) {
@@ -582,7 +594,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.14', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.15', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -704,7 +716,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.14\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.15\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -729,7 +741,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.14', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.15', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1102,7 +1114,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.14 — абсолютный путь + 8.3 === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.15 — spawnPy === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
