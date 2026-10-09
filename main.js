@@ -1,4 +1,4 @@
-// VERSION: 3.7.12
+// VERSION: 3.7.13
 // main.js
 // v3.7.12: исправлен resolvePythonExe + fallback для py лаунчера
 const mineflayer = require('mineflayer')
