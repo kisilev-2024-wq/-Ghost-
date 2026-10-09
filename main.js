@@ -1,6 +1,6 @@
-// VERSION: 3.7.4
+// VERSION: 3.7.5
 // main.js
-// v3.7.4: скрытие окна inference server + правильный запуск без открытия доп cmd
+// v3.7.5: правильный запуск inference через Python + uvicorn (без python -m)
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -28,7 +28,6 @@ const CLOUD_RF_TIMEOUT_MS = 20000
 const RF_PORT = 9001
 const RF_URL = 'http://localhost:' + RF_PORT
 
-// Windows: флаг CREATE_NO_WINDOW — не открывать консольное окно
 const CREATE_NO_WINDOW = 0x08000000
 
 // ========================= КОНФИГ =========================
@@ -172,7 +171,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.4: БЕЗ ОКНА) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.5) =========================
 let localhostAlive = false
 
 function checkLocalhostHealth() {
@@ -194,7 +193,6 @@ function parsePyCmd(py) {
 function spawnPy(py, extraArgs, opts) {
   const { cmd, baseArgs } = parsePyCmd(py)
   const merged = Object.assign({}, opts || {})
-  // На Windows — скрыть окно процесса
   if (process.platform === 'win32' && merged.creationFlags === undefined) {
     merged.creationFlags = CREATE_NO_WINDOW
   }
@@ -320,7 +318,7 @@ async function installInference(py) {
   })
 }
 
-// v3.7.4: запуск inference server БЕЗ открытия дополнительного окна cmd
+// v3.7.5: правильный запуск inference через Python + uvicorn (без python -m inference)
 async function startInferenceServer(py) {
   step('[RF] Запуск inference server на порту ' + RF_PORT + ' (без открытия окна)...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, может занять 1-3 мин)...')
@@ -342,10 +340,10 @@ async function startInferenceServer(py) {
   let launched = false
   let launchMethod = ''
 
-  // Вариант 1: inference.exe в Scripts (самый надёжный)
+  // Вариант 1: inference.exe в Scripts
   const inferenceExe = path.join(scriptsDir, 'inference.exe')
   if (fs.existsSync(inferenceExe)) {
-    step('[RF] Найдена inference.exe, запускаю скрыто...')
+    step('[RF] Найдена inference.exe, запускаю...')
     serverProc = spawn(inferenceExe, ['server', 'start', '--port', String(RF_PORT)], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -356,14 +354,44 @@ async function startInferenceServer(py) {
     launched = true
   }
 
-  // Вариант 2: python -m inference (если .exe нет)
+  // Вариант 2: Python скрипт с uvicorn
   if (!launched) {
-    step('[RF] inference.exe не найдена, запускаю через python -m inference (скрыто)...')
-    serverProc = spawnPy(py, ['-m', 'inference', 'server', 'start', '--port', String(RF_PORT)], {
+    step('[RF] inference.exe не найдена, запускаю через Python + uvicorn...')
+    
+    const pythonScript = `
+import sys
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    from inference.core.interfaces.http import app
+    import uvicorn
+    
+    print('[RF server] ✅ Модули загружены, запускаю сервер...', flush=True)
+    print(f'[RF server] Host: 0.0.0.0, Port: ${RF_PORT}', flush=True)
+    
+    uvicorn.run(
+        app,
+        host='0.0.0.0',
+        port=${RF_PORT},
+        log_level='info',
+        access_log=False
+    )
+except ImportError as e:
+    print(f'[RF server] ❌ Ошибка импорта: {e}', flush=True)
+    print(f'[RF server] Попробуйте: {sys.executable} -m pip install "inference[server]"', flush=True)
+    sys.exit(1)
+except Exception as e:
+    print(f'[RF server] ❌ Ошибка: {e}', flush=True)
+    sys.exit(1)
+`.trim()
+    
+    serverProc = spawnPy(py, ['-c', pythonScript], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe']
     })
-    launchMethod = 'python -m inference'
+    launchMethod = 'python + uvicorn'
     launched = true
   }
 
@@ -382,10 +410,8 @@ async function startInferenceServer(py) {
       step('[RF] ⚠️  Сервер завершился с кодом ' + code + ' (метод: ' + launchMethod + ')')
     }
   })
-  // Отсоединяем процесс — он продолжит работать после закрытия бота
   serverProc.unref()
 
-  // Ждём пока сервер поднимется
   const start = Date.now()
   const timeout = 300000
   let lastCheck = 0
@@ -404,6 +430,10 @@ async function startInferenceServer(py) {
   }
 
   step('[RF] ⚠️  Сервер не поднялся за 5 минут. Метод: ' + launchMethod)
+  step('[RF] Попробуйте вручную:')
+  step('[RF]   1. Откройте cmd')
+  step('[RF]   2. Выполните: py -3.12 -m pip install "inference[server]"')
+  step('[RF]   3. Затем: py -3.12 -c "from inference.core.interfaces.http import app; import uvicorn; uvicorn.run(app, host=\'0.0.0.0\', port=9001)"')
   return false
 }
 
@@ -464,7 +494,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.4', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.5', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -586,7 +616,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.4\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.5\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -611,7 +641,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.4', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.5', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -990,7 +1020,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.4 — inference без доп окна === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.5 — inference через uvicorn === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
