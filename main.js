@@ -1,6 +1,6 @@
-// VERSION: 3.7.15
+// VERSION: 3.7.16
 // main.js
-// v3.7.15: spawnPy вместо spawn — правильный парсинг команд типа "py -3.12"
+// v3.7.16: isatty для uvicorn + asgi_correlation_id + shell:true для скрытия окна
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,7 +134,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.15) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.16) =========================
 let localhostAlive = false
 let PY_EXE = ''
 
@@ -156,7 +156,6 @@ function checkLocalhostHealth() {
   })
 }
 
-// v3.7.15: getShortPath ТОЛЬКО для существующих абсолютных путей
 function getShortPath(p) {
   if (!p || typeof p !== 'string') return ''
   const clean = p.replace(/^"|"$/g, '')
@@ -171,22 +170,26 @@ function getShortPath(p) {
   return ''
 }
 
-// v3.7.15: умный парсер — различает "py -3.12" и "C:\...\python.exe"
 function parsePyCmd(py) {
   if (typeof py !== 'string' || !py) return { cmd: 'py', baseArgs: [] }
   const clean = py.trim().replace(/^"|"$/g, '')
-  // Абсолютный путь к python.exe
   if (/^[A-Za-z]:\\/.test(clean)) return { cmd: clean, baseArgs: [] }
-  // Команда типа "py -3.12" или "python"
   const parts = clean.split(/\s+/).filter(Boolean)
   if (parts.length === 0) return { cmd: 'py', baseArgs: [] }
   return { cmd: parts[0], baseArgs: parts.slice(1) }
 }
 
-// v3.7.15: spawn с правильным парсингом — ключевое исправление!
+// v3.7.16: shell:true скрывает окно от py-лаунчера
 function spawnPy(exe, args, opts) {
   const { cmd, baseArgs } = parsePyCmd(exe)
-  // Короткий путь ТОЛЬКО для cmd (не для всей команды)
+  const isPyLauncher = /^(py|python)(\.exe)?$/i.test(cmd)
+  if (isPyLauncher && process.platform === 'win32') {
+    const allArgs = [...baseArgs, ...(args || [])].map(q).join(' ')
+    const cmdLine = q(cmd) + ' ' + allArgs
+    const merged = winOpts(opts)
+    merged.shell = true
+    return spawn(cmdLine, [], merged)
+  }
   const cmdShort = getShortPath(cmd) || cmd
   return spawn(cmdShort, [...baseArgs, ...(args || [])], winOpts(opts))
 }
@@ -197,7 +200,6 @@ function execPy(exe, args, opts) {
   return execSync(line, winOpts(opts))
 }
 
-// v3.7.15: находит РЕАЛЬНЫЙ python.exe из команды 'py -3.12'
 function resolvePythonExe(pyCmd) {
   try {
     const out = execPy(pyCmd, ['-c', 'import sys, os; sys.stdout.write(os.path.abspath(sys.executable))'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 })
@@ -208,9 +210,7 @@ function resolvePythonExe(pyCmd) {
         return full
       }
     }
-  } catch (e) {
-    step('[RF] [DEBUG] resolvePythonExe error: ' + e.message)
-  }
+  } catch (e) {}
   return ''
 }
 
@@ -228,7 +228,6 @@ function findSupportedPython() {
       }
     } catch (e) {}
   }
-  
   for (const cmd of ['py -3.13', 'py -3.14', 'py -3.15', 'py', 'python', 'python3']) {
     try {
       const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -242,13 +241,14 @@ function findSupportedPython() {
   return null
 }
 
+// v3.7.16: добавил asgi_correlation_id и supervision (зависимости inference)
 function checkAllPackages(exe) {
-  const packages = ['inference', 'uvicorn', 'fastapi', 'python-multipart']
+  const packages = ['inference', 'uvicorn', 'fastapi', 'python-multipart', 'asgi_correlation_id', 'supervision']
   const missing = []
   for (const pkg of packages) {
     try {
       const r = execPy(exe, ['-m', 'pip', 'show', pkg], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-      if (!r || !r.includes('Name: ' + pkg)) missing.push(pkg)
+      if (!r || !r.includes('Name: ' + pkg.replace(/_/g, '-').toLowerCase()) && !r.includes('Name: ' + pkg)) missing.push(pkg)
     } catch (e) { missing.push(pkg) }
   }
   return missing
@@ -332,7 +332,6 @@ function writeVbsUnicode(p, content) {
   fs.writeFileSync(p, Buffer.concat([bom, body]))
 }
 
-// v3.7.15: spawnPy вместо spawn — главное исправление
 async function startInferenceServer(exe) {
   step('[RF] Запуск inference server на порту ' + RF_PORT + '...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, 1-3 мин)...')
@@ -348,6 +347,7 @@ async function startInferenceServer(exe) {
   try { fs.unlinkSync(logPath) } catch (e) {}
   try { fs.unlinkSync(vbsPath) } catch (e) {}
 
+  // v3.7.16: FileLogger с isatty(), fileno() + uvicorn с log_config=None
   const pythonScript = `
 import sys, os, warnings, traceback
 
@@ -357,13 +357,28 @@ PORT = ${RF_PORT}
 class FileLogger:
     def __init__(self, p):
         self.f = open(p, 'a', encoding='utf-8', errors='replace')
+        self.encoding = 'utf-8'
+        self.errors = 'replace'
     def write(self, msg):
         try:
-            self.f.write(msg); self.f.flush()
+            self.f.write(str(msg)); self.f.flush()
         except Exception: pass
     def flush(self):
         try: self.f.flush()
         except Exception: pass
+    def isatty(self):
+        return False
+    def fileno(self):
+        try: return self.f.fileno()
+        except: return -1
+    def readable(self): return False
+    def writable(self): return True
+    def seekable(self): return False
+    @property
+    def closed(self): return self.f.closed
+    def close(self):
+        try: self.f.close()
+        except: pass
 
 logger = FileLogger(LOG_PATH)
 sys.stdout = logger
@@ -439,7 +454,7 @@ if app is None:
 try:
     import uvicorn
     log('Starting uvicorn on 0.0.0.0:' + str(PORT) + '...')
-    uvicorn.run(app, host='0.0.0.0', port=PORT, log_level='warning', access_log=False)
+    uvicorn.run(app, host='0.0.0.0', port=PORT, log_level='warning', access_log=False, log_config=None)
 except Exception as e:
     log('FATAL: uvicorn failed: ' + str(e))
     traceback.print_exc()
@@ -453,7 +468,6 @@ except Exception as e:
 
   let launched = 'direct'
   try {
-    // v3.7.15: spawnPy правильно парсит "py -3.12" как cmd="py" + args=["-3.12"]
     const serverProc = spawnPy(exe, [scriptPath], {
       detached: true,
       stdio: 'ignore',
@@ -463,7 +477,7 @@ except Exception as e:
     serverProc.on('error', e => { step('[RF] ERROR direct spawn: ' + e.message); launched = '' })
     serverProc.unref()
     const cmdShort = getShortPath(parsed.cmd) || parsed.cmd
-    step('[RF] direct spawn: ' + cmdShort + (parsed.baseArgs.length ? ' ' + parsed.baseArgs.join(' ') : '') + ' (скрыто, без окон)')
+    step('[RF] direct spawn (shell=true): ' + cmdShort + ' ' + parsed.baseArgs.join(' ') + ' (скрыто, без окон)')
   } catch (e) {
     step('[RF] ERROR direct spawn: ' + e.message)
     launched = ''
@@ -505,7 +519,6 @@ except Exception as e:
       vbsTried = true
       step('[RF] Direct spawn не дал лога, пробую VBS fallback...')
       try {
-        // v3.7.15: VBS с правильным парсингом команды
         const cmdShort = getShortPath(parsed.cmd) || parsed.cmd
         const baseArgsStr = parsed.baseArgs.map(q).join(' ')
         const vbs = 'Set WshShell = CreateObject("WScript.Shell")\r\n' +
@@ -516,7 +529,7 @@ except Exception as e:
         const wp = spawn('wscript.exe', ['//B', '//Nologo', vbsPath], winOpts({ detached: true, stdio: 'ignore' }))
         wp.unref()
         launched = 'vbs'
-        step('[RF] VBS запущен (cmd=' + cmdShort + ', args=' + baseArgsStr + ')')
+        step('[RF] VBS запущен (cmd=' + cmdShort + ')')
       } catch (e) { step('[RF] ERROR VBS: ' + e.message) }
     }
 
@@ -594,7 +607,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.15', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.16', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -716,7 +729,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.15\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.16\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -741,7 +754,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.15', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.16', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1114,7 +1127,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.15 — spawnPy === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.16 — isatty+asgi_correlation_id === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
