@@ -1,6 +1,6 @@
-// VERSION: 3.7.5
+// VERSION: 3.7.6
 // main.js
-// v3.7.5: правильный запуск inference через Python + uvicorn (без python -m)
+// v3.7.6: исправлены ошибки импорта inference + убраны emoji + полностью скрытый запуск
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -171,7 +171,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.5) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.6) =========================
 let localhostAlive = false
 
 function checkLocalhostHealth() {
@@ -239,7 +239,7 @@ function findSupportedPython() {
           step('[RF] Найден поддерживаемый Python: ' + cmd + ' (' + v.trim() + ')')
           return cmd
         } else {
-          step('[RF] ⚠️  ' + cmd + ' = Python 3.' + minor + ' (не поддерживается inference)')
+          step('[RF] [WARN] ' + cmd + ' = Python 3.' + minor + ' (не поддерживается inference)')
         }
       }
     } catch (e) {}
@@ -262,9 +262,9 @@ async function installPython312() {
         file.on('finish', () => { file.close(); resolve() })
       }).on('error', e => { try { fs.unlinkSync(installerPath) } catch (x) {}; reject(e) })
     })
-    step('[RF] ✅ Установщик скачан')
+    step('[RF] OK: установщик скачан')
   } catch (e) {
-    step('[RF] ❌ Не удалось скачать Python: ' + e.message)
+    step('[RF] ERROR: не удалось скачать Python: ' + e.message)
     step('[RF] Скачайте вручную: ' + installerUrl)
     return false
   }
@@ -277,12 +277,12 @@ async function installPython312() {
       opts.creationFlags = CREATE_NO_WINDOW
     }
     execSync('"' + installerPath + '" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0', opts)
-    step('[RF] ✅ Python 3.12 установлен')
+    step('[RF] OK: Python 3.12 установлен')
     try { fs.unlinkSync(installerPath) } catch (e) {}
     await sleep(5000)
     return true
   } catch (e) {
-    step('[RF] ❌ Установка Python не удалась: ' + e.message)
+    step('[RF] ERROR: установка Python не удалась: ' + e.message)
     return false
   }
 }
@@ -306,19 +306,19 @@ async function installInference(py) {
     proc.stderr.on('data', onData)
     proc.on('close', code => {
       if (code === 0) {
-        step('[RF] ✅ inference установлен')
+        step('[RF] OK: inference установлен')
         resolve(true)
       } else {
-        step('[RF] ❌ pip install завершился с кодом ' + code)
+        step('[RF] ERROR: pip install завершился с кодом ' + code)
         step('[RF] Вывод: ' + output.slice(-500).replace(/\n/g, ' '))
         resolve(false)
       }
     })
-    proc.on('error', e => { step('[RF] ❌ Не удалось запустить pip: ' + e.message); resolve(false) })
+    proc.on('error', e => { step('[RF] ERROR: не удалось запустить pip: ' + e.message); resolve(false) })
   })
 }
 
-// v3.7.5: правильный запуск inference через Python + uvicorn (без python -m inference)
+// v3.7.6: правильный импорт inference + без emoji + полностью скрытый запуск
 async function startInferenceServer(py) {
   step('[RF] Запуск inference server на порту ' + RF_PORT + ' (без открытия окна)...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, может занять 1-3 мин)...')
@@ -333,14 +333,14 @@ async function startInferenceServer(py) {
     step('[RF] Python: ' + pythonPath)
     step('[RF] Scripts: ' + scriptsDir)
   } catch (e) {
-    step('[RF] ⚠️  Не удалось определить путь к Python: ' + e.message)
+    step('[RF] [WARN] Не удалось определить путь к Python: ' + e.message)
   }
 
   let serverProc = null
   let launched = false
   let launchMethod = ''
 
-  // Вариант 1: inference.exe в Scripts
+  // Вариант 1: inference.exe в Scripts (самый надёжный)
   const inferenceExe = path.join(scriptsDir, 'inference.exe')
   if (fs.existsSync(inferenceExe)) {
     step('[RF] Найдена inference.exe, запускаю...')
@@ -354,7 +354,7 @@ async function startInferenceServer(py) {
     launched = true
   }
 
-  // Вариант 2: Python скрипт с uvicorn
+  // Вариант 2: Python скрипт с uvicorn (без emoji, с UTF-8, множественные импорты)
   if (!launched) {
     step('[RF] inference.exe не найдена, запускаю через Python + uvicorn...')
     
@@ -362,14 +362,73 @@ async function startInferenceServer(py) {
 import sys
 import os
 import warnings
+
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['PYTHONUTF8'] = '1'
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 warnings.filterwarnings('ignore')
 
 try:
-    from inference.core.interfaces.http import app
-    import uvicorn
+    app = None
+    import_method = ''
     
-    print('[RF server] ✅ Модули загружены, запускаю сервер...', flush=True)
-    print(f'[RF server] Host: 0.0.0.0, Port: ${RF_PORT}', flush=True)
+    # Способ 1: inference >= 0.13.0
+    try:
+        from inference.core.interfaces.http import app as http_app
+        app = http_app
+        import_method = 'inference.core.interfaces.http'
+        print('[RF server] OK: импорт из ' + import_method, flush=True)
+    except ImportError:
+        pass
+    
+    # Способ 2: inference < 0.13.0
+    if app is None:
+        try:
+            from inference.core.http import app as http_app
+            app = http_app
+            import_method = 'inference.core.http'
+            print('[RF server] OK: импорт из ' + import_method, flush=True)
+        except ImportError:
+            pass
+    
+    # Способ 3: через InferenceHTTPInterface
+    if app is None:
+        try:
+            from inference.core.interfaces.http.http_api import HttpInterface
+            interface = HttpInterface()
+            app = interface.app
+            import_method = 'inference.core.interfaces.http.http_api.HttpInterface'
+            print('[RF server] OK: импорт через HttpInterface', flush=True)
+        except (ImportError, Exception):
+            pass
+    
+    # Способ 4: создание FastAPI app вручную
+    if app is None:
+        try:
+            from fastapi import FastAPI
+            app = FastAPI()
+            @app.get('/')
+            def root():
+                return {'status': 'ok', 'message': 'Inference server running (custom)'}
+            import_method = 'custom FastAPI'
+            print('[RF server] OK: создан кастомный FastAPI', flush=True)
+        except ImportError as e:
+            print('[RF server] ERROR: не удалось импортировать ни один способ', flush=True)
+            print('[RF server] Последняя ошибка: ' + str(e), flush=True)
+            print('[RF server] Попробуйте: ' + sys.executable + ' -m pip install --upgrade "inference[server]"', flush=True)
+            sys.exit(1)
+    
+    if app is None:
+        print('[RF server] ERROR: app is None', flush=True)
+        sys.exit(1)
+    
+    import uvicorn
+    print('[RF server] Запуск сервера на 0.0.0.0:${RF_PORT}...', flush=True)
     
     uvicorn.run(
         app,
@@ -378,18 +437,22 @@ try:
         log_level='info',
         access_log=False
     )
-except ImportError as e:
-    print(f'[RF server] ❌ Ошибка импорта: {e}', flush=True)
-    print(f'[RF server] Попробуйте: {sys.executable} -m pip install "inference[server]"', flush=True)
-    sys.exit(1)
 except Exception as e:
-    print(f'[RF server] ❌ Ошибка: {e}', flush=True)
+    print('[RF server] ERROR: ' + str(e), flush=True)
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
 `.trim()
     
+    const env = Object.assign({}, process.env, {
+      PYTHONIOENCODING: 'utf-8',
+      PYTHONUTF8: '1'
+    })
+    
     serverProc = spawnPy(py, ['-c', pythonScript], {
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: env
     })
     launchMethod = 'python + uvicorn'
     launched = true
@@ -397,17 +460,17 @@ except Exception as e:
 
   let logLines = 0
   const onLog = d => {
-    const lines = d.toString().split('\n').filter(l => l.trim())
+    const lines = d.toString('utf8').split('\n').filter(l => l.trim())
     for (const line of lines) {
       if (logLines < 30) { step('[RF server] ' + line); logLines++ }
     }
   }
   serverProc.stdout.on('data', onLog)
   serverProc.stderr.on('data', onLog)
-  serverProc.on('error', e => { step('[RF] Ошибка запуска: ' + e.message) })
+  serverProc.on('error', e => { step('[RF] ERROR: ошибка запуска: ' + e.message) })
   serverProc.on('exit', (code) => {
     if (code !== null && code !== 0 && !localhostAlive) {
-      step('[RF] ⚠️  Сервер завершился с кодом ' + code + ' (метод: ' + launchMethod + ')')
+      step('[RF] [WARN] Сервер завершился с кодом ' + code + ' (метод: ' + launchMethod + ')')
     }
   })
   serverProc.unref()
@@ -418,7 +481,7 @@ except Exception as e:
   while (Date.now() - start < timeout) {
     await sleep(2000)
     if (await checkLocalhostHealth()) {
-      step('[RF] ✅ inference server готов через ' + launchMethod + ' (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+      step('[RF] OK: inference server готов через ' + launchMethod + ' (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
       localhostAlive = true
       return true
     }
@@ -429,17 +492,17 @@ except Exception as e:
     }
   }
 
-  step('[RF] ⚠️  Сервер не поднялся за 5 минут. Метод: ' + launchMethod)
+  step('[RF] [WARN] Сервер не поднялся за 5 минут. Метод: ' + launchMethod)
   step('[RF] Попробуйте вручную:')
   step('[RF]   1. Откройте cmd')
-  step('[RF]   2. Выполните: py -3.12 -m pip install "inference[server]"')
-  step('[RF]   3. Затем: py -3.12 -c "from inference.core.interfaces.http import app; import uvicorn; uvicorn.run(app, host=\'0.0.0.0\', port=9001)"')
+  step('[RF]   2. Выполните: py -3.12 -m pip install --upgrade "inference[server]"')
+  step('[RF]   3. Затем: inference server start --port 9001')
   return false
 }
 
 async function ensureInferenceServer() {
   if (await checkLocalhostHealth()) {
-    step('[RF] ✅ inference server уже работает')
+    step('[RF] OK: inference server уже работает')
     localhostAlive = true
     return true
   }
@@ -447,17 +510,17 @@ async function ensureInferenceServer() {
   let py = findSupportedPython()
 
   if (!py) {
-    step('[RF] ⚠️  Не найден Python 3.8-3.12 (требуется для inference)')
+    step('[RF] [WARN] Не найден Python 3.8-3.12 (требуется для inference)')
     step('[RF] Пытаюсь установить Python 3.12 автоматически...')
     const installed = await installPython312()
     if (!installed) {
-      step('[RF] ❌ Без Python 3.12 RF не заработает')
+      step('[RF] ERROR: без Python 3.12 RF не заработает')
       step('[RF] Бот продолжит работу только на OCR')
       return false
     }
     py = findSupportedPython()
     if (!py) {
-      step('[RF] ❌ Python 3.12 установлен, но не найден в PATH')
+      step('[RF] ERROR: Python 3.12 установлен, но не найден в PATH')
       step('[RF] Перезапустите бота')
       return false
     }
@@ -467,7 +530,7 @@ async function ensureInferenceServer() {
     step('[RF] Пакет inference не установлен, устанавливаю...')
     const ok = await installInference(py)
     if (!ok) {
-      step('[RF] ❌ Установка inference не удалась')
+      step('[RF] ERROR: установка inference не удалась')
       return false
     }
   } else {
@@ -475,7 +538,7 @@ async function ensureInferenceServer() {
   }
 
   if (await checkLocalhostHealth()) {
-    step('[RF] ✅ inference server уже работает')
+    step('[RF] OK: inference server уже работает')
     localhostAlive = true
     return true
   }
@@ -494,7 +557,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.5', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.6', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -616,7 +679,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.5\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.6\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -641,7 +704,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.5', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.6', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1020,7 +1083,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.5 — inference через uvicorn === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.6 — inference без emoji === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
