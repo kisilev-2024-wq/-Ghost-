@@ -1,6 +1,6 @@
-// VERSION: 3.7.17
+// VERSION: 3.7.18
 // main.js
-// v3.7.17: resolvePythonExe починен + fastapi_cprofile + прямой python.exe
+// v3.7.18: изолированный Python 3.12 (БЕЗ окон) + правильный ModelManager для inference
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,7 +134,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.17) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.18) =========================
 let localhostAlive = false
 let PY_EXE = ''
 
@@ -170,124 +170,16 @@ function getShortPath(p) {
   return ''
 }
 
-function parsePyCmd(py) {
-  if (typeof py !== 'string' || !py) return { cmd: 'py', baseArgs: [] }
-  const clean = py.trim().replace(/^"|"$/g, '')
-  if (/^[A-Za-z]:\\/.test(clean)) return { cmd: clean, baseArgs: [] }
-  const parts = clean.split(/\s+/).filter(Boolean)
-  if (parts.length === 0) return { cmd: 'py', baseArgs: [] }
-  return { cmd: parts[0], baseArgs: parts.slice(1) }
-}
-
-function spawnPy(exe, args, opts) {
-  const { cmd, baseArgs } = parsePyCmd(exe)
-  const isPyLauncher = /^(py|python)(\.exe)?$/i.test(cmd)
-  if (isPyLauncher && process.platform === 'win32') {
-    const allArgs = [...baseArgs, ...(args || [])].map(q).join(' ')
-    const cmdLine = q(cmd) + ' ' + allArgs
-    const merged = winOpts(opts)
-    merged.shell = true
-    return spawn(cmdLine, [], merged)
-  }
-  const cmdShort = getShortPath(cmd) || cmd
-  return spawn(cmdShort, [...baseArgs, ...(args || [])], winOpts(opts))
-}
-
 function execPy(exe, args, opts) {
-  const { cmd, baseArgs } = parsePyCmd(exe)
-  const line = [cmd, ...baseArgs, ...(args || [])].map(q).join(' ')
+  const line = [exe, ...(args || [])].map(q).join(' ')
   return execSync(line, winOpts(opts))
 }
 
-// v3.7.17: ПОЧИНЕН — берём ПОСЛЕДНЮЮ строку вывода (py может писать мусор до результата)
-function resolvePythonExe(pyCmd) {
-  const attempts = [
-    [pyCmd, ['-c', 'import sys, os; sys.stdout.write(os.path.abspath(sys.executable))']],
-    [pyCmd, ['-c', 'import sys; sys.stdout.write(sys.executable)']],
-    [pyCmd, ['-c', 'import sys; print(sys.executable)']]
-  ]
-  for (const [cmd, args] of attempts) {
-    try {
-      const out = execPy(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 })
-      const lines = String(out || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-      // Ищем с конца — py лаунчер может писать баннер в начало
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const full = lines[i]
-        if (/^[A-Za-z]:\\/.test(full) && /python/i.test(full) && fs.existsSync(full)) {
-          step('[RF] resolvePythonExe: ' + full)
-          return full
-        }
-      }
-    } catch (e) {
-      step('[RF] [DEBUG] resolvePythonExe attempt failed: ' + (e.message || '').slice(0, 100))
-    }
-  }
-  return ''
+function spawnPy(exe, args, opts) {
+  return spawn(exe, [...(args || [])], winOpts(opts))
 }
 
-function findSupportedPython() {
-  for (const cmd of ['py -3.12', 'py -3.11', 'py -3.10']) {
-    try {
-      const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-      const m = v.match(/Python 3\.(\d+)/)
-      if (m) {
-        const minor = parseInt(m[1])
-        if (minor >= 10 && minor <= 12) {
-          step('[RF] Найден Python (поддерживается inference): ' + cmd + ' (' + v.trim() + ')')
-          return cmd
-        }
-      }
-    } catch (e) {}
-  }
-  for (const cmd of ['py -3.13', 'py -3.14', 'py -3.15', 'py', 'python', 'python3']) {
-    try {
-      const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-      const m = v.match(/Python 3\.(\d+)/)
-      if (m) {
-        const minor = parseInt(m[1])
-        step('[RF] [WARN] Найден Python 3.' + minor + ', но inference требует 3.10-3.12')
-      }
-    } catch (e) {}
-  }
-  return null
-}
-
-// v3.7.17: добавлен fastapi_cprofile (нужен для HttpInterface)
-function checkAllPackages(exe) {
-  const packages = ['inference', 'uvicorn', 'fastapi', 'python-multipart', 'asgi_correlation_id', 'supervision', 'fastapi_cprofile']
-  const missing = []
-  for (const pkg of packages) {
-    try {
-      const r = execPy(exe, ['-m', 'pip', 'show', pkg], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-      const rStr = String(r || '')
-      const pkgNorm = pkg.replace(/_/g, '-').toLowerCase()
-      const pkgLower = pkg.toLowerCase()
-      if (!rStr.includes('Name: ' + pkgNorm) && !rStr.includes('Name: ' + pkgLower) && !rStr.includes('Name: ' + pkg)) missing.push(pkg)
-    } catch (e) { missing.push(pkg) }
-  }
-  return missing
-}
-
-async function installAllPackages(exe, missing) {
-  if (missing.length === 0) { step('[RF] OK: все пакеты установлены'); return true }
-  step('[RF] Установка: ' + missing.join(', ') + ' (3-5 минут)...')
-  return new Promise(resolve => {
-    const proc = spawnPy(exe, ['-m', 'pip', 'install', '--upgrade', 'pip'], { stdio: ['ignore', 'pipe', 'pipe'] })
-    proc.on('close', () => {
-      const proc2 = spawnPy(exe, ['-m', 'pip', 'install', ...missing], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let out = ''
-      proc2.stdout.on('data', d => { out += d.toString(); if (out.length > 5000) out = out.slice(-3000) })
-      proc2.stderr.on('data', d => { out += d.toString(); if (out.length > 5000) out = out.slice(-3000) })
-      proc2.on('close', code => {
-        if (code === 0) { step('[RF] OK: пакеты установлены'); resolve(true) }
-        else { step('[RF] ERROR: pip code ' + code); step('[RF] ' + out.slice(-500).replace(/\n/g, ' ')); resolve(false) }
-      })
-      proc2.on('error', e => { step('[RF] ERROR: ' + e.message); resolve(false) })
-    })
-    proc.on('error', e => { step('[RF] ERROR: ' + e.message); resolve(false) })
-  })
-}
-
+// v3.7.18: принудительная установка Python 3.12 в изолированную папку
 async function installPython312() {
   step('[RF] Устанавливаю Python 3.12 в изолированную папку (это займёт 2-3 минуты)...')
   const installerUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe'
@@ -340,29 +232,63 @@ async function installPython312() {
   return false
 }
 
+// v3.7.18: установка inference со всеми зависимостями
+async function installAllPackages(exe, missing) {
+  if (missing.length === 0) { step('[RF] OK: все пакеты установлены'); return true }
+  step('[RF] Установка: ' + missing.join(', ') + ' (5-10 минут)...')
+  return new Promise(resolve => {
+    const proc = spawnPy(exe, ['-m', 'pip', 'install', '--upgrade', 'pip'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    proc.on('close', () => {
+      // v3.7.18: устанавливаем inference с extras [http] для всех зависимостей
+      const installArgs = ['-m', 'pip', 'install', 'inference[http]', 'uvicorn', 'fastapi', 'python-multipart', 'asgi-correlation-id', 'fastapi-cprofile', 'supervision']
+      const proc2 = spawnPy(exe, installArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      proc2.stdout.on('data', d => { out += d.toString(); if (out.length > 5000) out = out.slice(-3000) })
+      proc2.stderr.on('data', d => { out += d.toString(); if (out.length > 5000) out = out.slice(-3000) })
+      proc2.on('close', code => {
+        if (code === 0) { step('[RF] OK: пакеты установлены'); resolve(true) }
+        else { step('[RF] ERROR: pip code ' + code); step('[RF] ' + out.slice(-500).replace(/\n/g, ' ')); resolve(false) }
+      })
+      proc2.on('error', e => { step('[RF] ERROR: ' + e.message); resolve(false) })
+    })
+    proc.on('error', e => { step('[RF] ERROR: ' + e.message); resolve(false) })
+  })
+}
+
+function checkAllPackages(exe) {
+  const packages = ['inference', 'uvicorn', 'fastapi', 'python-multipart']
+  const missing = []
+  for (const pkg of packages) {
+    try {
+      const r = execPy(exe, ['-m', 'pip', 'show', pkg], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      const rStr = String(r || '')
+      if (!rStr.includes('Name: ' + pkg) && !rStr.includes('Name: ' + pkg.replace(/_/g, '-'))) missing.push(pkg)
+    } catch (e) { missing.push(pkg) }
+  }
+  return missing
+}
+
 function writeVbsUnicode(p, content) {
   const bom = Buffer.from([0xFF, 0xFE])
   const body = Buffer.from(String(content || ''), 'utf16le')
   fs.writeFileSync(p, Buffer.concat([bom, body]))
 }
 
+// v3.7.18: правильный Python-скрипт с ModelManager
 async function startInferenceServer(exe) {
   step('[RF] Запуск inference server на порту ' + RF_PORT + '...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, 1-3 мин)...')
 
-  step('[RF] Команда: ' + exe)
-  const parsed = parsePyCmd(exe)
-  step('[RF] Парсинг: cmd="' + parsed.cmd + '", baseArgs=' + JSON.stringify(parsed.baseArgs))
-  const isDirectExe = /^[A-Za-z]:\\/.test(parsed.cmd)
-  step('[RF] Тип запуска: ' + (isDirectExe ? 'ПРЯМОЙ python.exe (БЕЗ окон)' : 'py лаунчер (может открыть окно)'))
+  step('[RF] Python exe: ' + exe)
+  const isDirect = /^[A-Za-z]:\\/.test(exe)
+  step('[RF] Тип: ' + (isDirect ? 'ПРЯМОЙ python.exe (БЕЗ окон!)' : 'лаунчер (может быть окно)'))
 
   const scriptPath = path.join(__dirname, '.inference_server.py')
   const logPath = path.join(__dirname, '.inference_server.log')
-  const vbsPath = path.join(__dirname, '.launch_inference.vbs')
 
   try { fs.unlinkSync(logPath) } catch (e) {}
-  try { fs.unlinkSync(vbsPath) } catch (e) {}
 
+  // v3.7.18: правильный скрипт с ModelManager
   const pythonScript = `
 import sys, os, warnings, traceback
 
@@ -375,14 +301,12 @@ class FileLogger:
         self.encoding = 'utf-8'
         self.errors = 'replace'
     def write(self, msg):
-        try:
-            self.f.write(str(msg)); self.f.flush()
-        except Exception: pass
+        try: self.f.write(str(msg)); self.f.flush()
+        except: pass
     def flush(self):
         try: self.f.flush()
-        except Exception: pass
-    def isatty(self):
-        return False
+        except: pass
+    def isatty(self): return False
     def fileno(self):
         try: return self.f.fileno()
         except: return -1
@@ -401,6 +325,7 @@ sys.stderr = logger
 
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
+os.environ['ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS'] = 'False'
 warnings.filterwarnings('ignore')
 
 def log(msg):
@@ -413,58 +338,69 @@ log('Port: ' + str(PORT))
 app = None
 method = ''
 
+# v3.7.18: Способ 1 — HttpInterface с ModelManager (правильная инициализация!)
 try:
-    log('Trying inference.core.interfaces.http...')
-    from inference.core.interfaces.http import app as http_app
-    app = http_app; method = 'inference.core.interfaces.http'
+    log('Trying HttpInterface + ModelManager...')
+    from inference.core.managers.base import ModelManager
+    from inference.core.interfaces.http.http_api import HttpInterface
+    mm = ModelManager()
+    interface = HttpInterface(model_manager=mm)
+    app = interface.app
+    method = 'HttpInterface+ModelManager'
     log('OK: using ' + method)
 except Exception as e1:
     log('FAIL e1: ' + str(e1))
+    
+    # Способ 2 — старый API
     try:
-        log('Trying inference.core.http...')
-        from inference.core.http import app as http_app
-        app = http_app; method = 'inference.core.http'
+        log('Trying inference.core.interfaces.http.app...')
+        from inference.core.interfaces.http import app as http_app
+        app = http_app
+        method = 'inference.core.interfaces.http.app'
         log('OK: using ' + method)
     except Exception as e2:
         log('FAIL e2: ' + str(e2))
+        
+        # Способ 3 — через InferenceHTTPServer
         try:
-            log('Trying HttpInterface...')
-            from inference.core.interfaces.http.http_api import HttpInterface
-            app = HttpInterface().app; method = 'HttpInterface'
+            log('Trying InferenceHTTPServer...')
+            from inference.core.interfaces.http import InferenceHTTPServer
+            server = InferenceHTTPServer()
+            app = server.app
+            method = 'InferenceHTTPServer'
             log('OK: using ' + method)
         except Exception as e3:
             log('FAIL e3: ' + str(e3))
-            log('All inference imports failed, using emulator')
+            
+            # Способ 4 — эмулятор (fallback)
+            try:
+                log('Building emulated Roboflow API...')
+                from fastapi import FastAPI, Request, UploadFile, File
+                from fastapi.responses import JSONResponse
+                app = FastAPI()
 
-if app is None:
-    try:
-        log('Building emulated Roboflow API...')
-        from fastapi import FastAPI, Request, UploadFile, File
-        from fastapi.responses import JSONResponse
-        app = FastAPI()
+                @app.get('/')
+                def root():
+                    return {'status': 'ok', 'service': 'MC Bot Inference Emulator'}
 
-        @app.get('/')
-        def root():
-            return {'status': 'ok', 'service': 'MC Bot Inference Emulator'}
+                @app.get('/healthz')
+                def healthz():
+                    return {'status': 'ok'}
 
-        @app.get('/healthz')
-        def healthz():
-            return {'status': 'ok'}
+                @app.post('/{model_id}')
+                async def detect_any(model_id: str, request: Request, api_key: str = None, confidence: float = 0.25, overlap: float = 0.3, file: UploadFile = File(None)):
+                    return JSONResponse(content={'predictions': [], 'image': {'width': 1024, 'height': 512}, 'model_id': model_id})
 
-        @app.post('/{model_id}')
-        async def detect_any(model_id: str, request: Request, api_key: str = None, confidence: float = 0.25, overlap: float = 0.3, file: UploadFile = File(None)):
-            return JSONResponse(content={'predictions': [], 'image': {'width': 1024, 'height': 512}, 'model_id': model_id})
+                @app.post('/infer')
+                async def infer(request: Request, model_id: str = None, file: UploadFile = File(None)):
+                    return JSONResponse(content={'predictions': [], 'image': {'width': 1024, 'height': 512}})
 
-        @app.post('/infer')
-        async def infer(request: Request, model_id: str = None, file: UploadFile = File(None)):
-            return JSONResponse(content={'predictions': [], 'image': {'width': 1024, 'height': 512}})
-
-        method = 'emulated API'
-        log('OK: emulator ready')
-    except Exception as e:
-        log('FATAL: cannot create app: ' + str(e))
-        traceback.print_exc()
-        sys.exit(1)
+                method = 'emulated API'
+                log('OK: emulator ready')
+            except Exception as e:
+                log('FATAL: cannot create app: ' + str(e))
+                traceback.print_exc()
+                sys.exit(1)
 
 try:
     import uvicorn
@@ -479,10 +415,15 @@ except Exception as e:
   fs.writeFileSync(scriptPath, pythonScript, 'utf8')
   step('[RF] Скрипт записан: ' + scriptPath)
 
-  const env = Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
+  const env = Object.assign({}, process.env, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+    ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False'
+  })
 
   let launched = 'direct'
   try {
+    // v3.7.18: прямой spawn python.exe — БЕЗ окон!
     const serverProc = spawnPy(exe, [scriptPath], {
       detached: true,
       stdio: 'ignore',
@@ -491,7 +432,7 @@ except Exception as e:
     })
     serverProc.on('error', e => { step('[RF] ERROR direct spawn: ' + e.message); launched = '' })
     serverProc.unref()
-    step('[RF] direct spawn: ' + exe + ' (скрыто, без окон)')
+    step('[RF] direct spawn: ' + exe + ' (БЕЗ окон!)')
   } catch (e) {
     step('[RF] ERROR direct spawn: ' + e.message)
     launched = ''
@@ -514,12 +455,11 @@ except Exception as e:
 
   const start = Date.now()
   const timeout = 300000
-  let vbsTried = false
   let lastCheck = 0
 
   while (Date.now() - start < timeout) {
     await sleep(2000)
-    const hasLog = readLog()
+    readLog()
 
     if (await checkLocalhostHealth()) {
       readLog()
@@ -529,68 +469,39 @@ except Exception as e:
     }
 
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (!vbsTried && elapsed >= 20 && !hasLog) {
-      vbsTried = true
-      step('[RF] Direct spawn не дал лога, пробую VBS fallback...')
-      try {
-        const cmdShort = getShortPath(parsed.cmd) || parsed.cmd
-        const baseArgsStr = parsed.baseArgs.map(q).join(' ')
-        const vbs = 'Set WshShell = CreateObject("WScript.Shell")\r\n' +
-          'WshShell.Run """' + cmdShort.replace(/"/g, '""') + '"' + 
-          (baseArgsStr ? ' ' + baseArgsStr : '') + 
-          ' "' + scriptPath.replace(/"/g, '""') + '"", 0, False\r\n'
-        writeVbsUnicode(vbsPath, vbs)
-        const wp = spawn('wscript.exe', ['//B', '//Nologo', vbsPath], winOpts({ detached: true, stdio: 'ignore' }))
-        wp.unref()
-        launched = 'vbs'
-        step('[RF] VBS запущен (cmd=' + cmdShort + ')')
-      } catch (e) { step('[RF] ERROR VBS: ' + e.message) }
-    }
-
-    if (elapsed - lastCheck >= 15) { step('[RF] Ожидание... ' + elapsed + 'с (метод: ' + (launched || '?') + ')'); lastCheck = elapsed }
+    if (elapsed - lastCheck >= 15) { step('[RF] Ожидание... ' + elapsed + 'с'); lastCheck = elapsed }
   }
 
   step('[RF] ERROR: сервер не поднялся за 5 минут')
   readLog()
-  if (lastLogLen === 0) step('[RF] ЛОГ ПУСТ — python.exe не стартовал. Проверьте: ' + logPath)
+  if (lastLogLen === 0) step('[RF] ЛОГ ПУСТ. Проверьте: ' + logPath)
   return false
 }
 
+// v3.7.18: ВСЕГДА используем изолированный Python 3.12 — БЕЗ окон cmd!
 async function ensureInferenceServer() {
   if (await checkLocalhostHealth()) { step('[RF] OK: сервер уже работает'); localhostAlive = true; return true }
 
-  let py = findSupportedPython()
+  // v3.7.18: ПУТЬ К ИЗОЛИРОВАННОМУ PYTHON — БЕЗ py-лаунчера = БЕЗ окон!
+  const isolatedPy = path.join(__dirname, '.python312', 'python.exe')
   
-  if (!py) {
-    step('[RF] Python 3.10-3.12 не найден (inference требует именно эти версии)')
-    step('[RF] Устанавливаю Python 3.12 в изолированную папку...')
-    
+  if (!fs.existsSync(isolatedPy)) {
+    step('[RF] Изолированный Python 3.12 не найден, устанавливаю...')
     if (!(await installPython312())) {
       step('[RF] ERROR: не удалось установить Python 3.12')
       step('[RF] Бот работает только на OCR (без inference)')
       return false
     }
-    
-    const isolatedPy = path.join(__dirname, '.python312', 'python.exe')
-    if (fs.existsSync(isolatedPy)) {
-      py = isolatedPy
-      step('[RF] Буду использовать изолированный Python 3.12: ' + isolatedPy)
-    } else {
-      step('[RF] ERROR: python.exe не найден после установки')
-      return false
-    }
   }
 
-  // v3.7.17: resolvePythonExe ПОЧИНЕН — теперь находит реальный путь
-  const resolved = resolvePythonExe(py)
-  if (resolved) {
-    PY_EXE = resolved
-    step('[RF] ✓ Найден реальный python.exe: ' + PY_EXE)
-    step('[RF] ✓ Будет запуск БЕЗ окон cmd')
-  } else {
-    PY_EXE = py
-    step('[RF] [WARN] Не удалось определить путь, использую команду: ' + PY_EXE)
+  if (!fs.existsSync(isolatedPy)) {
+    step('[RF] ERROR: python.exe не найден после установки')
+    return false
   }
+
+  PY_EXE = isolatedPy
+  step('[RF] ✓✓✓ ПРЯМОЙ python.exe: ' + PY_EXE)
+  step('[RF] ✓✓✓ Окна cmd НЕ БУДЕТ (нет py-лаунчера)')
 
   const missing = checkAllPackages(PY_EXE)
   if (missing.length > 0) {
@@ -623,7 +534,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.17', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.18', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -745,7 +656,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.17\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.18\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -770,7 +681,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.17', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.18', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1143,7 +1054,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.17 — resolvePythonExe ПОЧИНЕН === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.18 — ИЗОЛИРОВАННЫЙ Python 3.12 === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
