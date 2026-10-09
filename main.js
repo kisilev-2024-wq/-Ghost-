@@ -1,6 +1,6 @@
-// VERSION: 3.7.18
+// VERSION: 3.7.19
 // main.js
-// v3.7.18: изолированный Python 3.12 (БЕЗ окон) + правильный ModelManager для inference
+// v3.7.19: поиск system Python + embeddable ZIP + ебанутое логирование установщика
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,7 +134,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.18) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.19) =========================
 let localhostAlive = false
 let PY_EXE = ''
 
@@ -179,67 +179,308 @@ function spawnPy(exe, args, opts) {
   return spawn(exe, [...(args || [])], winOpts(opts))
 }
 
-// v3.7.18: принудительная установка Python 3.12 в изолированную папку
-async function installPython312() {
-  step('[RF] Устанавливаю Python 3.12 в изолированную папку (это займёт 2-3 минуты)...')
+// ========================= v3.7.19: ПОИСК УЖЕ УСТАНОВЛЕННОГО PYTHON =========================
+function findSystemPython312() {
+  step('[RF] Поиск установленного Python 3.12 в системе...')
+  
+  const candidates = [
+    path.join(__dirname, '.python312', 'python.exe'),
+    'C:\\Python312\\python.exe',
+    'C:\\Python311\\python.exe',
+    'C:\\Python310\\python.exe',
+    process.env.LOCALAPPDATA + '\\Programs\\Python\\Python312\\python.exe',
+    process.env.LOCALAPPDATA + '\\Programs\\Python\\Python311\\python.exe',
+    process.env.LOCALAPPDATA + '\\Programs\\Python\\Python310\\python.exe',
+    process.env.APPDATA + '\\Python\\Python312\\python.exe',
+    process.env.APPDATA + '\\Python\\Python311\\python.exe',
+    process.env.APPDATA + '\\Python\\Python310\\python.exe',
+    'C:\\Program Files\\Python312\\python.exe',
+    'C:\\Program Files\\Python311\\python.exe',
+    'C:\\Program Files\\Python310\\python.exe',
+    'C:\\Program Files (x86)\\Python312\\python.exe',
+    'C:\\Program Files (x86)\\Python311\\python.exe',
+    'C:\\Program Files (x86)\\Python310\\python.exe',
+  ].filter(Boolean)
+
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      try {
+        const out = execSync(q(p) + ' --version', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }))
+        const m = String(out || '').match(/Python 3\.(\d+)/)
+        if (m) {
+          const minor = parseInt(m[1])
+          if (minor >= 10 && minor <= 12) {
+            step('[RF] ✓ НАЙДЕН Python 3.' + minor + ': ' + p)
+            return p
+          } else {
+            step('[RF] [skip] ' + p + ' — Python 3.' + minor + ' (не подходит)')
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  // Пробуем where.exe
+  try {
+    const whereOut = execSync('where python', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+    const lines = String(whereOut || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+    for (const p of lines) {
+      if (fs.existsSync(p)) {
+        try {
+          const v = execSync(q(p) + ' --version', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }))
+          const m = String(v || '').match(/Python 3\.(\d+)/)
+          if (m) {
+            const minor = parseInt(m[1])
+            if (minor >= 10 && minor <= 12) {
+              step('[RF] ✓ НАЙДЕН Python 3.' + minor + ' через where: ' + p)
+              return p
+            }
+          }
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+
+  step('[RF] Python 3.10-3.12 не найден в системе')
+  return null
+}
+
+// ========================= v3.7.19: EMBEDDABLE ZIP (без установки) =========================
+async function downloadFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath)
+    const mod = url.startsWith('https:') ? https : http
+    mod.get(url, response => {
+      if (response.statusCode !== 200) {
+        try { fs.unlinkSync(destPath) } catch (e) {}
+        reject(new Error('HTTP ' + response.statusCode)); return
+      }
+      response.pipe(file)
+      file.on('finish', () => { file.close(); resolve() })
+    }).on('error', e => {
+      try { fs.unlinkSync(destPath) } catch (x) {}
+      reject(e)
+    })
+  })
+}
+
+async function installPython312Embeddable() {
+  step('[RF] Устанавливаю Python 3.12 embeddable (ZIP, без UAC, без установщика)...')
+  const targetDir = path.join(__dirname, '.python312')
+  const zipUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-embed-amd64.zip'
+  const zipPath = path.join(__dirname, 'python-3.12.9-embed.zip')
+  const getPipUrl = 'https://bootstrap.pypa.io/get-pip.py'
+  const getPipPath = path.join(targetDir, 'get-pip.py')
+  const pthPath = path.join(targetDir, 'python312._pth')
+
+  // 1. Скачиваем ZIP
+  step('[RF] [1/5] Скачивание embeddable ZIP...')
+  try {
+    await downloadFile(zipUrl, zipPath)
+    const size = fs.statSync(zipPath).size
+    step('[RF] [1/5] OK: ' + (size / 1024 / 1024).toFixed(1) + ' MB')
+    if (size < 5000000) throw new Error('ZIP too small')
+  } catch (e) {
+    step('[RF] [1/5] ERROR: ' + e.message)
+    return null
+  }
+
+  // 2. Распаковываем
+  step('[RF] [2/5] Распаковка в ' + targetDir)
+  try {
+    fs.mkdirSync(targetDir, { recursive: true })
+    // Используем PowerShell для распаковки
+    const psCmd = 'powershell -NoProfile -NonInteractive -Command "Expand-Archive -Path \"' + zipPath + '\" -DestinationPath \"' + targetDir + '\" -Force"'
+    execSync(psCmd, winOpts({ stdio: 'pipe', timeout: 120000 }))
+    const pyExe = path.join(targetDir, 'python.exe')
+    if (!fs.existsSync(pyExe)) throw new Error('python.exe not found after extract')
+    step('[RF] [2/5] OK: распаковано')
+  } catch (e) {
+    step('[RF] [2/5] ERROR: ' + (e.message || '').slice(0, 200))
+    return null
+  }
+
+  // 3. Включаем import site (нужно для pip)
+  step('[RF] [3/5] Активация import site...')
+  try {
+    if (fs.existsSync(pthPath)) {
+      let content = fs.readFileSync(pthPath, 'utf8')
+      if (!content.includes('import site')) {
+        content = content.replace(/^#import site/m, 'import site')
+        if (!content.includes('import site')) content += '\nimport site\n'
+        fs.writeFileSync(pthPath, content)
+      }
+      step('[RF] [3/5] OK: _pth обновлён')
+    } else {
+      fs.writeFileSync(pthPath, 'python312.zip\n.\nimport site\n')
+      step('[RF] [3/5] OK: _pth создан')
+    }
+  } catch (e) {
+    step('[RF] [3/5] WARN: ' + e.message)
+  }
+
+  // 4. Скачиваем get-pip.py
+  step('[RF] [4/5] Скачивание get-pip.py...')
+  try {
+    await downloadFile(getPipUrl, getPipPath)
+    step('[RF] [4/5] OK')
+  } catch (e) {
+    step('[RF] [4/5] ERROR: ' + e.message)
+    return null
+  }
+
+  // 5. Устанавливаем pip
+  step('[RF] [5/5] Установка pip...')
+  try {
+    const pyExe = path.join(targetDir, 'python.exe')
+    const proc = spawnPy(pyExe, [getPipPath, '--no-warn-script-location'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    await new Promise((resolve) => {
+      let out = ''
+      proc.stdout.on('data', d => { out += d.toString() })
+      proc.stderr.on('data', d => { out += d.toString() })
+      proc.on('close', code => {
+        if (code === 0) {
+          step('[RF] [5/5] OK: pip установлен')
+          resolve(true)
+        } else {
+          step('[RF] [5/5] ERROR: pip code ' + code)
+          step('[RF] ' + out.slice(-400).replace(/\n/g, ' '))
+          resolve(false)
+        }
+      })
+      proc.on('error', e => { step('[RF] [5/5] ERROR: ' + e.message); resolve(false) })
+    })
+    try { fs.unlinkSync(zipPath) } catch (e) {}
+    try { fs.unlinkSync(getPipPath) } catch (e) {}
+    const pyExe = path.join(targetDir, 'python.exe')
+    if (fs.existsSync(pyExe)) {
+      step('[RF] ✓✓✓ EMBEDDED Python 3.12 готов: ' + pyExe)
+      return pyExe
+    }
+    return null
+  } catch (e) {
+    step('[RF] [5/5] ERROR: ' + e.message)
+    return null
+  }
+}
+
+// ========================= v3.7.19: УСТАНОВЩИК С ЕБАНУТЫМ ЛОГИРОВАНИЕМ =========================
+async function installPython312Installer() {
+  step('[RF] Запускаю установщик Python 3.12 с детальным логированием...')
   const installerUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe'
   const installerPath = path.join(__dirname, 'python-3.12.9-installer.exe')
   const targetDir = path.join(__dirname, '.python312')
+  const logPath = path.join(__dirname, 'python_install.log')
 
+  // 1. Скачиваем установщик
+  step('[RF] [1/3] Скачивание установщика...')
   try {
-    await new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(installerPath)
-      https.get(installerUrl, response => {
-        if (response.statusCode !== 200) { reject(new Error('HTTP ' + response.statusCode)); return }
-        response.pipe(file); file.on('finish', () => { file.close(); resolve() })
-      }).on('error', e => { try { fs.unlinkSync(installerPath) } catch (x) {}; reject(e) })
-    })
+    await downloadFile(installerUrl, installerPath)
     const size = fs.statSync(installerPath).size
-    step('[RF] Установщик скачан: ' + (size / 1024 / 1024).toFixed(1) + ' MB')
-    if (size < 10000000) { step('[RF] ERROR: файл слишком мал'); return false }
-  } catch (e) { step('[RF] ERROR: ' + e.message); return false }
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    step('[RF] Попытка установки ' + attempt + '/3 в ' + targetDir)
-    try {
-      const args = [
-        '/quiet',
-        'InstallAllUsers=0',
-        'TargetDir=' + targetDir,
-        'PrependPath=0',
-        'Include_pip=1',
-        'Include_test=0',
-        'Include_doc=0',
-        'Include_launcher=0',
-        'AssociateFiles=0',
-        'CompileAll=0'
-      ].join(' ')
-      execSync('"' + installerPath + '" ' + args, winOpts({ stdio: 'ignore', timeout: 300000 }))
-      const pyExe = path.join(targetDir, 'python.exe')
-      if (fs.existsSync(pyExe)) {
-        step('[RF] OK: Python 3.12 установлен в ' + targetDir)
-        try { fs.unlinkSync(installerPath) } catch (e) {}
-        await sleep(3000)
-        return true
-      }
-      step('[RF] [WARN] python.exe не найден после установки')
-    } catch (e) {
-      step('[RF] ERROR попытки ' + attempt + ': ' + (e.message || '').slice(0, 200))
-      if (attempt < 3) await sleep(5000)
-    }
+    step('[RF] [1/3] OK: ' + (size / 1024 / 1024).toFixed(1) + ' MB')
+    if (size < 10000000) throw new Error('installer too small')
+  } catch (e) {
+    step('[RF] [1/3] ERROR: ' + e.message)
+    return null
   }
-  step('[RF] ERROR: установка Python 3.12 не удалась')
-  return false
+
+  // 2. Запускаем установщик с /passive и логом
+  step('[RF] [2/3] Запуск установщика (/passive)...')
+  step('[RF] [2/3] Лог установщика: ' + logPath)
+  try { fs.unlinkSync(logPath) } catch (e) {}
+  
+  // v3.7.19: используем cmd /c чтобы ловить stderr
+  const args = [
+    '/passive',
+    'InstallAllUsers=0',
+    'TargetDir=' + targetDir,
+    'PrependPath=0',
+    'Include_pip=1',
+    'Include_test=0',
+    'Include_doc=0',
+    'Include_launcher=0',
+    'AssociateFiles=0',
+    'CompileAll=0',
+    '/log', logPath
+  ]
+  
+  const cmdLine = '"' + installerPath + '" ' + args.join(' ')
+  step('[RF] [2/3] Команда: ' + cmdLine)
+  
+  const installResult = await new Promise(resolve => {
+    const proc = spawn('cmd.exe', ['/c', cmdLine], winOpts({ stdio: ['ignore', 'pipe', 'pipe'] }))
+    let stdout = '', stderr = ''
+    proc.stdout.on('data', d => { stdout += d.toString() })
+    proc.stderr.on('data', d => { stderr += d.toString() })
+    proc.on('close', code => resolve({ code, stdout, stderr }))
+    proc.on('error', e => resolve({ code: -1, error: e.message }))
+  })
+
+  step('[RF] [2/3] Exit code: ' + installResult.code)
+  if (installResult.stdout) step('[RF] [2/3] stdout: ' + installResult.stdout.slice(0, 300))
+  if (installResult.stderr) step('[RF] [2/3] stderr: ' + installResult.stderr.slice(0, 300))
+  if (installResult.error) step('[RF] [2/3] ERROR: ' + installResult.error)
+
+  // Читаем лог установщика
+  try {
+    if (fs.existsSync(logPath)) {
+      const logContent = fs.readFileSync(logPath, 'utf8')
+      const lastLines = logContent.split('\n').slice(-10).join('\n')
+      step('[RF] [2/3] Последние 10 строк лога установщика:')
+      for (const line of logContent.split('\n').slice(-10)) {
+        if (line.trim()) step('[RF]   | ' + line)
+      }
+    }
+  } catch (e) {}
+
+  // 3. Проверяем результат
+  step('[RF] [3/3] Проверка результата...')
+  const pyExe = path.join(targetDir, 'python.exe')
+  if (fs.existsSync(pyExe)) {
+    try { fs.unlinkSync(installerPath) } catch (e) {}
+    step('[RF] [3/3] ✓ Python установлен: ' + pyExe)
+    await sleep(2000)
+    return pyExe
+  } else {
+    step('[RF] [3/3] ERROR: python.exe не найден в ' + targetDir)
+    // Показываем содержимое папки
+    try {
+      const files = fs.readdirSync(targetDir)
+      step('[RF] [3/3] Содержимое папки (' + files.length + ' файлов):')
+      for (const f of files.slice(0, 20)) step('[RF]   - ' + f)
+    } catch (e) {}
+    return null
+  }
 }
 
-// v3.7.18: установка inference со всеми зависимостями
+// ========================= v3.7.19: ОБЩАЯ ФУНКЦИЯ УСТАНОВКИ =========================
+async function ensurePython312() {
+  // 1. Сначала ищем уже установленный
+  const systemPy = findSystemPython312()
+  if (systemPy) {
+    step('[RF] ✓✓✓ Используем уже установленный Python: ' + systemPy)
+    return systemPy
+  }
+
+  // 2. Пробуем embeddable (самый надёжный способ)
+  step('[RF] Пробую embeddable установку (без UAC, без установщика)...')
+  const embedded = await installPython312Embeddable()
+  if (embedded) return embedded
+
+  // 3. Fallback на установщик с ебанутым логированием
+  step('[RF] Embeddable не сработал, пробую установщик с логом...')
+  const installed = await installPython312Installer()
+  if (installed) return installed
+
+  return null
+}
+
 async function installAllPackages(exe, missing) {
   if (missing.length === 0) { step('[RF] OK: все пакеты установлены'); return true }
   step('[RF] Установка: ' + missing.join(', ') + ' (5-10 минут)...')
   return new Promise(resolve => {
     const proc = spawnPy(exe, ['-m', 'pip', 'install', '--upgrade', 'pip'], { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.on('close', () => {
-      // v3.7.18: устанавливаем inference с extras [http] для всех зависимостей
       const installArgs = ['-m', 'pip', 'install', 'inference[http]', 'uvicorn', 'fastapi', 'python-multipart', 'asgi-correlation-id', 'fastapi-cprofile', 'supervision']
       const proc2 = spawnPy(exe, installArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
       let out = ''
@@ -268,13 +509,6 @@ function checkAllPackages(exe) {
   return missing
 }
 
-function writeVbsUnicode(p, content) {
-  const bom = Buffer.from([0xFF, 0xFE])
-  const body = Buffer.from(String(content || ''), 'utf16le')
-  fs.writeFileSync(p, Buffer.concat([bom, body]))
-}
-
-// v3.7.18: правильный Python-скрипт с ModelManager
 async function startInferenceServer(exe) {
   step('[RF] Запуск inference server на порту ' + RF_PORT + '...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, 1-3 мин)...')
@@ -288,7 +522,6 @@ async function startInferenceServer(exe) {
 
   try { fs.unlinkSync(logPath) } catch (e) {}
 
-  // v3.7.18: правильный скрипт с ModelManager
   const pythonScript = `
 import sys, os, warnings, traceback
 
@@ -338,7 +571,6 @@ log('Port: ' + str(PORT))
 app = None
 method = ''
 
-# v3.7.18: Способ 1 — HttpInterface с ModelManager (правильная инициализация!)
 try:
     log('Trying HttpInterface + ModelManager...')
     from inference.core.managers.base import ModelManager
@@ -350,8 +582,6 @@ try:
     log('OK: using ' + method)
 except Exception as e1:
     log('FAIL e1: ' + str(e1))
-    
-    # Способ 2 — старый API
     try:
         log('Trying inference.core.interfaces.http.app...')
         from inference.core.interfaces.http import app as http_app
@@ -360,8 +590,6 @@ except Exception as e1:
         log('OK: using ' + method)
     except Exception as e2:
         log('FAIL e2: ' + str(e2))
-        
-        # Способ 3 — через InferenceHTTPServer
         try:
             log('Trying InferenceHTTPServer...')
             from inference.core.interfaces.http import InferenceHTTPServer
@@ -371,8 +599,6 @@ except Exception as e1:
             log('OK: using ' + method)
         except Exception as e3:
             log('FAIL e3: ' + str(e3))
-            
-            # Способ 4 — эмулятор (fallback)
             try:
                 log('Building emulated Roboflow API...')
                 from fastapi import FastAPI, Request, UploadFile, File
@@ -423,7 +649,6 @@ except Exception as e:
 
   let launched = 'direct'
   try {
-    // v3.7.18: прямой spawn python.exe — БЕЗ окон!
     const serverProc = spawnPy(exe, [scriptPath], {
       detached: true,
       stdio: 'ignore',
@@ -460,14 +685,12 @@ except Exception as e:
   while (Date.now() - start < timeout) {
     await sleep(2000)
     readLog()
-
     if (await checkLocalhostHealth()) {
       readLog()
       step('[RF] OK: inference server готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
       localhostAlive = true
       return true
     }
-
     const elapsed = Math.round((Date.now() - start) / 1000)
     if (elapsed - lastCheck >= 15) { step('[RF] Ожидание... ' + elapsed + 'с'); lastCheck = elapsed }
   }
@@ -478,30 +701,19 @@ except Exception as e:
   return false
 }
 
-// v3.7.18: ВСЕГДА используем изолированный Python 3.12 — БЕЗ окон cmd!
 async function ensureInferenceServer() {
   if (await checkLocalhostHealth()) { step('[RF] OK: сервер уже работает'); localhostAlive = true; return true }
 
-  // v3.7.18: ПУТЬ К ИЗОЛИРОВАННОМУ PYTHON — БЕЗ py-лаунчера = БЕЗ окон!
-  const isolatedPy = path.join(__dirname, '.python312', 'python.exe')
+  // v3.7.19: ищем или ставим Python 3.10-3.12
+  PY_EXE = await ensurePython312()
   
-  if (!fs.existsSync(isolatedPy)) {
-    step('[RF] Изолированный Python 3.12 не найден, устанавливаю...')
-    if (!(await installPython312())) {
-      step('[RF] ERROR: не удалось установить Python 3.12')
-      step('[RF] Бот работает только на OCR (без inference)')
-      return false
-    }
-  }
-
-  if (!fs.existsSync(isolatedPy)) {
-    step('[RF] ERROR: python.exe не найден после установки')
+  if (!PY_EXE) {
+    step('[RF] ERROR: не удалось получить Python 3.10-3.12')
+    step('[RF] Бот работает только на OCR (без inference)')
     return false
   }
 
-  PY_EXE = isolatedPy
-  step('[RF] ✓✓✓ ПРЯМОЙ python.exe: ' + PY_EXE)
-  step('[RF] ✓✓✓ Окна cmd НЕ БУДЕТ (нет py-лаунчера)')
+  step('[RF] ✓✓✓ Python для inference: ' + PY_EXE)
 
   const missing = checkAllPackages(PY_EXE)
   if (missing.length > 0) {
@@ -534,7 +746,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.18', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.19', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -656,7 +868,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.18\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.19\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -681,7 +893,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.18', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.19', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1054,7 +1266,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.18 — ИЗОЛИРОВАННЫЙ Python 3.12 === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.19 — ПОИСК + EMBED + ЛОГ === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
