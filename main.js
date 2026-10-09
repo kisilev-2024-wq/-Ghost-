@@ -1,6 +1,6 @@
-// VERSION: 3.7.10
+// VERSION: 3.7.11
 // main.js
-// v3.7.10: прямой запуск python.exe (без py-лаунчера) + короткие пути 8.3 + VBS UTF-16 fallback
+// v3.7.11: поддержка Python 3.9-3.15 + изолированная установка 3.12 + retry
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,10 +134,10 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.10) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.11) =========================
 let localhostAlive = false
-let PY_EXE = ''       // настоящий python.exe (не py-лаунчер!)
-let PY_EXE_SHORT = '' // короткий путь 8.3 (чистый ASCII)
+let PY_EXE = ''
+let PY_EXE_SHORT = ''
 
 function q(s) { s = String(s); return /[\s"]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s }
 
@@ -162,7 +162,6 @@ function parsePyCmd(py) {
   return { cmd: parts[0] || 'py', baseArgs: parts.slice(1) }
 }
 
-// v3.7.10: короткий путь 8.3 (ASCII) — убирает все проблемы с кириллицей
 function getShortPath(p) {
   try {
     const out = execSync('cmd /c for %I in (' + q(p) + ') do @echo %~sI', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
@@ -173,7 +172,6 @@ function getShortPath(p) {
   return ''
 }
 
-// v3.7.10: resolvим НАСТОЯЩИЙ python.exe, минуя py-лаунчер
 function resolvePythonExe(pyCmd) {
   try {
     const { cmd, baseArgs } = parsePyCmd(pyCmd)
@@ -189,24 +187,31 @@ function execPyExe(exe, args, opts) {
   return execSync([exe, ...args].map(q).join(' '), winOpts(opts))
 }
 
+// v3.7.11: расширенный поиск — принимает Python 3.9-3.15
 function findSupportedPython() {
-  for (const cmd of ['py -3.12', 'py -3.11', 'py -3.10', 'py -3.9']) {
-    try {
-      const v = execPyExe(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-      const m = v.match(/Python 3\.(\d+)/)
-      if (m && parseInt(m[1]) >= 9 && parseInt(m[1]) <= 12) {
-        step('[RF] Найден Python: ' + cmd + ' (' + v.trim() + ')'); return cmd
-      }
-    } catch (e) {}
-  }
-  for (const cmd of ['python', 'py', 'python3']) {
+  for (const cmd of ['py -3.15', 'py -3.14', 'py -3.13', 'py -3.12', 'py -3.11', 'py -3.10', 'py -3.9']) {
     try {
       const v = execPyExe(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
       const m = v.match(/Python 3\.(\d+)/)
       if (m) {
         const minor = parseInt(m[1])
-        if (minor >= 9 && minor <= 12) { step('[RF] Найден Python: ' + cmd + ' (' + v.trim() + ')'); return cmd }
-        else step('[RF] [WARN] ' + cmd + ' = Python 3.' + minor)
+        if (minor >= 9 && minor <= 15) {
+          step('[RF] Найден Python: ' + cmd + ' (' + v.trim() + ')'); return cmd
+        }
+      }
+    } catch (e) {}
+  }
+  for (const cmd of ['py', 'python', 'python3']) {
+    try {
+      const v = execPyExe(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      const m = v.match(/Python 3\.(\d+)/)
+      if (m) {
+        const minor = parseInt(m[1])
+        if (minor >= 9 && minor <= 15) {
+          step('[RF] Найден Python: ' + cmd + ' (' + v.trim() + ')'); return cmd
+        } else {
+          step('[RF] [WARN] ' + cmd + ' = Python 3.' + minor + ' (вне диапазона 3.9-3.15)')
+        }
       }
     } catch (e) {}
   }
@@ -245,10 +250,13 @@ async function installAllPackages(exe, missing) {
   })
 }
 
+// v3.7.11: изолированная установка в .python312/ + retry
 async function installPython312() {
-  step('[RF] Устанавливаю Python 3.12...')
+  step('[RF] Устанавливаю Python 3.12 в изолированную папку...')
   const installerUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe'
   const installerPath = path.join(__dirname, 'python-3.12.9-installer.exe')
+  const targetDir = path.join(__dirname, '.python312')
+
   try {
     await new Promise((resolve, reject) => {
       const file = fs.createWriteStream(installerPath)
@@ -257,16 +265,44 @@ async function installPython312() {
         response.pipe(file); file.on('finish', () => { file.close(); resolve() })
       }).on('error', e => { try { fs.unlinkSync(installerPath) } catch (x) {}; reject(e) })
     })
+    const size = fs.statSync(installerPath).size
+    step('[RF] Установщик скачан: ' + (size / 1024 / 1024).toFixed(1) + ' MB')
+    if (size < 10000000) { step('[RF] ERROR: файл слишком мал'); return false }
   } catch (e) { step('[RF] ERROR: ' + e.message); return false }
-  try {
-    execSync('"' + installerPath + '" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0', winOpts({ stdio: 'ignore', timeout: 180000 }))
-    step('[RF] OK: Python 3.12 установлен')
-    try { fs.unlinkSync(installerPath) } catch (e) {}
-    await sleep(5000); return true
-  } catch (e) { step('[RF] ERROR: ' + e.message); return false }
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    step('[RF] Попытка установки ' + attempt + '/3 в ' + targetDir)
+    try {
+      const args = [
+        '/quiet',
+        'InstallAllUsers=0',
+        'TargetDir=' + targetDir,
+        'PrependPath=0',
+        'Include_pip=1',
+        'Include_test=0',
+        'Include_doc=0',
+        'Include_launcher=0',
+        'AssociateFiles=0',
+        'CompileAll=0'
+      ].join(' ')
+      execSync('"' + installerPath + '" ' + args, winOpts({ stdio: 'ignore', timeout: 300000 }))
+      const pyExe = path.join(targetDir, 'python.exe')
+      if (fs.existsSync(pyExe)) {
+        step('[RF] OK: Python 3.12 установлен в ' + targetDir)
+        try { fs.unlinkSync(installerPath) } catch (e) {}
+        await sleep(3000)
+        return true
+      }
+      step('[RF] [WARN] python.exe не найден после установки')
+    } catch (e) {
+      step('[RF] ERROR попытки ' + attempt + ': ' + (e.message || '').slice(0, 200))
+      if (attempt < 3) await sleep(5000)
+    }
+  }
+  step('[RF] ERROR: установка Python 3.12 не удалась')
+  return false
 }
 
-// v3.7.10: VBS в UTF-16 LE с BOM (как в установщике) — WSH читает кириллицу правильно
 function writeVbsUnicode(p, content) {
   const bom = Buffer.from([0xFF, 0xFE])
   const body = Buffer.from(String(content || ''), 'utf16le')
@@ -288,7 +324,6 @@ async function startInferenceServer(exe) {
   try { fs.unlinkSync(logPath) } catch (e) {}
   try { fs.unlinkSync(vbsPath) } catch (e) {}
 
-  // Python-скрипт: всё пишет в файл-лог
   const pythonScript = `
 import sys, os, warnings, traceback
 
@@ -392,8 +427,6 @@ except Exception as e:
 
   const env = Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
 
-  // v3.7.10 ГЛАВНОЕ: запускаем НАСТОЯЩИЙ python.exe напрямую (НЕ py-лаунчер!)
-  // CREATE_NO_WINDOW применяется к самому python.exe → консоли нет вообще
   let launched = 'direct'
   try {
     const serverProc = spawn(exeShort, [scriptPath], winOpts({
@@ -410,7 +443,6 @@ except Exception as e:
     launched = ''
   }
 
-  // Чтение лога из файла
   let lastLogLen = 0
   const readLog = () => {
     try {
@@ -442,7 +474,6 @@ except Exception as e:
       return true
     }
 
-    // v3.7.10: если через 20с нет ни лога ни сервера — fallback через VBS (UTF-16, //B)
     const elapsed = Math.round((Date.now() - start) / 1000)
     if (!vbsTried && elapsed >= 20 && !hasLog) {
       vbsTried = true
@@ -467,18 +498,27 @@ except Exception as e:
   return false
 }
 
+// v3.7.11: умный выбор Python
 async function ensureInferenceServer() {
   if (await checkLocalhostHealth()) { step('[RF] OK: сервер уже работает'); localhostAlive = true; return true }
 
   let py = findSupportedPython()
   if (!py) {
-    step('[RF] [WARN] Python 3.9-3.12 не найден, устанавливаю 3.12...')
-    if (!(await installPython312())) { step('[RF] ERROR: бот работает только на OCR'); return false }
-    py = findSupportedPython()
-    if (!py) { step('[RF] ERROR: Python не найден в PATH'); return false }
+    step('[RF] [WARN] Python 3.9-3.15 не найден, устанавливаю 3.12...')
+    if (!(await installPython312())) {
+      step('[RF] ERROR: бот работает только на OCR')
+      return false
+    }
+    const isolatedPy = path.join(__dirname, '.python312', 'python.exe')
+    if (fs.existsSync(isolatedPy)) {
+      py = '"' + isolatedPy + '"'
+      step('[RF] Буду использовать изолированный Python: ' + isolatedPy)
+    } else {
+      py = findSupportedPython()
+      if (!py) { step('[RF] ERROR: Python не найден в PATH'); return false }
+    }
   }
 
-  // v3.7.10: resolvим настоящий python.exe один раз
   PY_EXE = resolvePythonExe(py)
   if (!PY_EXE) { step('[RF] ERROR: не удалось определить python.exe'); return false }
   PY_EXE_SHORT = getShortPath(PY_EXE) || PY_EXE
@@ -505,7 +545,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.10', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.11', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -627,7 +667,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.10\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.11\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -652,7 +692,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.10', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.11', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -814,7 +854,7 @@ const DIGITS={'0':[[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[
 
 function matchPat(mask,W,H,bx,by,bw,bh){const pat=[];for(let py=0;py<7;py++){const row=[];for(let px=0;px<5;px++){const sx=bx+Math.floor(px*bw/5),ex=bx+Math.floor((px+1)*bw/5),sy=by+Math.floor(py*bh/7),ey=by+Math.floor((py+1)*bh/7);let c=0,t=0;for(let y=sy;y<ey;y++)for(let x=sx;x<ex;x++){c+=mask[y*W+x];t++};row.push(t&&(c/t)>0.35?1:0)};pat.push(row)};let bd='?',bs=0;for(const d in DIGITS){let m=0;for(let y=0;y<7;y++)for(let x=0;x<5;x++)if(pat[y][x]===DIGITS[d][y][x])m++;const s=m/35;if(s>bs){bs=s;bd=d}};return{best:bd,score:Math.round(bs*100)/100}}
 
-function ocr(mask,W,H){const digits=[];for (const c of compsList(mask, W, H, false)) {const w=c.mxX-c.mnX+1,h=c.mxY-c.mnY+1;if(c.a<Math.max(80,W*H/1600))continue;if(w<W*0.02||w>W*0.5)continue;if(h<H*0.07||h>H*0.92)continue;if(isStraight(c,w,h))continue;const m=matchPat(mask,W,H,c.mnX,c.mnY,w,h);digits.push({x:c.mnX,best:m.best,score:m.score})};digits.sort((a,b)=>a.x-b.x);let text='';for(const d of digits) if(d.score>=0.5) text+=d.best;return { text, digits}}
+function ocr(mask,W,H){const digits=[];for (const c of compsList(mask, W, H, false)) {const w=c.mxX-c.mnX+1,h=c.mxY-c.mnY+1;if(c.a<Math.max(80,W*H/1600))continue;if(w<W*0.02||w>W*0.5)continue;if(h<H*0.07||h>H*0.92)continue;if(isStraight(c,w,h))continue;const m=matchPat(mask,W,H,c.mnX,c.mnY,w,h);digits.push({x:c.mnX,best:m.best,score:m.score})};digits.sort((a,b)=>a.x-b.x);let text='';for(const d of digits) if(d.score>=0.5) text+=d.best;return { text, digits }}
 
 function pickOcr(vars, W, H) {
   let best = null
@@ -1025,7 +1065,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.10 — прямой python.exe + 8.3 пути === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.11 — поддержка Python 3.9-3.15 === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
