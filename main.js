@@ -1,6 +1,6 @@
-// VERSION: 3.7.3
+// VERSION: 3.7.4
 // main.js
-// v3.7.3: исправлен запуск inference server (inference.exe / uvicorn fallback)
+// v3.7.4: скрытие окна inference server + правильный запуск без открытия доп cmd
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -27,6 +27,9 @@ const LOCAL_RF_TIMEOUT_MS = 30000
 const CLOUD_RF_TIMEOUT_MS = 20000
 const RF_PORT = 9001
 const RF_URL = 'http://localhost:' + RF_PORT
+
+// Windows: флаг CREATE_NO_WINDOW — не открывать консольное окно
+const CREATE_NO_WINDOW = 0x08000000
 
 // ========================= КОНФИГ =========================
 const CFG_PARENT = path.join(__dirname, '..', 'config.json')
@@ -169,7 +172,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.3) =========================
+// ========================= АВТОУСТАНОВКА INFERENCE SERVER (v3.7.4: БЕЗ ОКНА) =========================
 let localhostAlive = false
 
 function checkLocalhostHealth() {
@@ -190,7 +193,12 @@ function parsePyCmd(py) {
 
 function spawnPy(py, extraArgs, opts) {
   const { cmd, baseArgs } = parsePyCmd(py)
-  return spawn(cmd, [...baseArgs, ...(extraArgs || [])], opts || {})
+  const merged = Object.assign({}, opts || {})
+  // На Windows — скрыть окно процесса
+  if (process.platform === 'win32' && merged.creationFlags === undefined) {
+    merged.creationFlags = CREATE_NO_WINDOW
+  }
+  return spawn(cmd, [...baseArgs, ...(extraArgs || [])], merged)
 }
 
 function execPy(py, extraArgs, opts) {
@@ -201,13 +209,20 @@ function execPy(py, extraArgs, opts) {
     if (/[\s"]/.test(s)) return '"' + s.replace(/"/g, '\\"') + '"'
     return s
   }).join(' ')
-  return execSync(cmdLine, opts)
+  const merged = Object.assign({}, opts || {})
+  if (process.platform === 'win32' && merged.windowsHide === undefined) {
+    merged.windowsHide = true
+  }
+  if (process.platform === 'win32' && merged.creationFlags === undefined) {
+    merged.creationFlags = CREATE_NO_WINDOW
+  }
+  return execSync(cmdLine, merged)
 }
 
 function findSupportedPython() {
   for (const cmd of ['py -3.12', 'py -3.11', 'py -3.10', 'py -3.9', 'py -3.8']) {
     try {
-      const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
       const m = v.match(/Python 3\.(\d+)/)
       if (m && parseInt(m[1]) >= 8 && parseInt(m[1]) <= 12) {
         step('[RF] Найден поддерживаемый Python: ' + cmd + ' (' + v.trim() + ')')
@@ -218,7 +233,7 @@ function findSupportedPython() {
 
   for (const cmd of ['python', 'py', 'python3']) {
     try {
-      const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      const v = execPy(cmd, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
       const m = v.match(/Python 3\.(\d+)/)
       if (m) {
         const minor = parseInt(m[1])
@@ -258,9 +273,12 @@ async function installPython312() {
 
   step('[RF] Установка Python 3.12 (тихий режим, с добавлением в PATH)...')
   try {
-    execSync('"' + installerPath + '" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0', {
-      stdio: 'ignore', windowsHide: true, timeout: 180000
-    })
+    const opts = { stdio: 'ignore', timeout: 180000 }
+    if (process.platform === 'win32') {
+      opts.windowsHide = true
+      opts.creationFlags = CREATE_NO_WINDOW
+    }
+    execSync('"' + installerPath + '" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0', opts)
     step('[RF] ✅ Python 3.12 установлен')
     try { fs.unlinkSync(installerPath) } catch (e) {}
     await sleep(5000)
@@ -273,7 +291,7 @@ async function installPython312() {
 
 function isInferenceInstalled(py) {
   try {
-    const r = execPy(py, ['-m', 'pip', 'show', 'inference'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    const r = execPy(py, ['-m', 'pip', 'show', 'inference'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return r && r.includes('Name: inference')
   } catch (e) { return false }
 }
@@ -282,9 +300,7 @@ async function installInference(py) {
   step('[RF] Установка inference через pip (это может занять 2-5 минут)...')
   return new Promise(resolve => {
     const proc = spawnPy(py, ['-m', 'pip', 'install', 'inference'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-      shell: process.platform === 'win32'
+      stdio: ['ignore', 'pipe', 'pipe']
     })
     let output = ''
     const onData = d => { output += d.toString(); if (output.length > 5000) output = output.slice(-3000) }
@@ -304,18 +320,17 @@ async function installInference(py) {
   })
 }
 
-// v3.7.3: правильный запуск inference server
+// v3.7.4: запуск inference server БЕЗ открытия дополнительного окна cmd
 async function startInferenceServer(py) {
-  step('[RF] Запуск inference server на порту ' + RF_PORT + '...')
+  step('[RF] Запуск inference server на порту ' + RF_PORT + ' (без открытия окна)...')
   step('[RF] Первый запуск: скачивание модели (~120 МБ, может занять 1-3 мин)...')
 
   const { cmd: pyCmd, baseArgs } = parsePyCmd(py)
   
-  // Получаем путь к Python и его Scripts
   let pythonPath = ''
   let scriptsDir = ''
   try {
-    pythonPath = execPy(py, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim()
+    pythonPath = execPy(py, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
     scriptsDir = path.join(path.dirname(pythonPath), 'Scripts')
     step('[RF] Python: ' + pythonPath)
     step('[RF] Scripts: ' + scriptsDir)
@@ -323,68 +338,72 @@ async function startInferenceServer(py) {
     step('[RF] ⚠️  Не удалось определить путь к Python: ' + e.message)
   }
 
-  // Вариант 1: команда inference (если в PATH)
-  const inferenceCmd = path.join(scriptsDir, 'inference.exe')
   let serverProc = null
-  let serverCmd = ''
+  let launched = false
+  let launchMethod = ''
 
-  if (fs.existsSync(inferenceCmd)) {
-    step('[RF] Найдена inference.exe, запускаю...')
-    serverCmd = inferenceCmd
-    serverProc = spawn(inferenceCmd, ['server', 'start', '--port', String(RF_PORT)], {
+  // Вариант 1: inference.exe в Scripts (самый надёжный)
+  const inferenceExe = path.join(scriptsDir, 'inference.exe')
+  if (fs.existsSync(inferenceExe)) {
+    step('[RF] Найдена inference.exe, запускаю скрыто...')
+    serverProc = spawn(inferenceExe, ['server', 'start', '--port', String(RF_PORT)], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      creationFlags: process.platform === 'win32' ? CREATE_NO_WINDOW : undefined
     })
-  } else {
-    // Вариант 2: запуск через Python с uvicorn
-    step('[RF] inference.exe не найдена, запускаю через Python + uvicorn...')
-    serverCmd = pyCmd + ' ' + baseArgs.join(' ')
-    const pythonCode = `
-import sys
-try:
-    from inference.core.http import app
-    import uvicorn
-    print('[RF server] Запуск inference через uvicorn...', flush=True)
-    uvicorn.run(app, host='0.0.0.0', port=${RF_PORT}, log_level='info')
-except Exception as e:
-    print(f'[RF server] Ошибка: {e}', flush=True)
-    sys.exit(1)
-`.trim()
-    
-    serverProc = spawnPy(py, ['-c', pythonCode], {
+    launchMethod = 'inference.exe'
+    launched = true
+  }
+
+  // Вариант 2: python -m inference (если .exe нет)
+  if (!launched) {
+    step('[RF] inference.exe не найдена, запускаю через python -m inference (скрыто)...')
+    serverProc = spawnPy(py, ['-m', 'inference', 'server', 'start', '--port', String(RF_PORT)], {
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
+      stdio: ['ignore', 'pipe', 'pipe']
     })
+    launchMethod = 'python -m inference'
+    launched = true
   }
 
   let logLines = 0
   const onLog = d => {
     const lines = d.toString().split('\n').filter(l => l.trim())
     for (const line of lines) {
-      if (logLines < 20) { step('[RF server] ' + line); logLines++ }
+      if (logLines < 30) { step('[RF server] ' + line); logLines++ }
     }
   }
   serverProc.stdout.on('data', onLog)
   serverProc.stderr.on('data', onLog)
-  serverProc.on('error', e => { step('[RF] Ошибка запуска сервера: ' + e.message) })
+  serverProc.on('error', e => { step('[RF] Ошибка запуска: ' + e.message) })
+  serverProc.on('exit', (code) => {
+    if (code !== null && code !== 0 && !localhostAlive) {
+      step('[RF] ⚠️  Сервер завершился с кодом ' + code + ' (метод: ' + launchMethod + ')')
+    }
+  })
+  // Отсоединяем процесс — он продолжит работать после закрытия бота
   serverProc.unref()
 
+  // Ждём пока сервер поднимется
   const start = Date.now()
   const timeout = 300000
+  let lastCheck = 0
   while (Date.now() - start < timeout) {
-    await sleep(3000)
+    await sleep(2000)
     if (await checkLocalhostHealth()) {
-      step('[RF] ✅ inference server готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+      step('[RF] ✅ inference server готов через ' + launchMethod + ' (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
       localhostAlive = true
       return true
     }
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed % 15 === 0) step('[RF] Ожидание сервера... ' + elapsed + 'с')
+    if (elapsed - lastCheck >= 15) {
+      step('[RF] Ожидание сервера... ' + elapsed + 'с (метод: ' + launchMethod + ')')
+      lastCheck = elapsed
+    }
   }
 
-  step('[RF] ⚠️  Сервер не поднялся за 5 минут')
+  step('[RF] ⚠️  Сервер не поднялся за 5 минут. Метод: ' + launchMethod)
   return false
 }
 
@@ -445,7 +464,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.3', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.4', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -567,7 +586,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.3\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.4\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -592,7 +611,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.3', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.4', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -971,7 +990,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.3 — правильный запуск inference === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.4 — inference без доп окна === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
