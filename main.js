@@ -1,7 +1,6 @@
-// VERSION: 3.7.29
+// VERSION: 3.7.30
 // main.js
-// v3.7.29: ПРАВИЛЬНАЯ интеграция Roboflow Serverless API
-//          Authorization: Bearer header + serverless.roboflow.com
+// v3.7.30: HARDCODED Roboflow values (не берём из config.json)
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -85,8 +84,6 @@ function regexCfg(raw) {
   if (ac) { put('accounts', 'nickPrefix', grabIn(ac, 'nickPrefix')); put('accounts', 'countDefault', grabNumIn(ac, 'countDefault')); put('accounts', 'sessionMinutes', grabNumIn(ac, 'sessionMinutes')) }
   const tg = sectionBody(raw, 'telegram')
   if (tg) { put('telegram', 'token', grabIn(tg, 'token')); put('telegram', 'chatId', grabNumIn(tg, 'chatId')); put('telegram', 'apiProxy', grabIn(tg, 'apiProxy')) }
-  const rf = sectionBody(raw, 'roboflow')
-  if (rf) { put('roboflow', 'enabled', grabBoolIn(rf, 'enabled')); put('roboflow', 'apiKey', grabIn(rf, 'apiKey')); put('roboflow', 'modelId', grabIn(rf, 'modelId')); put('roboflow', 'detectUrl', grabIn(rf, 'detectUrl')); put('roboflow', 'serverlessUrl', grabIn(rf, 'serverlessUrl')); put('roboflow', 'confidence', grabNumIn(rf, 'confidence')); put('roboflow', 'overlap', grabNumIn(rf, 'overlap')); put('roboflow', 'httpProxy', grabIn(rf, 'httpProxy')); put('roboflow', 'socksProxy', grabIn(rf, 'socksProxy')) }
   return cfg
 }
 
@@ -94,7 +91,7 @@ let CFG = {}; let CFG_STRATEGY = 'none'; let CFG_PATCHED = []
 
 function mergeCfg(primary, fallback) {
   let res = {}; try { res = JSON.parse(JSON.stringify(primary || {})) } catch (e) { res = primary || {} }
-  for (const sec of ['minecraft', 'proxy', 'accounts', 'telegram', 'roboflow', 'autostart', 'update']) {
+  for (const sec of ['minecraft', 'proxy', 'accounts', 'telegram', 'autostart', 'update']) {
     const f = fallback && fallback[sec]; if (!f) continue
     if (!res[sec] || typeof res[sec] !== 'object') res[sec] = {}
     for (const k of Object.keys(f)) { if (isEmptyCfgVal(res[sec][k])) { res[sec][k] = f[k]; CFG_PATCHED.push(sec + '.' + k) } }
@@ -131,19 +128,15 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= v3.7.29: ROBLOW SERVERLESS API =========================
-// Правильные настройки по официальной документации Roboflow
+// ========================= v3.7.30: ROBLOW — HARDCODED ЗНАЧЕНИЯ =========================
+// Эти значения НЕ читаются из config.json — всегда используются правильные
 const ROBOFLOW = {
-  enabled: cfgGet(CFG, 'roboflow.enabled', true),
-  apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
-  // v3.7.29: ПРАВИЛЬНЫЙ model_id с workspace
-  modelId: cfgGet(CFG, 'roboflow.modelId', 's-workspace-juqs3/captcha-funtime-vn60f/2'),
-  // v3.7.29: serverless.roboflow.com — ОФИЦИАЛЬНЫЙ endpoint!
-  serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', 'https://serverless.roboflow.com'),
-  confidence: cfgGet(CFG, 'roboflow.confidence', 25),
-  overlap: cfgGet(CFG, 'roboflow.overlap', 20),
-  httpProxy: cfgGet(CFG, 'roboflow.httpProxy', ''),
-  socksProxy: cfgGet(CFG, 'roboflow.socksProxy', '')
+  enabled: true,
+  apiKey: 'kTAPmOyqKcxeBTyi18FD',
+  modelId: 's-workspace-juqs3/captcha-funtime-vn60f/2',
+  serverlessUrl: 'https://serverless.roboflow.com',
+  confidence: 25,
+  overlap: 20
 }
 
 function rfMultipart(buf, filename, boundary) {
@@ -182,7 +175,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.29', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.30', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -243,7 +236,7 @@ async function rotateIp() {
   currentRunIp = await currentIp(); return currentRunIp
 }
 
-// ========================= v3.7.29: ПРАВИЛЬНЫЙ ROBLOW SERVERLESS ЗАПРОС =========================
+// ========================= ROBLOW SERVERLESS HTTP =========================
 function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
   return new Promise(resolve => {
     const mod = useTls ? https : http
@@ -354,7 +347,7 @@ async function rfPost(url, headers, body) {
     if (st === 401 || st === 404) { last._attempts = attemptsLog; return last }
     
     if (st === 403 && String(r.body || '').includes('Cloudflare')) {
-      step('[RF] ⚠️ Cloudflare блокирует via=' + tr + ', пробую следующий...')
+      step('[RF] ⚠️ Cloudflare блокирует via=' + tr)
       await sleep(1500)
       continue
     }
@@ -418,9 +411,9 @@ function rfMetrics(preds) {
   return { n, avg: Math.round(avg * 1000) / 1000, row, plausible, strong, score, text: digits.map(d => d.digit).join(''), digits }
 }
 
-// v3.7.29: ПРАВИЛЬНАЯ отправка — Authorization: Bearer в header!
+// v3.7.30: ПРАВИЛЬНАЯ отправка — Authorization: Bearer в header!
 async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
-  if (!ROBOFLOW || ROBOFLOW.enabled === false || !ROBOFLOW.apiKey) {
+  if (!ROBOFLOW.enabled || !ROBOFLOW.apiKey) {
     return { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
   }
   
@@ -430,36 +423,32 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
   const conf = encodeURIComponent(ROBOFLOW.confidence || 25)
   const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
   
-  // v3.7.29: ПРАВИЛЬНЫЙ URL — serverless.roboflow.com + model_id в path
-  // https://serverless.roboflow.com/{workspace}/{project}/{version}?confidence=...&overlap=...
+  // ПРАВИЛЬНЫЙ URL: https://serverless.roboflow.com/{workspace}/{project}/{version}?...
   const inferUrl = serverlessBase + '/' + modelId + '?confidence=' + conf + '&overlap=' + ov
-  const safeUrl = inferUrl
   
-  step('[RF] 🎯 Официальный Serverless API')
-  step('[RF] URL: ' + safeUrl)
+  step('[RF] 🎯 Serverless API (HARDCODED)')
+  step('[RF] URL: ' + inferUrl)
   step('[RF] Auth: Authorization: Bearer ' + key.slice(0, 6) + '...' + key.slice(-4))
   
   const boundary = '----WebKitFormBoundary' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
   const mp = rfMultipart(pngBuffer, filename, boundary)
   
   const attempts = [
-    // v3.7.29: multipart/form-data + Authorization: Bearer
     { 
       name: 'serverless_multipart', 
       url: inferUrl, 
       headers: { 
         'Content-Type': 'multipart/form-data; boundary=' + boundary,
-        'Authorization': 'Bearer ' + key  // КРИТИЧЕСКИ ВАЖНО!
+        'Authorization': 'Bearer ' + key
       }, 
       body: mp 
     },
-    // v3.7.29: raw PNG + Authorization: Bearer
     { 
       name: 'serverless_raw', 
       url: inferUrl, 
       headers: { 
         'Content-Type': 'image/png',
-        'Authorization': 'Bearer ' + key  // КРИТИЧЕСКИ ВАЖНО!
+        'Authorization': 'Bearer ' + key
       }, 
       body: pngBuffer 
     }
@@ -473,19 +462,18 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
     
     if (r.status === 401) {
       step('[RF] ❌ 401 — НЕВЕРНЫЙ API-КЛЮЧ!')
-      step('[RF] Проверьте roboflow.apiKey в config.json')
       return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY' }
     }
     if (r.status === 403) {
       if (String(r.body || '').includes('Cloudflare')) {
-        step('[RF] ❌ Cloudflare блокирует запрос')
+        step('[RF] ❌ Cloudflare блокирует')
       } else {
-        step('[RF] ❌ 403 — нет доступа к модели ' + modelId)
+        step('[RF] ❌ 403 — нет доступа к модели')
       }
       return { ok: false, status: 403, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'ACCESS DENIED', raw: r.body }
     }
     if (r.status === 404) {
-      step('[RF] ❌ 404 — модель ' + modelId + ' не найдена на serverless.roboflow.com')
+      step('[RF] ❌ 404 — модель ' + modelId + ' не найдена')
       return { ok: false, status: 404, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'MODEL NOT FOUND' }
     }
     
@@ -507,14 +495,14 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
       try {
         fs.mkdirSync(debugDir, { recursive: true })
         fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'), 
-          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + safeUrl + 
-          '\nHEADERS: Authorization: Bearer ***\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
+          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + inferUrl + 
+          '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
       } catch (e) {}
     }
     
     if (label && typeof step === 'function') {
       step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') + 
-        (ok ? ' ✓ ЦИФР: ' + metrics.n + ' row=' + metrics.row + ' text="' + metrics.text + '"' 
+        (ok ? ' ✓ ЦИФР: ' + metrics.n + ' text="' + metrics.text + '"' 
             : ' ' + bodyPreview.slice(0, 140)))
     }
     
@@ -793,14 +781,16 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.29 — ПРАВИЛЬНЫЙ ROBLOW SERVERLESS === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.30 — HARDCODED ROBLOW === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
-  step('roboflow.serverlessUrl=' + ROBOFLOW.serverlessUrl)
-  step('roboflow.modelId=' + ROBOFLOW.modelId)
-  step('roboflow.apiKey=' + (ROBOFLOW.apiKey ? ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4) : '(НЕ ЗАДАН!)'))
-  step('Auth: Authorization: Bearer (в header, НЕ в URL!)')
-  step('LOGIN_TIMEOUT=' + LOGIN_TIMEOUT_MS + 'мс')
+  step('ROBOFLOW (HARDCODED):')
+  step('  serverlessUrl = ' + ROBOFLOW.serverlessUrl)
+  step('  modelId       = ' + ROBOFLOW.modelId)
+  step('  apiKey        = ' + ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4))
+  step('  confidence    = ' + ROBOFLOW.confidence)
+  step('  overlap       = ' + ROBOFLOW.overlap)
+  step('Auth: Authorization: Bearer (в header, НЕ в URL)')
   
   await killPort9001()
 
