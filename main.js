@@ -1,6 +1,6 @@
-// VERSION: 3.7.25
+// VERSION: 3.7.26
 // main.js
-// v3.7.25: правильный запуск обученной модели + fallback на inference_sdk
+// v3.7.26: прямой запрос к detect.roboflow.com (без локального inference!)
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -23,10 +23,7 @@ const LOGIN_TIMEOUT_MS = 15000
 const MAX_ROTATIONS_ON_FAIL = 4
 const VIEW_SIGN = 1
 
-const LOCAL_RF_TIMEOUT_MS = 30000
-const CLOUD_RF_TIMEOUT_MS = 20000
-const RF_PORT = 9001
-const RF_URL = 'http://localhost:' + RF_PORT
+const CLOUD_RF_TIMEOUT_MS = 30000
 
 const CREATE_NO_WINDOW = 0x08000000
 
@@ -134,61 +131,31 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= INFERENCE SERVER (v3.7.25) =========================
-let localhostAlive = false
-let PY_EXE = ''
-
-function q(s) { s = String(s); return /[\s"]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s }
-
-function winOpts(opts) {
-  const merged = Object.assign({}, opts || {})
-  if (process.platform === 'win32') { merged.windowsHide = true; merged.creationFlags = CREATE_NO_WINDOW }
-  return merged
+// ========================= ROBLOW API (v3.7.26: ПРЯМОЙ ЗАПРОС В ОБЛАКО) =========================
+const ROBOFLOW = {
+  enabled: cfgGet(CFG, 'roboflow.enabled', true),
+  apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
+  modelId: cfgGet(CFG, 'roboflow.modelId', 'captchas-gz2yx/funtimecaptcha/1'),
+  // v3.7.26: ПРЯМО detect.roboflow.com! Никакого localhost!
+  detectUrl: cfgGet(CFG, 'roboflow.detectUrl', 'https://detect.roboflow.com'),
+  serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', 'https://serverless.roboflow.com'),
+  confidence: cfgGet(CFG, 'roboflow.confidence', 25),
+  overlap: cfgGet(CFG, 'roboflow.overlap', 20),
+  httpProxy: cfgGet(CFG, 'roboflow.httpProxy', ''),
+  socksProxy: cfgGet(CFG, 'roboflow.socksProxy', '')
 }
 
-function checkLocalhostHealth() {
-  return new Promise(resolve => {
-    const sock = net.connect({ port: RF_PORT, host: '127.0.0.1', timeout: 2000 }, () => {
-      try { sock.destroy() } catch (e) {}
-      resolve(true)
-    })
-    sock.on('error', () => resolve(false))
-    sock.on('timeout', () => { try { sock.destroy() } catch (e) {}; resolve(false) })
-  })
+function rfMultipart(buf, filename, boundary) {
+  const safe = String(filename || 'captcha.png').replace(/"/g, '')
+  const head = Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' + safe + '"\r\nContent-Type: image/png\r\n\r\n')
+  const tail = Buffer.from('\r\n--' + boundary + '--\r\n')
+  return Buffer.concat([head, buf, tail])
 }
 
-async function testRoboflowEndpoint() {
-  return new Promise(resolve => {
-    const postData = Buffer.from('--test\r\nContent-Disposition: form-data; name="file"; filename="test.png"\r\nContent-Type: image/png\r\n\r\nx\r\n--test--\r\n')
-    const opts = {
-      hostname: '127.0.0.1',
-      port: RF_PORT,
-      path: '/test-workspace/test-model/1?api_key=test',
-      method: 'POST',
-      timeout: 5000,
-      headers: {
-        'Content-Type': 'multipart/form-data; boundary=test',
-        'Content-Length': postData.length
-      }
-    }
-    const req = http.request(opts, res => {
-      let body = ''
-      res.on('data', c => body += c)
-      res.on('end', () => {
-        try { res.resume() } catch (e) {}
-        resolve({ status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 500 && res.statusCode !== 404, body: body.slice(0, 200) })
-      })
-    })
-    req.on('error', e => resolve({ status: 0, ok: false, error: e.message }))
-    req.on('timeout', () => { try { req.destroy() } catch (e) {}; resolve({ status: 0, ok: false, error: 'timeout' }) })
-    req.write(postData)
-    req.end()
-  })
-}
-
-async function killProcessOnPort(port) {
+// v3.7.26: Убиваем мусор на порту 9001 (эмулятор от предыдущих запусков)
+async function killPort9001() {
   try {
-    const out = execSync('netstat -ano | findstr :' + port, winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+    const out = execSync('netstat -ano | findstr :9001', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, creationFlags: CREATE_NO_WINDOW })
     const lines = String(out || '').split('\n').filter(l => l.includes('LISTENING'))
     const pids = new Set()
     for (const line of lines) {
@@ -197,592 +164,11 @@ async function killProcessOnPort(port) {
       if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid)
     }
     for (const pid of pids) {
-      step('[RF] Убиваю старый процесс на порту ' + port + ': PID ' + pid)
-      try { execSync('taskkill /F /PID ' + pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
+      step('[RF] Убиваю мусорный процесс на порту 9001: PID ' + pid)
+      try { execSync('taskkill /F /PID ' + pid, { stdio: 'ignore', windowsHide: true, creationFlags: CREATE_NO_WINDOW }) } catch (e) {}
     }
-    if (pids.size > 0) {
-      await sleep(2000)
-      return true
-    }
+    if (pids.size > 0) await sleep(1000)
   } catch (e) {}
-  return false
-}
-
-function execPy(exe, args, opts) {
-  const line = [exe, ...(args || [])].map(q).join(' ')
-  return execSync(line, winOpts(opts))
-}
-
-function spawnPy(exe, args, opts) {
-  return spawn(exe, [...(args || [])], winOpts(opts))
-}
-
-function findSystemPython312() {
-  step('[RF] Поиск установленного Python 3.10-3.12 в системе...')
-  
-  const localApp = process.env.LOCALAPPDATA || ''
-  const appData = process.env.APPDATA || ''
-  const candidates = [
-    path.join(__dirname, '.python312', 'python.exe'),
-    localApp ? localApp + '\\Programs\\Python\\Python312\\python.exe' : '',
-    localApp ? localApp + '\\Programs\\Python\\Python311\\python.exe' : '',
-    localApp ? localApp + '\\Programs\\Python\\Python310\\python.exe' : '',
-    appData ? appData + '\\Python\\Python312\\python.exe' : '',
-    appData ? appData + '\\Python\\Python311\\python.exe' : '',
-    appData ? appData + '\\Python\\Python310\\python.exe' : '',
-    'C:\\Python312\\python.exe',
-    'C:\\Python311\\python.exe',
-    'C:\\Python310\\python.exe'
-  ].filter(Boolean)
-
-  for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      try {
-        const out = execSync(q(p) + ' --version', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }))
-        const m = String(out || '').match(/Python 3\.(\d+)/)
-        if (m) {
-          const minor = parseInt(m[1])
-          if (minor >= 10 && minor <= 12) {
-            step('[RF] ✓ НАЙДЕН Python 3.' + minor + ': ' + p)
-            return p
-          }
-        }
-      } catch (e) {}
-    }
-  }
-
-  step('[RF] Python 3.10-3.12 не найден в системе')
-  return null
-}
-
-async function downloadFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath)
-    const mod = url.startsWith('https:') ? https : http
-    mod.get(url, response => {
-      if (response.statusCode !== 200) {
-        try { fs.unlinkSync(destPath) } catch (e) {}
-        reject(new Error('HTTP ' + response.statusCode)); return
-      }
-      response.pipe(file)
-      file.on('finish', () => { file.close(); resolve() })
-    }).on('error', e => {
-      try { fs.unlinkSync(destPath) } catch (x) {}
-      reject(e)
-    })
-  })
-}
-
-async function installPython312Embeddable() {
-  step('[RF] Устанавливаю Python 3.12 embeddable...')
-  const targetDir = path.join(__dirname, '.python312')
-  const zipUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-embed-amd64.zip'
-  const zipPath = path.join(__dirname, 'python-3.12.9-embed.zip')
-  const getPipPath = path.join(targetDir, 'get-pip.py')
-  const pthPath = path.join(targetDir, 'python312._pth')
-  const pyExe = path.join(targetDir, 'python.exe')
-
-  try {
-    await downloadFile(zipUrl, zipPath)
-    fs.mkdirSync(targetDir, { recursive: true })
-    const psCmd = 'powershell -NoProfile -NonInteractive -Command "Expand-Archive -Path \'' + zipPath + '\' -DestinationPath \'' + targetDir + '\' -Force"'
-    execSync(psCmd, winOpts({ stdio: 'pipe', timeout: 120000 }))
-    if (fs.existsSync(pthPath)) {
-      let content = fs.readFileSync(pthPath, 'utf8')
-      if (!content.includes('import site')) content += '\nimport site\n'
-      fs.writeFileSync(pthPath, content)
-    }
-    await downloadFile('https://bootstrap.pypa.io/get-pip.py', getPipPath)
-    const proc = spawnPy(pyExe, [getPipPath, '--no-warn-script-location'], { stdio: ['ignore', 'pipe', 'pipe'] })
-    await new Promise((resolve) => { proc.on('close', code => resolve(code === 0)) })
-    try { fs.unlinkSync(zipPath) } catch (e) {}
-    try { fs.unlinkSync(getPipPath) } catch (e) {}
-    if (fs.existsSync(pyExe)) return pyExe
-  } catch (e) {}
-  return null
-}
-
-async function ensurePython312() {
-  const systemPy = findSystemPython312()
-  if (systemPy) {
-    step('[RF] ✓✓✓ Используем уже установленный Python: ' + systemPy)
-    return systemPy
-  }
-  const embedded = await installPython312Embeddable()
-  if (embedded) return embedded
-  return null
-}
-
-async function installAllPackages(exe, missing) {
-  if (missing.length === 0) { step('[RF] OK: все пакеты установлены'); return true }
-  step('[RF] Установка: ' + missing.join(', ') + ' (5-10 минут)...')
-  return new Promise(resolve => {
-    const proc = spawnPy(exe, ['-m', 'pip', 'install', '--upgrade', 'pip'], { stdio: ['ignore', 'pipe', 'pipe'] })
-    proc.on('close', () => {
-      const installArgs = ['-m', 'pip', 'install', 'inference', 'inference-sdk', 'uvicorn', 'fastapi', 'python-multipart']
-      const proc2 = spawnPy(exe, installArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
-      proc2.on('close', code => resolve(code === 0))
-      proc2.on('error', () => resolve(false))
-    })
-    proc.on('error', () => resolve(false))
-  })
-}
-
-function checkAllPackages(exe) {
-  const packages = ['inference', 'inference-sdk', 'uvicorn', 'fastapi', 'python-multipart']
-  const missing = []
-  for (const pkg of packages) {
-    try {
-      const r = execPy(exe, ['-m', 'pip', 'show', pkg], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-      const rStr = String(r || '')
-      if (!rStr.includes('Name: ' + pkg) && !rStr.includes('Name: ' + pkg.replace(/_/g, '-'))) missing.push(pkg)
-    } catch (e) { missing.push(pkg) }
-  }
-  return missing
-}
-
-// v3.7.25: Попытка 1 — официальный CLI `python -m inference_cli server start`
-async function tryOfficialCLI(exe) {
-  step('[RF] [1/4] Официальный CLI: `python -m inference_cli server start`...')
-  
-  const env = Object.assign({}, process.env, {
-    PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',
-    PORT: String(RF_PORT),
-    HOST: '0.0.0.0',
-    ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False',
-    MODEL_MANAGER: 'local',
-    DISABLE_VERSION_CHECK: 'True'
-  })
-
-  let proc = null
-  let exited = false
-  let exitCode = null
-  let stderrOutput = ''
-  
-  try {
-    proc = spawnPy(exe, ['-m', 'inference_cli', 'server', 'start', '--port', String(RF_PORT), '--host', '0.0.0.0'], {
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: env
-    })
-    
-    proc.stdout.on('data', data => {
-      const line = data.toString().trim()
-      if (line) step('[RF CLI] ' + line.slice(0, 200))
-    })
-    proc.stderr.on('data', data => {
-      const line = data.toString().trim()
-      if (line) {
-        step('[RF CLI] ' + line.slice(0, 200))
-        stderrOutput += line + '\n'
-      }
-    })
-    
-    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); exited = true })
-    proc.on('exit', (code) => { exitCode = code; exited = true })
-    proc.unref()
-    step('[RF] PID: ' + (proc.pid || '?'))
-  } catch (e) {
-    step('[RF] ERROR spawn: ' + e.message)
-    return false
-  }
-
-  const start = Date.now()
-  const timeout = 45000
-  let lastCheck = 0
-
-  while (Date.now() - start < timeout) {
-    await sleep(2000)
-    
-    if (exited) {
-      step('[RF] [1/4] inference_cli завершился с кодом ' + exitCode)
-      if (stderrOutput) step('[RF CLI] stderr: ' + stderrOutput.slice(-500))
-      return false
-    }
-
-    if (await checkLocalhostHealth()) {
-      const test = await testRoboflowEndpoint()
-      step('[RF] Тест POST: status=' + test.status + ' ok=' + test.ok)
-      
-      if (test.ok) {
-        step('[RF] ✓✓✓ Официальный inference_cli готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
-        localhostAlive = true
-        return true
-      }
-    }
-    
-    const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 10) { 
-      step('[RF] Ожидание inference_cli... ' + elapsed + 'с')
-      lastCheck = elapsed 
-    }
-  }
-
-  step('[RF] [1/4] TIMEOUT: inference_cli не поднялся за 45с')
-  if (stderrOutput) step('[RF CLI] stderr: ' + stderrOutput.slice(-500))
-  if (proc && proc.pid) {
-    try { execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
-  }
-  await killProcessOnPort(RF_PORT)
-  return false
-}
-
-// v3.7.25: Попытка 2 — `inference server start` через PATH
-async function tryInferencePath(exe) {
-  step('[RF] [2/4] Попытка `inference server start`...')
-  
-  // Проверяем есть ли inference в PATH
-  try {
-    const whichOut = execSync('where inference 2>nul || echo not_found', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
-    if (whichOut.includes('not_found')) {
-      step('[RF] [2/4] Команда `inference` не найдена в PATH')
-      return false
-    }
-    step('[RF] [2/4] inference найден: ' + whichOut.trim())
-  } catch (e) {
-    step('[RF] [2/4] `where inference` упал: ' + e.message)
-    return false
-  }
-
-  const env = Object.assign({}, process.env, {
-    PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',
-    PORT: String(RF_PORT),
-    HOST: '0.0.0.0',
-    ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False',
-    DISABLE_VERSION_CHECK: 'True'
-  })
-
-  let proc = null
-  let exited = false
-  let exitCode = null
-  
-  try {
-    proc = spawn('inference', ['server', 'start', '--port', String(RF_PORT), '--host', '0.0.0.0'], {
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: env
-    })
-    
-    proc.stdout.on('data', data => {
-      const line = data.toString().trim()
-      if (line) step('[RF INF] ' + line.slice(0, 200))
-    })
-    proc.stderr.on('data', data => {
-      const line = data.toString().trim()
-      if (line) step('[RF INF] ' + line.slice(0, 200))
-    })
-    
-    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); exited = true })
-    proc.on('exit', (code) => { exitCode = code; exited = true })
-    proc.unref()
-    step('[RF] PID: ' + (proc.pid || '?'))
-  } catch (e) {
-    step('[RF] ERROR spawn: ' + e.message)
-    return false
-  }
-
-  const start = Date.now()
-  const timeout = 45000
-  let lastCheck = 0
-
-  while (Date.now() - start < timeout) {
-    await sleep(2000)
-    
-    if (exited) {
-      step('[RF] [2/4] inference завершился с кодом ' + exitCode)
-      return false
-    }
-
-    if (await checkLocalhostHealth()) {
-      const test = await testRoboflowEndpoint()
-      if (test.ok) {
-        step('[RF] ✓✓✓ `inference server start` готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
-        localhostAlive = true
-        return true
-      }
-    }
-    
-    const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 10) { 
-      step('[RF] Ожидание inference... ' + elapsed + 'с')
-      lastCheck = elapsed 
-    }
-  }
-
-  if (proc && proc.pid) {
-    try { execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
-  }
-  await killProcessOnPort(RF_PORT)
-  return false
-}
-
-// v3.7.25: Попытка 3 — HttpInterface с правильной инициализацией
-async function tryHttpInterface(exe) {
-  step('[RF] [3/4] HttpInterface с ModelManager...')
-  
-  const scriptPath = path.join(__dirname, '.http_interface.py')
-  const logPath = path.join(__dirname, '.http_interface.log')
-  try { fs.unlinkSync(logPath) } catch (e) {}
-
-  // v3.7.25: пробуем разные способы инициализации
-  const pythonScript = `
-import sys, os, traceback
-
-LOG_PATH = r'''${logPath}'''
-PORT = ${RF_PORT}
-
-class FileLogger:
-    def __init__(self, p):
-        self.f = open(p, 'a', encoding='utf-8', errors='replace')
-        self.encoding = 'utf-8'
-        self.errors = 'replace'
-    def write(self, msg):
-        try: self.f.write(str(msg)); self.f.flush()
-        except: pass
-    def flush(self):
-        try: self.f.flush()
-        except: pass
-    def isatty(self): return False
-    def fileno(self):
-        try: return self.f.fileno()
-        except: return -1
-    def readable(self): return False
-    def writable(self): return True
-    def seekable(self): return False
-    @property
-    def closed(self): return self.f.closed
-
-logger = FileLogger(LOG_PATH)
-sys.stdout = logger
-sys.stderr = logger
-os.environ['PYTHONIOENCODING'] = 'utf-8'
-os.environ['PYTHONUTF8'] = '1'
-os.environ['ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS'] = 'False'
-
-def log(msg):
-    print('[RF HI] ' + str(msg), flush=True)
-
-log('=== HttpInterface STARTED ===')
-log('Python: ' + sys.executable)
-log('Port: ' + str(PORT))
-
-app = None
-method = ''
-
-# Способ 1: ModelManager() без аргументов
-try:
-    log('Trying: ModelManager() + HttpInterface(mm)...')
-    from inference.core.managers.base import ModelManager
-    from inference.core.interfaces.http.http_api import HttpInterface
-    mm = ModelManager()
-    interface = HttpInterface(model_manager=mm)
-    app = interface.app
-    method = 'HttpInterface(mm)'
-    log('OK: ' + method)
-except Exception as e:
-    log('FAIL 1: ' + str(e))
-    
-    # Способ 2: HttpInterface(mm) позиционный
-    try:
-        log('Trying: HttpInterface(mm) positional...')
-        from inference.core.managers.base import ModelManager
-        from inference.core.interfaces.http.http_api import HttpInterface
-        mm = ModelManager()
-        interface = HttpInterface(mm)
-        app = interface.app
-        method = 'HttpInterface(mm) positional'
-        log('OK: ' + method)
-    except Exception as e:
-        log('FAIL 2: ' + str(e))
-        
-        # Способ 3: inference.app напрямую
-        try:
-            log('Trying: from inference import app...')
-            from inference import app as inf_app
-            app = inf_app
-            method = 'inference.app'
-            log('OK: ' + method)
-        except Exception as e:
-            log('FAIL 3: ' + str(e))
-            
-            # Способ 4: inference.core.interfaces.http.app
-            try:
-                log('Trying: from inference.core.interfaces.http import app...')
-                from inference.core.interfaces.http import app as http_app
-                app = http_app
-                method = 'inference.core.interfaces.http.app'
-                log('OK: ' + method)
-            except Exception as e:
-                log('FAIL 4: ' + str(e))
-                log('ALL METHODS FAILED — будет использован inference_sdk fallback')
-                sys.exit(2)
-
-try:
-    import uvicorn
-    log('Starting uvicorn on 0.0.0.0:' + str(PORT) + '...')
-    uvicorn.run(app, host='0.0.0.0', port=PORT, log_level='warning', access_log=False, log_config=None)
-except Exception as e:
-    log('FATAL uvicorn: ' + str(e))
-    traceback.print_exc()
-    sys.exit(1)
-`.trim()
-
-  fs.writeFileSync(scriptPath, pythonScript, 'utf8')
-
-  let proc = null
-  let exited = false
-  let exitCode = null
-  
-  try {
-    proc = spawnPy(exe, [scriptPath], {
-      detached: true,
-      stdio: 'ignore',
-      env: Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
-    })
-    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); exited = true })
-    proc.on('exit', (code) => { exitCode = code; exited = true })
-    proc.unref()
-    step('[RF] PID: ' + (proc.pid || '?'))
-  } catch (e) {
-    step('[RF] ERROR spawn: ' + e.message)
-    return false
-  }
-
-  let lastLogLen = 0
-  const readLog = () => {
-    try {
-      if (!fs.existsSync(logPath)) return false
-      const content = fs.readFileSync(logPath, 'utf8')
-      if (content.length > lastLogLen) {
-        const newPart = content.slice(lastLogLen)
-        lastLogLen = content.length
-        for (const line of newPart.split('\n').filter(l => l.trim())) step(line)
-        return true
-      }
-      return lastLogLen > 0
-    } catch (e) { return false }
-  }
-
-  const start = Date.now()
-  const timeout = 60000
-  let lastCheck = 0
-
-  while (Date.now() - start < timeout) {
-    await sleep(2000)
-    readLog()
-    
-    if (exited) {
-      step('[RF] [3/4] HttpInterface завершился с кодом ' + exitCode)
-      readLog()
-      if (exitCode === 2) {
-        step('[RF] [3/4] HttpInterface не работает — нужен fallback')
-      }
-      return false
-    }
-
-    if (await checkLocalhostHealth()) {
-      const test = await testRoboflowEndpoint()
-      step('[RF] Тест POST: status=' + test.status + ' ok=' + test.ok)
-      
-      if (test.ok) {
-        readLog()
-        step('[RF] ✓✓✓ HttpInterface готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
-        localhostAlive = true
-        return true
-      }
-    }
-    
-    const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 10) { 
-      step('[RF] Ожидание HttpInterface... ' + elapsed + 'с')
-      lastCheck = elapsed 
-    }
-  }
-
-  if (proc && proc.pid) {
-    try { execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
-  }
-  await killProcessOnPort(RF_PORT)
-  return false
-}
-
-// v3.7.25: Переключаемся на inference_sdk (прямой запрос к Roboflow)
-async function switchToInferenceSDK() {
-  step('[RF] [4/4] ПЕРЕКЛЮЧАЕМСЯ на inference_sdk (прямой запрос к detect.roboflow.com)')
-  step('[RF] [4/4] Настоящая обученная модель будет использоваться, но через интернет')
-  
-  // Меняем detectUrl на облачный Roboflow
-  ROBOFLOW.detectUrl = 'https://detect.roboflow.com'
-  ROBOFLOW.serverlessUrl = 'https://serverless.roboflow.com'
-  localhostAlive = false
-  
-  step('[RF] ✓✓✓ Новый detectUrl: ' + ROBOFLOW.detectUrl)
-  step('[RF] ✓✓✓ Новый serverlessUrl: ' + ROBOFLOW.serverlessUrl)
-  step('[RF] ✓✓✓ Будет использоваться inference_sdk → настоящая обученная модель!')
-  return true
-}
-
-async function startInferenceServer(exe) {
-  step('[RF] === ЗАПУСК НАСТОЯЩЕЙ ОБУЧЕННОЙ МОДЕЛИ ===')
-  step('[RF] Порт: ' + RF_PORT)
-  step('[RF] Python: ' + exe)
-  
-  await killProcessOnPort(RF_PORT)
-
-  // Попытка 1: официальный CLI
-  if (await tryOfficialCLI(exe)) return true
-
-  // Попытка 2: inference через PATH
-  if (await tryInferencePath(exe)) return true
-
-  // Попытка 3: HttpInterface с правильной инициализацией
-  if (await tryHttpInterface(exe)) return true
-
-  // Попытка 4: fallback на inference_sdk (прямой запрос к Roboflow)
-  return await switchToInferenceSDK()
-}
-
-async function ensureInferenceServer() {
-  const isListening = await checkLocalhostHealth()
-  
-  if (isListening) {
-    step('[RF] Порт ' + RF_PORT + ' слушает, проверяем endpoint...')
-    const test = await testRoboflowEndpoint()
-    step('[RF] Тестовый POST: status=' + test.status + ' ok=' + test.ok)
-    
-    if (test.ok) {
-      step('[RF] ✓✓✓ Локальный сервер работает')
-      localhostAlive = true
-      return true
-    } else {
-      step('[RF] [WARN] Локальный сервер даёт status=' + test.status + ' — ПЕРЕЗАПУСКАЕМ')
-      await killProcessOnPort(RF_PORT)
-      await sleep(2000)
-    }
-  }
-
-  PY_EXE = await ensurePython312()
-  if (!PY_EXE) {
-    step('[RF] ERROR: не удалось получить Python')
-    step('[RF] Переключаюсь на inference_sdk (без локального сервера)')
-    return await switchToInferenceSDK()
-  }
-  step('[RF] ✓ Python: ' + PY_EXE)
-
-  const missing = checkAllPackages(PY_EXE)
-  if (missing.length > 0) {
-    step('[RF] Отсутствуют: ' + missing.join(', '))
-    if (!(await installAllPackages(PY_EXE, missing))) {
-      step('[RF] ERROR: пакеты не установлены')
-      return await switchToInferenceSDK()
-    }
-  } else {
-    step('[RF] OK: все пакеты установлены')
-  }
-
-  return await startInferenceServer(PY_EXE)
 }
 
 // ========================= HTTP / IP =========================
@@ -796,7 +182,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.25', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.26', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -857,93 +243,12 @@ async function rotateIp() {
   currentRunIp = await currentIp(); return currentRunIp
 }
 
-// ========================= ROBLOW API =========================
-const ROBOFLOW = {
-  enabled: cfgGet(CFG, 'roboflow.enabled', true),
-  apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
-  modelId: cfgGet(CFG, 'roboflow.modelId', 'captchas-gz2yx/funtimecaptcha/1'),
-  detectUrl: cfgGet(CFG, 'roboflow.detectUrl', RF_URL),
-  serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', RF_URL),
-  confidence: cfgGet(CFG, 'roboflow.confidence', 25),
-  overlap: cfgGet(CFG, 'roboflow.overlap', 20),
-  httpProxy: cfgGet(CFG, 'roboflow.httpProxy', ''),
-  socksProxy: cfgGet(CFG, 'roboflow.socksProxy', '')
-}
-
-function rfMultipart(buf, filename, boundary) {
-  const safe = String(filename || 'captcha.png').replace(/"/g, '')
-  const head = Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' + safe + '"\r\nContent-Type: image/png\r\n\r\n')
-  const tail = Buffer.from('\r\n--' + boundary + '--\r\n')
-  return Buffer.concat([head, buf, tail])
-}
-
-function socksConnectSocket(host, port, useTls) {
-  return new Promise((resolve, reject) => {
-    if (!PROXY.host) { reject(new Error('proxy.host пуст')); return }
-    let settled = false
-    const connTimeout = setTimeout(() => { if (settled) return; settled = true; reject(new Error('SOCKS timeout 30s')) }, 30000)
-    SocksClient.createConnection({ proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password }, command: 'connect', destination: { host, port } })
-      .then(conn => {
-        if (settled) { try { conn.socket.destroy() } catch (e) {}; return }
-        if (!useTls) { settled = true; clearTimeout(connTimeout); resolve({ socket: conn.socket, cleanup() { try { conn.socket.destroy() } catch (e) {} } }); return }
-        let secure = null
-        const fail = e => { if (settled) return; settled = true; clearTimeout(connTimeout); try { conn.socket.destroy() } catch (x) {}; if (secure) try { secure.destroy() } catch (x) {}; reject(e) }
-        try { secure = tls.connect({ socket: conn.socket, servername: host, minVersion: 'TLSv1.2' }, () => { if (settled) return; settled = true; clearTimeout(connTimeout); resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {}; try { conn.socket.destroy() } catch (e) {} } }) }) } catch (e) { fail(e); return }
-        secure.on('error', fail); conn.socket.on('error', fail)
-      }).catch(e => { if (settled) return; settled = true; clearTimeout(connTimeout); reject(e) })
-  })
-}
-
-function parseSocksUrl(urlStr) { const m = String(urlStr).match(/^socks5[h]?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/?$/i); if (!m) throw new Error('bad socks url'); return { host: m[3], port: Number(m[4]), username: decodeURIComponent(m[1]), password: decodeURIComponent(m[2]) } }
-
-function rfSocksConnect(socksUrl, targetHost, targetPort, useTls) {
-  return new Promise((resolve, reject) => {
-    let parsed; try { parsed = parseSocksUrl(socksUrl) } catch (e) { reject(e); return }
-    let settled = false
-    const t = setTimeout(() => { if (settled) return; settled = true; reject(new Error('rf socks timeout 30s')) }, 30000)
-    SocksClient.createConnection({ proxy: { host: parsed.host, port: parsed.port, type: 5, userId: parsed.username, password: parsed.password }, command: 'connect', destination: { host: targetHost, port: targetPort } })
-      .then(conn => {
-        if (settled) { try { conn.socket.destroy() } catch (e) {}; return }
-        if (!useTls) { settled = true; clearTimeout(t); resolve({ socket: conn.socket, cleanup() { try { conn.socket.destroy() } catch (e) {} } }); return }
-        let secure = null
-        const fail = e => { if (settled) return; settled = true; clearTimeout(t); try { conn.socket.destroy() } catch (x) {}; if (secure) try { secure.destroy() } catch (x) {}; reject(e) }
-        try { secure = tls.connect({ socket: conn.socket, servername: targetHost, minVersion: 'TLSv1.2' }, () => { if (settled) return; settled = true; clearTimeout(t); resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {}; try { conn.socket.destroy() } catch (e) {} } }) }) } catch (e) { fail(e); return }
-        secure.on('error', fail); conn.socket.on('error', fail)
-      }).catch(e => { if (settled) return; settled = true; clearTimeout(t); reject(e) })
-  })
-}
-
-function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
-  return new Promise((resolve, reject) => {
-    let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
-    const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
-    const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.25\r\n\r\n'
-    const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
-    const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
-    let data = ''
-    socket.on('data', chunk => {
-      if (settled) return; data += chunk.toString()
-      const headerEnd = data.indexOf('\r\n\r\n')
-      if (headerEnd >= 0) {
-        const statusLine = data.slice(0, data.indexOf('\r\n')); const statusMatch = statusLine.match(/HTTP\/1\.[01]\s+(\d+)/); const statusCode = statusMatch ? Number(statusMatch[1]) : 0
-        if (statusCode === 200) {
-          settled = true; clearTimeout(t)
-          if (useTls) { const secure = tls.connect({ socket: socket, servername: targetHost, minVersion: 'TLSv1.2' }, () => { resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {}; try { socket.destroy() } catch (e) {} } }) }); secure.on('error', e => { if (settled) return; settled = true; clearTimeout(t); try { socket.destroy() } catch (x) {}; reject(e) }) }
-          else resolve({ socket: socket, cleanup() { try { socket.destroy() } catch (e) {} } })
-        } else { settled = true; clearTimeout(t); try { socket.destroy() } catch (e) {}; reject(new Error('http proxy rejected: ' + statusLine)) }
-      }
-    })
-    socket.on('error', e => { if (settled) return; settled = true; clearTimeout(t); reject(e) })
-    socket.on('connect', () => { socket.write(connectReq) })
-  })
-}
-
+// ========================= ROBLOW: ПРЯМОЙ HTTP ЗАПРОС К detect.roboflow.com =========================
 function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.25', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.26', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -955,89 +260,221 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   })
 }
 
-async function rfPostOnce(transport, url, headers, body, timeoutMs) {
-  let u = null; try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL: ' + ((e && e.message) || e), via: transport } }
-  const useTls = u.protocol === 'https:'; const port = Number(u.port || (useTls ? 443 : 80)); const reqPath = u.pathname + u.search; const hostname = u.hostname
-  if (transport === 'direct') { const r = await rawRequestOnSocket(useTls, null, hostname, port, 'POST', reqPath, headers, body, timeoutMs); r.via = 'direct'; return r }
-  if (transport === 'http_proxy') { let sk = null; try { sk = await httpProxyConnect(ROBOFLOW.httpProxy, hostname, port, useTls) } catch (e) { return { status: 0, body: 'HTTP PROXY ERR: ' + (((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || e)), via: 'http_proxy' } }; try { const r = await rawRequestOnSocket(useTls, sk.socket, hostname, port, 'POST', reqPath, headers, body, timeoutMs); r.via = 'http_proxy'; return r } finally { try { sk.cleanup() } catch (e) {} } }
-  if (transport === 'rf_socks') { let sk = null; try { sk = await rfSocksConnect(ROBOFLOW.socksProxy, hostname, port, useTls) } catch (e) { return { status: 0, body: 'RF SOCKS ERR: ' + (((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || e)), via: 'rf_socks' } }; try { const r = await rawRequestOnSocket(useTls, sk.socket, hostname, port, 'POST', reqPath, headers, body, timeoutMs); r.via = 'rf_socks'; return r } finally { try { sk.cleanup() } catch (e) {} } }
-  let sk = null; try { sk = await socksConnectSocket(hostname, port, useTls) } catch (e) { return { status: 0, body: 'SOCKS ERR: ' + (((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || e)), via: 'socks' } }
-  try { const r = await rawRequestOnSocket(useTls, sk.socket, hostname, port, 'POST', reqPath, headers, body, timeoutMs); r.via = 'socks'; return r } finally { try { sk.cleanup() } catch (e) {} }
+function socksConnectSocket(host, port, useTls, proxyHost, proxyPort, proxyUser, proxyPass) {
+  return new Promise((resolve, reject) => {
+    if (!proxyHost) { reject(new Error('proxy host пуст')); return }
+    let settled = false
+    const connTimeout = setTimeout(() => { if (settled) return; settled = true; reject(new Error('SOCKS timeout 30s')) }, 30000)
+    SocksClient.createConnection({ proxy: { host: proxyHost, port: proxyPort, type: 5, userId: proxyUser, password: proxyPass }, command: 'connect', destination: { host, port } })
+      .then(conn => {
+        if (settled) { try { conn.socket.destroy() } catch (e) {}; return }
+        if (!useTls) { settled = true; clearTimeout(connTimeout); resolve({ socket: conn.socket, cleanup() { try { conn.socket.destroy() } catch (e) {} } }); return }
+        let secure = null
+        const fail = e => { if (settled) return; settled = true; clearTimeout(connTimeout); try { conn.socket.destroy() } catch (x) {}; if (secure) try { secure.destroy() } catch (x) {}; reject(e) }
+        try { secure = tls.connect({ socket: conn.socket, servername: host, minVersion: 'TLSv1.2' }, () => { if (settled) return; settled = true; clearTimeout(connTimeout); resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {}; try { conn.socket.destroy() } catch (e) {} } }) }) } catch (e) { fail(e); return }
+        secure.on('error', fail); conn.socket.on('error', fail)
+      }).catch(e => { if (settled) return; settled = true; clearTimeout(connTimeout); reject(e) })
+  })
 }
 
-function isLocalhost(hostname) { return /^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)$/i.test(hostname) }
+// v3.7.26: Прямой запрос к detect.roboflow.com через SOCKS прокси (или напрямую)
+async function rfPostOnce(transport, url, headers, body, timeoutMs) {
+  let u = null; try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL: ' + ((e && e.message) || e), via: transport } }
+  const useTls = u.protocol === 'https:'
+  const port = Number(u.port || (useTls ? 443 : 80))
+  const reqPath = u.pathname + u.search
+  const hostname = u.hostname
+  
+  if (transport === 'direct') {
+    const r = await rawRequestOnSocket(useTls, null, hostname, port, 'POST', reqPath, headers, body, timeoutMs)
+    r.via = 'direct'
+    return r
+  }
+  
+  // Через SOCKS прокси
+  let sk = null
+  try {
+    sk = await socksConnectSocket(hostname, port, useTls, PROXY.host, PROXY.port, PROXY.username, PROXY.password)
+  } catch (e) {
+    return { status: 0, body: 'SOCKS ERR: ' + (((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || e)), via: 'socks' }
+  }
+  try {
+    const r = await rawRequestOnSocket(useTls, sk.socket, hostname, port, 'POST', reqPath, headers, body, timeoutMs)
+    r.via = 'socks'
+    return r
+  } finally {
+    try { sk.cleanup() } catch (e) {}
+  }
+}
 
+// v3.7.26: умная отправка с fallback'ом и детальным логированием
 async function rfPost(url, headers, body) {
   let u; try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL', via: 'none' } }
-  const isLocal = isLocalhost(u.hostname); const timeoutMs = isLocal ? LOCAL_RF_TIMEOUT_MS : CLOUD_RF_TIMEOUT_MS
+  const timeoutMs = CLOUD_RF_TIMEOUT_MS
+  
+  // v3.7.26: пробуем сначала напрямую, потом через SOCKS
   const transports = []
-  if (isLocal) transports.push('direct')
-  else { if (ROBOFLOW.socksProxy) transports.push('rf_socks'); if (ROBOFLOW.httpProxy) transports.push('http_proxy'); if (PROXY.host) transports.push('socks'); transports.push('direct') }
-  const attemptsLog = []; const badTransports = new Set(); let last = null
-  for (let pass = 0; pass < (isLocal ? 1 : 2); pass++) {
-    for (const tr of transports) {
-      if (badTransports.has(tr)) continue; if (pass > 0) await sleep(1000)
-      const r = await rfPostOnce(tr, url, headers, body, timeoutMs)
-      attemptsLog.push(tr + ':' + r.status + ':' + String(r.body || '').slice(0, 40).replace(/\s+/g, ' ')); last = r
-      const st = Number(r.status || 0)
-      if (st >= 200 && st < 400) { last._attempts = attemptsLog; return last }
-      if (st === 401 || st === 403 || st === 404) { last._attempts = attemptsLog; return last }
-      const bodyStr = String(r.body || '')
-      if (bodyStr.includes('rejected') || bodyStr.includes('PROXY CONNECT ERR') || bodyStr.includes('Connection refused') || bodyStr.includes('ECONNREFUSED')) {
-        badTransports.add(tr)
-        if (isLocal && tr === 'direct') { localhostAlive = false; break }
-      }
+  if (PROXY.host) transports.push('socks')
+  transports.push('direct')
+  
+  const attemptsLog = []; let last = null
+  for (const tr of transports) {
+    const r = await rfPostOnce(tr, url, headers, body, timeoutMs)
+    attemptsLog.push(tr + ':' + r.status)
+    last = r
+    const st = Number(r.status || 0)
+    if (st >= 200 && st < 400) { last._attempts = attemptsLog; return last }
+    if (st === 401 || st === 403 || st === 404) { 
+      last._attempts = attemptsLog
+      return last 
     }
-    if (isLocal && !localhostAlive) break
+    await sleep(500)
   }
   if (last) last._attempts = attemptsLog
   return last || { status: 0, body: 'no transport', via: 'none' }
 }
 
-function rfGetPredictions(json) { if (!json) return []; if (Array.isArray(json.predictions)) return json.predictions; if (Array.isArray(json.results)) return json.results; if (json.prediction && Array.isArray(json.prediction.predictions)) return json.prediction.predictions; if (json.object && Array.isArray(json.object.predictions)) return json.object.predictions; return [] }
-function rfDigitFromPrediction(p) { const s = String(p.class || p.class_name || p.label || p.name || ''); const m = s.match(/\d/); return m ? m[0] : null }
+function rfGetPredictions(json) { 
+  if (!json) return []
+  if (Array.isArray(json.predictions)) return json.predictions
+  if (Array.isArray(json.results)) return json.results
+  if (json.prediction && Array.isArray(json.prediction.predictions)) return json.prediction.predictions
+  if (json.object && Array.isArray(json.object.predictions)) return json.object.predictions
+  return [] 
+}
+function rfDigitFromPrediction(p) { 
+  const s = String(p.class || p.class_name || p.label || p.name || '')
+  const m = s.match(/\d/)
+  return m ? m[0] : null 
+}
 function rfNormConf(c) { c = Number(c || 0); if (c > 1) c = c / 100; return c }
 
 function rfMetrics(preds) {
   const digits = []
-  for (const p of preds) { const d = rfDigitFromPrediction(p); const conf = rfNormConf(p.confidence != null ? p.confidence : p.score); if (d !== null && conf >= 0.15) digits.push({ digit: d, conf, x: Number(p.x || 0), y: Number(p.y || 0), w: Number(p.width || p.w || 0), h: Number(p.height || p.h || 0) }) }
-  digits.sort((a, b) => a.x - b.x); const n = digits.length; const avg = n ? digits.reduce((a, d) => a + d.conf, 0) / n : 0
+  for (const p of preds) { 
+    const d = rfDigitFromPrediction(p)
+    const conf = rfNormConf(p.confidence != null ? p.confidence : p.score)
+    if (d !== null && conf >= 0.15) digits.push({ digit: d, conf, x: Number(p.x || 0), y: Number(p.y || 0), w: Number(p.width || p.w || 0), h: Number(p.height || p.h || 0) }) 
+  }
+  digits.sort((a, b) => a.x - b.x)
+  const n = digits.length
+  const avg = n ? digits.reduce((a, d) => a + d.conf, 0) / n : 0
   let row = 0
   if (n > 0) {
-    const hs = digits.map(d => d.h).filter(x => x > 0).sort((a, b) => a - b); const medH = hs.length ? hs[Math.floor(hs.length / 2)] : 40; const band = Math.max(25, medH * 0.8)
+    const hs = digits.map(d => d.h).filter(x => x > 0).sort((a, b) => a - b)
+    const medH = hs.length ? hs[Math.floor(hs.length / 2)] : 40
+    const band = Math.max(25, medH * 0.8)
     const sorted = digits.slice().sort((a, b) => a.y - b.y)
-    for (let i = 0; i < sorted.length; i++) { const group = [sorted[i]]; for (let j = i + 1; j < sorted.length; j++) { if (Math.abs(sorted[j].y - sorted[i].y) <= band) group.push(sorted[j]); else break }; group.sort((a, b) => a.x - b.x); let cnt = 0, lastRight = -1e9; for (const d of group) { const left = d.x - d.w / 2, right = d.x + d.w / 2; if (left >= lastRight - Math.max(3, d.w * 0.15)) { cnt++; lastRight = right } }; if (cnt > row) row = cnt }
+    for (let i = 0; i < sorted.length; i++) { 
+      const group = [sorted[i]]
+      for (let j = i + 1; j < sorted.length; j++) { 
+        if (Math.abs(sorted[j].y - sorted[i].y) <= band) group.push(sorted[j])
+        else break 
+      }
+      group.sort((a, b) => a.x - b.x)
+      let cnt = 0, lastRight = -1e9
+      for (const d of group) { 
+        const left = d.x - d.w / 2, right = d.x + d.w / 2
+        if (left >= lastRight - Math.max(3, d.w * 0.15)) { cnt++; lastRight = right } 
+      }
+      if (cnt > row) row = cnt 
+    }
   }
-  const plausible = n >= 3 && n <= 8; const strong = avg >= 0.35; const score = (plausible ? 10000 : 0) + (strong ? 3000 : 0) + n * 1000 + row * 700 + Math.round(avg * 1000)
+  const plausible = n >= 3 && n <= 8
+  const strong = avg >= 0.35
+  const score = (plausible ? 10000 : 0) + (strong ? 3000 : 0) + n * 1000 + row * 700 + Math.round(avg * 1000)
   return { n, avg: Math.round(avg * 1000) / 1000, row, plausible, strong, score, text: digits.map(d => d.digit).join(''), digits }
 }
 
+// v3.7.26: отправка с детальным логированием
 async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
-  if (!ROBOFLOW || ROBOFLOW.enabled === false || !ROBOFLOW.apiKey) return { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
-  if (!localhostAlive && isLocalhost(String(ROBOFLOW.detectUrl).replace(/^https?:\/\//, '').split(/[:\/]/)[0])) return { ok: false, status: 0, attempt: 'localhost_dead', predictions: [], metrics: rfMetrics([]), error: 'localhost' }
-  const key = String(ROBOFLOW.apiKey); const model = String(ROBOFLOW.modelId || 'captchas-gz2yx/funtimecaptcha/1').replace(/^\/+|\/+$/g, '')
-  const detectBase = String(ROBOFLOW.detectUrl || RF_URL).replace(/\/+$/, ''); const serverlessBase = String(ROBOFLOW.serverlessUrl || RF_URL).replace(/\/+$/, '')
-  const conf = encodeURIComponent(ROBOFLOW.confidence || 25); const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
-  const boundary = '----MCBotRF' + Date.now() + Math.floor(Math.random() * 1000000); const mp = rfMultipart(pngBuffer, filename, boundary)
+  if (!ROBOFLOW || ROBOFLOW.enabled === false || !ROBOFLOW.apiKey) {
+    return { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
+  }
+  
+  const key = String(ROBOFLOW.apiKey)
+  const model = String(ROBOFLOW.modelId || 'funtimecapth/captcha-funtime/1').replace(/^\/+|\/+$/g, '')
+  const detectBase = String(ROBOFLOW.detectUrl || 'https://detect.roboflow.com').replace(/\/+$/, '')
+  const conf = encodeURIComponent(ROBOFLOW.confidence || 25)
+  const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
+  const boundary = '----MCBotRF' + Date.now() + Math.floor(Math.random() * 1000000)
+  const mp = rfMultipart(pngBuffer, filename, boundary)
   const detectUrl = detectBase + '/' + model + '?api_key=' + encodeURIComponent(key) + '&confidence=' + conf + '&overlap=' + ov
-  const inferUrl = serverlessBase + '/infer?model_id=' + model
+  
+  // v3.7.26: логируем URL (без api_key)
+  const safeUrl = detectUrl.replace(/api_key=[^&]+/, 'api_key=***')
+  step('[RF] Запрос к: ' + safeUrl)
+  
   const attempts = [
     { name: 'detect_multipart', url: detectUrl, headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary }, body: mp },
-    { name: 'detect_raw', url: detectUrl, headers: { 'Content-Type': 'image/png' }, body: pngBuffer },
-    { name: 'serverless_infer_bearer', url: inferUrl, headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'multipart/form-data; boundary=' + boundary }, body: mp }
+    { name: 'detect_raw', url: detectUrl, headers: { 'Content-Type': 'image/png' }, body: pngBuffer }
   ]
+  
   let last = null
   for (const at of attempts) {
     const r = await rfPost(at.url, at.headers, at.body)
-    let json = null; try { json = JSON.parse(r.body) } catch (e) {}
-    const predictions = rfGetPredictions(json); const metrics = rfMetrics(predictions); const ok = r.status >= 200 && r.status < 300 && !!json
-    const item = { ok, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics, raw: String(r.body || '').slice(0, 3000), attempts: r._attempts || [], error: ok ? null : (String(r.body || '').replace(/\s+/g, ' ').slice(0, 300) || 'HTTP ' + r.status) }
-    if (debugDir) { try { fs.mkdirSync(debugDir, { recursive: true }); fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'), 'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nATTEMPT: ' + at.name + '\nATTEMPTS_LOG: ' + JSON.stringify(r._attempts || []) + '\nURL: ' + at.url + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n') } catch (e) {} }
-    if (label && typeof step === 'function') step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') + (ok ? ' OK digits=' + metrics.n + ' row=' + metrics.row + ' text="' + metrics.text + '"' : ' ' + String(item.raw || '').replace(/\s+/g, ' ').slice(0, 140)))
+    
+    // v3.7.26: детальное логирование ответа
+    const bodyPreview = String(r.body || '').slice(0, 500).replace(/\s+/g, ' ')
+    step('[RF] Ответ ' + at.name + ': status=' + r.status + ' via=' + (r.via || '?') + ' body=' + bodyPreview)
+    
+    // v3.7.26: обработка специфических ошибок
+    if (r.status === 401) {
+      step('[RF] ❌ 401 Unauthorized — НЕВЕРНЫЙ API-КЛЮЧ! Проверьте roboflow.apiKey в конфиге')
+      step('[RF] Получите ключ на https://app.roboflow.com/ → Settings → API Key')
+      return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY', raw: r.body }
+    }
+    if (r.status === 403) {
+      step('[RF] ❌ 403 Forbidden — НЕТ ДОСТУПА К МОДЕЛИ!')
+      step('[RF] Ваша модель "' + model + '" закрытая. Проверьте:')
+      step('[RF]   1. API-ключ принадлежит тому же workspace, что и модель')
+      step('[RF]   2. У вас есть права на модель (owner/member)')
+      step('[RF]   3. Либо используйте публичную модель (workspace/project)')
+      return { ok: false, status: 403, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'ACCESS DENIED to model ' + model, raw: r.body }
+    }
+    if (r.status === 404) {
+      step('[RF] ❌ 404 Not Found — МОДЕЛЬ НЕ НАЙДЕНА!')
+      step('[RF] Проверьте roboflow.modelId в конфиге. Сейчас: "' + model + '"')
+      step('[RF] Правильный формат: workspace-id/project-id/version')
+      step('[RF] Пример: funtimecapth/captcha-funtime/1')
+      return { ok: false, status: 404, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'MODEL NOT FOUND: ' + model, raw: r.body }
+    }
+    
+    let json = null
+    try { json = JSON.parse(r.body) } catch (e) {}
+    const predictions = rfGetPredictions(json)
+    const metrics = rfMetrics(predictions)
+    const ok = r.status >= 200 && r.status < 300 && !!json
+    
+    const item = { 
+      ok, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics, 
+      raw: String(r.body || '').slice(0, 3000), 
+      attempts: r._attempts || [], 
+      error: ok ? null : (String(r.body || '').replace(/\s+/g, ' ').slice(0, 300) || 'HTTP ' + r.status) 
+    }
+    
+    // Сохраняем debug файлы
+    if (debugDir) {
+      try {
+        fs.mkdirSync(debugDir, { recursive: true })
+        fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'), 
+          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nATTEMPT: ' + at.name + '\nURL: ' + safeUrl + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
+      } catch (e) {}
+    }
+    
+    if (label && typeof step === 'function') {
+      step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') + 
+        (ok ? ' ✓ НАЙДЕНО ЦИФР: ' + metrics.n + ' row=' + metrics.row + ' text="' + metrics.text + '"' 
+            : ' ' + String(item.raw || '').replace(/\s+/g, ' ').slice(0, 140)))
+    }
+    
     if (ok) return item
     last = item
-    if (isLocalhost(u && u.hostname) && String(r.body || '').includes('ECONNREFUSED')) { localhostAlive = false; break }
+    
+    // Если 401/403/404 — не пробуем другие способы
+    if (r.status === 401 || r.status === 403 || r.status === 404) break
   }
+  
   return last || { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'no attempts' }
 }
 
@@ -1310,14 +747,15 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.25 — НАСТОЯЩАЯ ОБУЧЕННАЯ МОДЕЛЬ === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.26 — ПРЯМОЙ ЗАПРОС К detect.roboflow.com === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
-  step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
-
-  if (isLocalhost(String(ROBOFLOW.detectUrl).replace(/^https?:\/\//, '').split(/[:\/]/)[0])) {
-    await ensureInferenceServer()
-  }
+  step('roboflow.detectUrl=' + ROBOFLOW.detectUrl)
+  step('roboflow.modelId=' + ROBOFLOW.modelId)
+  step('roboflow.apiKey=' + ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4))
+  
+  // v3.7.26: Убиваем мусорный локальный сервер (если он остался от прошлых запусков)
+  await killPort9001()
 
   currentRunIp = await rotateIp(); step('IP забега: ' + (currentRunIp || '?'))
 
