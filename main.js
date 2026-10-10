@@ -1,6 +1,7 @@
-// VERSION: 3.7.28
+// VERSION: 3.7.29
 // main.js
-// v3.7.28: автоперебор публичных моделей + обход Cloudflare + браузерные заголовки
+// v3.7.29: ПРАВИЛЬНАЯ интеграция Roboflow Serverless API
+//          Authorization: Bearer header + serverless.roboflow.com
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -130,57 +131,14 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= v3.7.28: СПИСОК ПУБЛИЧНЫХ МОДЕЛЕЙ =========================
-// Если в конфиге нет apiKey или detectUrl=localhost — пробуем все эти модели
-const PUBLIC_MODELS = [
-  { id: 's-workspace-juqs3/captcha-funtime-vn60f/2', name: 'Roboflow3.0 (8688 img)', priority: 1 },
-  { id: 'accs-workspace/captcha-funtime-e3qza/1', name: 'YOLOv11 Fast (Apr 2026)', priority: 2 },
-  { id: 'vodka-vyhax/captcha-funtime-ilivf/3', name: 'Roboflow3.0 (Jun 2025)', priority: 3 },
-  { id: 'mike-a6zu0/captcha-funtime-b2ibk/1', name: 'RF-DETR Medium (Sep 2025)', priority: 4 }
-]
-
-// v3.7.28: активная модель (перебираем по очереди)
-let ACTIVE_MODEL_INDEX = 0
-let MODEL_FAILED = new Set()
-
-function getNextModel() {
-  while (ACTIVE_MODEL_INDEX < PUBLIC_MODELS.length) {
-    const m = PUBLIC_MODELS[ACTIVE_MODEL_INDEX]
-    if (!MODEL_FAILED.has(m.id)) return m
-    ACTIVE_MODEL_INDEX++
-  }
-  return null
-}
-
-// ========================= ROBLOW API =========================
-let _cfgApiKey = cfgGet(CFG, 'roboflow.apiKey', '')
-let _cfgDetectUrl = cfgGet(CFG, 'roboflow.detectUrl', 'http://localhost:9001')
-let _cfgModelId = cfgGet(CFG, 'roboflow.modelId', '')
-
-// v3.7.28: авто-фикс detectUrl
-if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0)/i.test(_cfgDetectUrl.replace(/^https?:\/\//, ''))) {
-  step('[RF] ⚠️ detectUrl=localhost — АВТОЗАМЕНА на https://detect.roboflow.com')
-  _cfgDetectUrl = 'https://detect.roboflow.com'
-}
-
-// v3.7.28: если ключ пустой или модель закрытая — будем перебирать публичные
-const NEED_PUBLIC_MODEL_SEARCH = !_cfgApiKey || _cfgModelId === 'captchas-gz2yx/funtimecaptcha/1' || _cfgModelId === 'funtimecapth/captcha-funtime/1'
-
-if (NEED_PUBLIC_MODEL_SEARCH) {
-  step('[RF] 🎯 ВКЛЮЧЁН РЕЖИМ АВТОПОИСКА ПУБЛИЧНОЙ МОДЕЛИ')
-  step('[RF] 🎯 Будем перебирать ' + PUBLIC_MODELS.length + ' моделей Roboflow Universe')
-  if (!_cfgApiKey) {
-    step('[RF] ❗️ ВНИМАНИЕ: roboflow.apiKey НЕ ЗАДАН в конфиге!')
-    step('[RF] ❗️ Без личного ключа Roboflow API работать НЕ БУДЕТ!')
-    step('[RF] ❗️ Получите ключ: https://app.roboflow.com/ → Settings → API Key')
-  }
-}
-
+// ========================= v3.7.29: ROBLOW SERVERLESS API =========================
+// Правильные настройки по официальной документации Roboflow
 const ROBOFLOW = {
   enabled: cfgGet(CFG, 'roboflow.enabled', true),
-  apiKey: _cfgApiKey,
-  modelId: _cfgModelId,
-  detectUrl: _cfgDetectUrl,
+  apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
+  // v3.7.29: ПРАВИЛЬНЫЙ model_id с workspace
+  modelId: cfgGet(CFG, 'roboflow.modelId', 's-workspace-juqs3/captcha-funtime-vn60f/2'),
+  // v3.7.29: serverless.roboflow.com — ОФИЦИАЛЬНЫЙ endpoint!
   serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', 'https://serverless.roboflow.com'),
   confidence: cfgGet(CFG, 'roboflow.confidence', 25),
   overlap: cfgGet(CFG, 'roboflow.overlap', 20),
@@ -224,7 +182,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.28', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.29', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -285,7 +243,7 @@ async function rotateIp() {
   currentRunIp = await currentIp(); return currentRunIp
 }
 
-// ========================= v3.7.28: HTTP с браузерными заголовками =========================
+// ========================= v3.7.29: ПРАВИЛЬНЫЙ ROBLOW SERVERLESS ЗАПРОС =========================
 function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
   return new Promise(resolve => {
     const mod = useTls ? https : http
@@ -294,20 +252,11 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
     
     const h = Object.assign({
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
+      'Accept': 'application/json',
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'identity',
-      'Cache-Control': 'no-cache',
       'Connection': 'close',
-      'Host': hostHeader,
-      'Origin': 'https://app.roboflow.com',
-      'Referer': 'https://app.roboflow.com/',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-site',
-      'Sec-Ch-Ua': '"Google Chrome";v="129", "Chromium";v="129"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"'
+      'Host': hostHeader
     }, headers || {})
     
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
@@ -405,12 +354,12 @@ async function rfPost(url, headers, body) {
     if (st === 401 || st === 404) { last._attempts = attemptsLog; return last }
     
     if (st === 403 && String(r.body || '').includes('Cloudflare')) {
-      step('[RF] ⚠️ Cloudflare блокирует via=' + tr)
+      step('[RF] ⚠️ Cloudflare блокирует via=' + tr + ', пробую следующий...')
       await sleep(1500)
       continue
     }
     
-    await sleep(1000)
+    await sleep(500)
   }
   
   if (last) last._attempts = attemptsLog
@@ -469,120 +418,111 @@ function rfMetrics(preds) {
   return { n, avg: Math.round(avg * 1000) / 1000, row, plausible, strong, score, text: digits.map(d => d.digit).join(''), digits }
 }
 
-// v3.7.28: отправка с автоперебором моделей
+// v3.7.29: ПРАВИЛЬНАЯ отправка — Authorization: Bearer в header!
 async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
-  if (!ROBOFLOW || ROBOFLOW.enabled === false) {
+  if (!ROBOFLOW || ROBOFLOW.enabled === false || !ROBOFLOW.apiKey) {
     return { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
   }
   
-  if (!ROBOFLOW.apiKey) {
-    step('[RF] ❌ НЕТ API-КЛЮЧА! Получите ключ: https://app.roboflow.com/ → Settings → API Key')
-    return { ok: false, status: 0, attempt: 'no_api_key', predictions: [], metrics: rfMetrics([]), error: 'no api key configured' }
-  }
-  
   const key = String(ROBOFLOW.apiKey)
+  const modelId = String(ROBOFLOW.modelId).replace(/^\/+|\/+$/g, '')
+  const serverlessBase = String(ROBOFLOW.serverlessUrl).replace(/\/+$/, '')
   const conf = encodeURIComponent(ROBOFLOW.confidence || 25)
   const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
-  const detectBase = String(ROBOFLOW.detectUrl).replace(/\/+$/, '')
   
-  // v3.7.28: собираем список моделей для проверки
-  const modelsToTry = []
+  // v3.7.29: ПРАВИЛЬНЫЙ URL — serverless.roboflow.com + model_id в path
+  // https://serverless.roboflow.com/{workspace}/{project}/{version}?confidence=...&overlap=...
+  const inferUrl = serverlessBase + '/' + modelId + '?confidence=' + conf + '&overlap=' + ov
+  const safeUrl = inferUrl
   
-  // Если в конфиге задана конкретная модель — пробуем её первой
-  if (ROBOFLOW.modelId && !NEED_PUBLIC_MODEL_SEARCH) {
-    modelsToTry.push({ id: ROBOFLOW.modelId, name: 'config.json', priority: 0 })
-  }
-  
-  // Добавляем публичные модели (если не все уже проверены)
-  for (const pm of PUBLIC_MODELS) {
-    if (!MODEL_FAILED.has(pm.id)) modelsToTry.push(pm)
-  }
-  
-  if (modelsToTry.length === 0) {
-    step('[RF] ❌ Все ' + PUBLIC_MODELS.length + ' моделей проверены и недоступны')
-    return { ok: false, status: 0, attempt: 'all_models_failed', predictions: [], metrics: rfMetrics([]), error: 'all public models failed' }
-  }
+  step('[RF] 🎯 Официальный Serverless API')
+  step('[RF] URL: ' + safeUrl)
+  step('[RF] Auth: Authorization: Bearer ' + key.slice(0, 6) + '...' + key.slice(-4))
   
   const boundary = '----WebKitFormBoundary' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
   const mp = rfMultipart(pngBuffer, filename, boundary)
   
-  // v3.7.28: перебираем модели
-  for (const model of modelsToTry) {
-    const modelId = model.id.replace(/^\/+|\/+$/g, '')
-    const detectUrl = detectBase + '/' + modelId + '?api_key=' + encodeURIComponent(key) + '&confidence=' + conf + '&overlap=' + ov
-    const safeUrl = detectUrl.replace(/api_key=[^&]+/, 'api_key=***')
+  const attempts = [
+    // v3.7.29: multipart/form-data + Authorization: Bearer
+    { 
+      name: 'serverless_multipart', 
+      url: inferUrl, 
+      headers: { 
+        'Content-Type': 'multipart/form-data; boundary=' + boundary,
+        'Authorization': 'Bearer ' + key  // КРИТИЧЕСКИ ВАЖНО!
+      }, 
+      body: mp 
+    },
+    // v3.7.29: raw PNG + Authorization: Bearer
+    { 
+      name: 'serverless_raw', 
+      url: inferUrl, 
+      headers: { 
+        'Content-Type': 'image/png',
+        'Authorization': 'Bearer ' + key  // КРИТИЧЕСКИ ВАЖНО!
+      }, 
+      body: pngBuffer 
+    }
+  ]
+  
+  let last = null
+  for (const at of attempts) {
+    const r = await rfPost(at.url, at.headers, at.body)
+    const bodyPreview = String(r.body || '').slice(0, 500).replace(/\s+/g, ' ')
+    step('[RF] Ответ ' + at.name + ': status=' + r.status + ' via=' + (r.via || '?'))
     
-    step('[RF] 🎯 Пробую модель: ' + modelId + ' (' + model.name + ')')
-    step('[RF] Запрос к: ' + safeUrl)
-    
-    const attempts = [
-      { name: 'detect_multipart', url: detectUrl, headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary }, body: mp },
-      { name: 'detect_raw', url: detectUrl, headers: { 'Content-Type': 'image/png' }, body: pngBuffer }
-    ]
-    
-    let modelWorked = false
-    
-    for (const at of attempts) {
-      const r = await rfPost(at.url, at.headers, at.body)
-      const bodyPreview = String(r.body || '').slice(0, 300).replace(/\s+/g, ' ')
-      step('[RF] Ответ ' + at.name + ': status=' + r.status + ' via=' + (r.via || '?'))
-      
-      // v3.7.28: специфические ошибки
-      if (r.status === 401) {
-        step('[RF] ❌ 401 — НЕВЕРНЫЙ API-КЛЮЧ! Получите свой: https://app.roboflow.com/')
-        return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY' }
+    if (r.status === 401) {
+      step('[RF] ❌ 401 — НЕВЕРНЫЙ API-КЛЮЧ!')
+      step('[RF] Проверьте roboflow.apiKey в config.json')
+      return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY' }
+    }
+    if (r.status === 403) {
+      if (String(r.body || '').includes('Cloudflare')) {
+        step('[RF] ❌ Cloudflare блокирует запрос')
+      } else {
+        step('[RF] ❌ 403 — нет доступа к модели ' + modelId)
       }
-      if (r.status === 403) {
-        if (String(r.body || '').includes('Cloudflare')) {
-          step('[RF] ❌ 403 Cloudflare — блокирует запрос, пробуем следующую модель...')
-        } else {
-          step('[RF] ❌ 403 — нет доступа к модели ' + modelId + ', помечаю как FAILED')
-          MODEL_FAILED.add(modelId)
-        }
-        break // пробуем следующую модель
-      }
-      if (r.status === 404) {
-        step('[RF] ❌ 404 — модель ' + modelId + ' не найдена, помечаю как FAILED')
-        MODEL_FAILED.add(modelId)
-        break
-      }
-      
-      let json = null
-      try { json = JSON.parse(r.body) } catch (e) {}
-      const predictions = rfGetPredictions(json)
-      const metrics = rfMetrics(predictions)
-      const ok = r.status >= 200 && r.status < 300 && !!json
-      
-      if (debugDir) {
-        try {
-          fs.mkdirSync(debugDir, { recursive: true })
-          fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + modelId.replace(/\//g, '_') + '.txt'), 
-            'MODEL: ' + modelId + '\nSTATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + safeUrl + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
-        } catch (e) {}
-      }
-      
-      if (label && typeof step === 'function') {
-        step(label + ': RF ' + at.name + ' [' + modelId + '] -> ' + r.status + 
-          (ok ? ' ✓ ЦИФР: ' + metrics.n + ' text="' + metrics.text + '"' 
-              : ' ' + bodyPreview.slice(0, 100)))
-      }
-      
-      if (ok) {
-        // v3.7.28: модель сработала! Запоминаем её для следующих запросов
-        ROBOFLOW.modelId = modelId
-        step('[RF] ✅ МОДЕЛЬ РАБОТАЕТ: ' + modelId + ' (' + model.name + ')')
-        modelWorked = true
-        return { ok: true, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics, 
-                 raw: String(r.body || '').slice(0, 3000), attempts: r._attempts || [], error: null, modelId: modelId }
-      }
+      return { ok: false, status: 403, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'ACCESS DENIED', raw: r.body }
+    }
+    if (r.status === 404) {
+      step('[RF] ❌ 404 — модель ' + modelId + ' не найдена на serverless.roboflow.com')
+      return { ok: false, status: 404, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'MODEL NOT FOUND' }
     }
     
-    // Если модель сработала — возвращаемся
-    if (modelWorked) break
+    let json = null
+    try { json = JSON.parse(r.body) } catch (e) {}
+    const predictions = rfGetPredictions(json)
+    const metrics = rfMetrics(predictions)
+    const ok = r.status >= 200 && r.status < 300 && !!json
+    
+    const item = { 
+      ok, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics, 
+      raw: String(r.body || '').slice(0, 3000), 
+      attempts: r._attempts || [], 
+      error: ok ? null : (String(r.body || '').replace(/\s+/g, ' ').slice(0, 300) || 'HTTP ' + r.status),
+      modelId: modelId
+    }
+    
+    if (debugDir) {
+      try {
+        fs.mkdirSync(debugDir, { recursive: true })
+        fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'), 
+          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + safeUrl + 
+          '\nHEADERS: Authorization: Bearer ***\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
+      } catch (e) {}
+    }
+    
+    if (label && typeof step === 'function') {
+      step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') + 
+        (ok ? ' ✓ ЦИФР: ' + metrics.n + ' row=' + metrics.row + ' text="' + metrics.text + '"' 
+            : ' ' + bodyPreview.slice(0, 140)))
+    }
+    
+    if (ok) return item
+    last = item
   }
   
-  step('[RF] ❌ Ни одна модель не сработала. Получите личный API-ключ и проверьте модель вручную.')
-  return { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'all models failed' }
+  return last || { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'no attempts' }
 }
 
 // ========================= ПАЛИТРА / ASCII / PNG =========================
@@ -774,7 +714,6 @@ async function saveRecord(outDir, snap, label) {
     ' rfDigits=' + (best.rf && best.rf.metrics ? best.rf.metrics.n : 0) +
     ' rfText="' + (best.rf && best.rf.metrics ? best.rf.metrics.text : '') + '"' +
     ' ocr="' + best.pick.text + '" (' + best.pick.name + ')' +
-    ' model=' + (best.rf.modelId || '?') +
     ' -> ' + outDir
   )
 
@@ -854,12 +793,13 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.28 — АВТОПОИСК МОДЕЛИ === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.29 — ПРАВИЛЬНЫЙ ROBLOW SERVERLESS === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
-  step('roboflow.detectUrl=' + ROBOFLOW.detectUrl)
+  step('roboflow.serverlessUrl=' + ROBOFLOW.serverlessUrl)
+  step('roboflow.modelId=' + ROBOFLOW.modelId)
   step('roboflow.apiKey=' + (ROBOFLOW.apiKey ? ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4) : '(НЕ ЗАДАН!)'))
-  step('Режим поиска публичной модели: ' + (NEED_PUBLIC_MODEL_SEARCH ? 'ВКЛ (' + PUBLIC_MODELS.length + ' моделей)' : 'ВЫКЛ'))
+  step('Auth: Authorization: Bearer (в header, НЕ в URL!)')
   step('LOGIN_TIMEOUT=' + LOGIN_TIMEOUT_MS + 'мс')
   
   await killPort9001()
@@ -902,15 +842,14 @@ async function main() {
       step('РАУНД ' + r + ' сохранён: ORIGINAL=' + rec.wall + 
         ' rfDigits=' + (rec.rfMetrics ? rec.rfMetrics.n : 0) + 
         ' rfText="' + (rec.rfMetrics ? rec.rfMetrics.text : '') + '"' +
-        ' ocr="' + rec.ocrText + '"' +
-        ' model=' + (rec.rf.modelId || '?'))
+        ' ocr="' + rec.ocrText + '"')
     } else if (!aborted) { results.push({ n: r, ok: false, note: 'fail' }); step('РАУНД ' + r + ' провален') }
     if (r < TARGET_ROUNDS && !aborted) await sleep(PAUSE_BETWEEN_MS)
   }
 
   const okList = results.filter(x => x.ok && x.rec); const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - tGlobal) / 1000) + 'с')
-  for (const x of results) L.push('  #' + x.n + ': ' + (x.rec ? 'ORIGINAL=' + x.rec.wall + ' rfDigits=' + (x.rec.rfMetrics ? x.rec.rfMetrics.n : 0) + ' ocr="' + x.rec.ocrText + '" model=' + (x.rec.rf.modelId || '?') : 'FAIL'))
+  for (const x of results) L.push('  #' + x.n + ': ' + (x.rec ? 'ORIGINAL=' + x.rec.wall + ' rfDigits=' + (x.rec.rfMetrics ? x.rec.rfMetrics.n : 0) + ' rfText="' + (x.rec.rfMetrics ? x.rec.rfMetrics.text : '') + '" ocr="' + x.rec.ocrText + '"' : 'FAIL'))
   step('готово.'); flushReport(L.join('\n')); console.log('\n' + L.join('\n'))
   setTimeout(() => process.exit(0), 2000)
 }
