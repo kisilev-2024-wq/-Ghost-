@@ -1,6 +1,6 @@
-// VERSION: 3.7.22
+// VERSION: 3.7.23
 // main.js
-// v3.7.22: официальный `python -m inference` + чистый FastAPI эмулятор БЕЗ импорта inference
+// v3.7.23: видим stderr inference + быстрый fallback на эмулятор (15с)
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,7 +134,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= INFERENCE SERVER (v3.7.22) =========================
+// ========================= INFERENCE SERVER (v3.7.23) =========================
 let localhostAlive = false
 let PY_EXE = ''
 
@@ -157,7 +157,6 @@ function checkLocalhostHealth() {
   })
 }
 
-// v3.7.22: тестовый POST — проверяет, что endpoint не даёт 404
 async function testRoboflowEndpoint() {
   return new Promise(resolve => {
     const postData = Buffer.from('--test\r\nContent-Disposition: form-data; name="file"; filename="test.png"\r\nContent-Type: image/png\r\n\r\nx\r\n--test--\r\n')
@@ -207,20 +206,6 @@ async function killProcessOnPort(port) {
     }
   } catch (e) {}
   return false
-}
-
-function getShortPath(p) {
-  if (!p || typeof p !== 'string') return ''
-  const clean = p.replace(/^"|"$/g, '')
-  if (!/^[A-Za-z]:\\/.test(clean)) return ''
-  if (!fs.existsSync(clean)) return ''
-  try {
-    const out = execSync('cmd /c for %I in (' + q(clean) + ') do @echo %~sI', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
-    const lines = String(out || '').trim().split(/\r?\n/)
-    const last = (lines.pop() || '').trim()
-    if (last && /^[A-Za-z]:\\/.test(last) && !/[^\x20-\x7E]/.test(last)) return last
-  } catch (e) {}
-  return ''
 }
 
 function execPy(exe, args, opts) {
@@ -356,9 +341,12 @@ function checkAllPackages(exe) {
   return missing
 }
 
-// v3.7.22: ЗАПУСК ОФИЦИАЛЬНОГО `python -m inference`
-async function startOfficialInference(exe) {
-  step('[RF] [1/2] Запуск официального inference (`python -m inference`)...')
+// v3.7.23: ПОПЫТКА 1/2 — `python -m inference` С ЛОГИРОВАНИЕМ stderr
+async function tryOfficialInference(exe) {
+  step('[RF] [1/2] Пробую `python -m inference` (с видимым stderr)...')
+  
+  const logPath = path.join(__dirname, '.inference_cli.log')
+  try { fs.unlinkSync(logPath) } catch (e) {}
   
   const env = Object.assign({}, process.env, {
     PYTHONIOENCODING: 'utf-8',
@@ -372,63 +360,100 @@ async function startOfficialInference(exe) {
     DISABLE_VERSION_CHECK: 'True'
   })
 
-  let proc = null
+  // v3.7.23: открываем файл для лога и передаём в stdio
+  let logStream = null
   try {
-    proc = spawnPy(exe, ['-m', 'inference'], {
-      detached: true,
-      stdio: 'ignore',
-      env: env
-    })
-    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); return false })
-    proc.unref()
-    step('[RF] PID: ' + (proc.pid || '?'))
+    logStream = fs.createWriteStream(logPath, { flags: 'a' })
   } catch (e) {
-    step('[RF] ERROR spawn: ' + e.message)
+    step('[RF] Не удалось открыть лог-файл: ' + e.message)
     return false
   }
 
-  // Ждём старта с проверкой
+  let proc = null
+  let exited = false
+  let exitCode = null
+  try {
+    proc = spawnPy(exe, ['-m', 'inference'], {
+      detached: true,
+      stdio: ['ignore', logStream, logStream],
+      env: env
+    })
+    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); exited = true })
+    proc.on('exit', (code) => { exitCode = code; exited = true })
+    proc.unref()
+    step('[RF] PID: ' + (proc.pid || '?') + ', лог: ' + logPath)
+  } catch (e) {
+    step('[RF] ERROR spawn: ' + e.message)
+    try { logStream.close() } catch (x) {}
+    return false
+  }
+
+  // Ждём максимум 20 секунд
   const start = Date.now()
-  const timeout = 60000
+  const timeout = 20000
+  let lastLogLen = 0
   let lastCheck = 0
-  let lastTestStatus = 0
+
+  const readLog = () => {
+    try {
+      if (!fs.existsSync(logPath)) return false
+      const content = fs.readFileSync(logPath, 'utf8')
+      if (content.length > lastLogLen) {
+        const newPart = content.slice(lastLogLen)
+        lastLogLen = content.length
+        for (const line of newPart.split('\n').filter(l => l.trim())) step('[RF CLI] ' + line.slice(0, 200))
+        return true
+      }
+      return lastLogLen > 0
+    } catch (e) { return false }
+  }
 
   while (Date.now() - start < timeout) {
-    await sleep(3000)
-    const isListening = await checkLocalhostHealth()
+    await sleep(2000)
+    readLog()
     
-    if (isListening) {
+    // Если процесс уже завершился — inference не стартует
+    if (exited) {
+      step('[RF] [1/2] inference завершился с кодом ' + exitCode + ' — не подходит')
+      readLog()
+      try { logStream.close() } catch (x) {}
+      return false
+    }
+
+    if (await checkLocalhostHealth()) {
       const test = await testRoboflowEndpoint()
-      lastTestStatus = test.status
-      step('[RF] Тест POST: status=' + test.status)
+      step('[RF] Тест POST: status=' + test.status + ' ok=' + test.ok)
       
       if (test.ok) {
         step('[RF] ✓✓✓ Официальный inference готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
         localhostAlive = true
+        try { logStream.close() } catch (x) {}
         return true
       }
     }
     
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 10) { 
-      step('[RF] Ожидание inference... ' + elapsed + 'с (порт ' + (isListening ? 'слушает' : 'молчит') + ', last status=' + lastTestStatus + ')')
+    if (elapsed - lastCheck >= 5) { 
+      step('[RF] Ожидание inference... ' + elapsed + 'с (порт ' + ((await checkLocalhostHealth()) ? 'слушает' : 'молчит') + ')')
       lastCheck = elapsed 
     }
   }
 
-  step('[RF] [1/2] FAIL: официальный inference не поднялся за 60с (последний status=' + lastTestStatus + ')')
-  // Убиваем процесс, чтобы освободить порт
+  // Таймаут — убиваем процесс
+  step('[RF] [1/2] TIMEOUT: inference не поднялся за 20с')
+  readLog()
   if (proc && proc.pid) {
     try { 
-      process.kill(-proc.pid, 'SIGTERM')
       execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' }))
+      step('[RF] Убил зависший inference PID ' + proc.pid)
     } catch (e) {}
   }
+  try { logStream.close() } catch (x) {}
   await killProcessOnPort(RF_PORT)
   return false
 }
 
-// v3.7.22: FALLBACK — чистый FastAPI эмулятор БЕЗ импорта inference
+// v3.7.23: ПОПЫТКА 2/2 — ЧИСТЫЙ FastAPI эмулятор (100% рабочий)
 async function startEmulatorServer(exe) {
   step('[RF] [2/2] Запуск чистого FastAPI эмулятора (БЕЗ inference)...')
   
@@ -436,7 +461,6 @@ async function startEmulatorServer(exe) {
   const logPath = path.join(__dirname, '.emulator_server.log')
   try { fs.unlinkSync(logPath) } catch (e) {}
 
-  // v3.7.22: ЧИСТЫЙ FastAPI эмулятор — никаких импортов inference!
   const pythonScript = `
 import sys, os
 
@@ -486,13 +510,12 @@ try:
 
     @app.get('/')
     def root():
-        return {'status': 'ok', 'service': 'MC Bot Inference Emulator v3.7.22', 'emulator': True}
+        return {'status': 'ok', 'service': 'MC Bot Inference Emulator v3.7.23', 'emulator': True}
 
     @app.get('/healthz')
     def healthz():
         return {'status': 'ok', 'emulator': True}
 
-    # КЛЮЧЕВОЕ: {path:path} матчит ЛЮБОЙ путь включая /
     @app.post('/{path:path}')
     async def detect_any(
         path: str,
@@ -502,7 +525,6 @@ try:
         overlap: float = 0.3
     ):
         log('Received POST /' + path)
-        # Возвращаем пустые predictions (будет использоваться OCR)
         return JSONResponse(content={
             'predictions': [],
             'image': {'width': 1024, 'height': 512},
@@ -558,7 +580,7 @@ except Exception as e:
   }
 
   const start = Date.now()
-  const timeout = 60000
+  const timeout = 30000
   let lastCheck = 0
 
   while (Date.now() - start < timeout) {
@@ -578,13 +600,13 @@ except Exception as e:
     }
     
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 10) { 
+    if (elapsed - lastCheck >= 5) { 
       step('[RF] Ожидание эмулятора... ' + elapsed + 'с')
       lastCheck = elapsed 
     }
   }
 
-  step('[RF] ERROR: эмулятор не поднялся за 60с')
+  step('[RF] ERROR: эмулятор не поднялся за 30с')
   readLog()
   return false
 }
@@ -596,10 +618,10 @@ async function startInferenceServer(exe) {
   
   await killProcessOnPort(RF_PORT)
 
-  // Попытка 1: официальный `python -m inference`
-  if (await startOfficialInference(exe)) return true
+  // Попытка 1: официальный `python -m inference` с видимым stderr
+  if (await tryOfficialInference(exe)) return true
 
-  // Попытка 2: чистый FastAPI эмулятор (fallback)
+  // Попытка 2: чистый FastAPI эмулятор (всегда работает)
   return await startEmulatorServer(exe)
 }
 
@@ -612,7 +634,7 @@ async function ensureInferenceServer() {
     step('[RF] Тестовый POST: status=' + test.status + ' ok=' + test.ok)
     
     if (test.ok) {
-      step('[RF] ✓✓✓ Сервер работает и не даёт 404')
+      step('[RF] ✓✓✓ Сервер работает и не даёт 404/500')
       localhostAlive = true
       return true
     } else {
@@ -655,7 +677,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.22', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.23', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -777,7 +799,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.22\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.23\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -802,7 +824,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.22', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.23', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1169,7 +1191,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.22 — python -m inference + чистый FastAPI === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.23 — видим stderr + быстрый fallback === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
