@@ -1,6 +1,6 @@
-// VERSION: 3.7.21
+// VERSION: 3.7.22
 // main.js
-// v3.7.21: убийство старого сервера + официальный CLI inference + эмулятор с {path:path}
+// v3.7.22: официальный `python -m inference` + чистый FastAPI эмулятор БЕЗ импорта inference
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,7 +134,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= АВТОУСТАНОВКА INFERENCE (v3.7.21) =========================
+// ========================= INFERENCE SERVER (v3.7.22) =========================
 let localhostAlive = false
 let PY_EXE = ''
 
@@ -146,7 +146,6 @@ function winOpts(opts) {
   return merged
 }
 
-// v3.7.21: проверка здоровья через TCP connect (надёжнее чем HTTP GET)
 function checkLocalhostHealth() {
   return new Promise(resolve => {
     const sock = net.connect({ port: RF_PORT, host: '127.0.0.1', timeout: 2000 }, () => {
@@ -158,30 +157,7 @@ function checkLocalhostHealth() {
   })
 }
 
-// v3.7.21: убийство процесса на порту
-async function killProcessOnPort(port) {
-  try {
-    const out = execSync('netstat -ano | findstr :' + port, winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
-    const lines = String(out || '').split('\n').filter(l => l.includes('LISTENING'))
-    const pids = new Set()
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/)
-      const pid = parts[parts.length - 1]
-      if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid)
-    }
-    for (const pid of pids) {
-      step('[RF] Убиваю старый процесс на порту ' + port + ': PID ' + pid)
-      try { execSync('taskkill /F /PID ' + pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
-    }
-    if (pids.size > 0) {
-      await sleep(2000)
-      return true
-    }
-  } catch (e) {}
-  return false
-}
-
-// v3.7.21: тестовый POST запрос к серверу — проверяет, что он не даёт 404
+// v3.7.22: тестовый POST — проверяет, что endpoint не даёт 404
 async function testRoboflowEndpoint() {
   return new Promise(resolve => {
     const postData = Buffer.from('--test\r\nContent-Disposition: form-data; name="file"; filename="test.png"\r\nContent-Type: image/png\r\n\r\nx\r\n--test--\r\n')
@@ -209,6 +185,28 @@ async function testRoboflowEndpoint() {
     req.write(postData)
     req.end()
   })
+}
+
+async function killProcessOnPort(port) {
+  try {
+    const out = execSync('netstat -ano | findstr :' + port, winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+    const lines = String(out || '').split('\n').filter(l => l.includes('LISTENING'))
+    const pids = new Set()
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/)
+      const pid = parts[parts.length - 1]
+      if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid)
+    }
+    for (const pid of pids) {
+      step('[RF] Убиваю старый процесс на порту ' + port + ': PID ' + pid)
+      try { execSync('taskkill /F /PID ' + pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
+    }
+    if (pids.size > 0) {
+      await sleep(2000)
+      return true
+    }
+  } catch (e) {}
+  return false
 }
 
 function getShortPath(p) {
@@ -249,10 +247,7 @@ function findSystemPython312() {
     appData ? appData + '\\Python\\Python310\\python.exe' : '',
     'C:\\Python312\\python.exe',
     'C:\\Python311\\python.exe',
-    'C:\\Python310\\python.exe',
-    'C:\\Program Files\\Python312\\python.exe',
-    'C:\\Program Files\\Python311\\python.exe',
-    'C:\\Program Files\\Python310\\python.exe'
+    'C:\\Python310\\python.exe'
   ].filter(Boolean)
 
   for (const p of candidates) {
@@ -270,26 +265,6 @@ function findSystemPython312() {
       } catch (e) {}
     }
   }
-
-  try {
-    const whereOut = execSync('where python', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
-    const lines = String(whereOut || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-    for (const p of lines) {
-      if (fs.existsSync(p)) {
-        try {
-          const v = execSync(q(p) + ' --version', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }))
-          const m = String(v || '').match(/Python 3\.(\d+)/)
-          if (m) {
-            const minor = parseInt(m[1])
-            if (minor >= 10 && minor <= 12) {
-              step('[RF] ✓ НАЙДЕН Python 3.' + minor + ' через where: ' + p)
-              return p
-            }
-          }
-        } catch (e) {}
-      }
-    }
-  } catch (e) {}
 
   step('[RF] Python 3.10-3.12 не найден в системе')
   return null
@@ -314,7 +289,7 @@ async function downloadFile(url, destPath) {
 }
 
 async function installPython312Embeddable() {
-  step('[RF] Устанавливаю Python 3.12 embeddable (ZIP, без UAC)...')
+  step('[RF] Устанавливаю Python 3.12 embeddable...')
   const targetDir = path.join(__dirname, '.python312')
   const zipUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-embed-amd64.zip'
   const zipPath = path.join(__dirname, 'python-3.12.9-embed.zip')
@@ -322,100 +297,23 @@ async function installPython312Embeddable() {
   const pthPath = path.join(targetDir, 'python312._pth')
   const pyExe = path.join(targetDir, 'python.exe')
 
-  step('[RF] [1/5] Скачивание embeddable ZIP...')
   try {
     await downloadFile(zipUrl, zipPath)
-    const size = fs.statSync(zipPath).size
-    step('[RF] [1/5] OK: ' + (size / 1024 / 1024).toFixed(1) + ' MB')
-    if (size < 5000000) throw new Error('ZIP too small')
-  } catch (e) {
-    step('[RF] [1/5] ERROR: ' + e.message)
-    return null
-  }
-
-  step('[RF] [2/5] Распаковка в ' + targetDir)
-  try {
     fs.mkdirSync(targetDir, { recursive: true })
     const psCmd = 'powershell -NoProfile -NonInteractive -Command "Expand-Archive -Path \'' + zipPath + '\' -DestinationPath \'' + targetDir + '\' -Force"'
     execSync(psCmd, winOpts({ stdio: 'pipe', timeout: 120000 }))
-    if (!fs.existsSync(pyExe)) throw new Error('python.exe not found')
-    step('[RF] [2/5] OK')
-  } catch (e) {
-    step('[RF] [2/5] ERROR: ' + (e.message || '').slice(0, 200))
-    return null
-  }
-
-  step('[RF] [3/5] Активация import site...')
-  try {
     if (fs.existsSync(pthPath)) {
       let content = fs.readFileSync(pthPath, 'utf8')
-      if (!content.includes('import site')) {
-        content = content.replace(/^#import site/m, 'import site')
-        if (!content.includes('import site')) content += '\nimport site\n'
-        fs.writeFileSync(pthPath, content)
-      }
-      step('[RF] [3/5] OK')
+      if (!content.includes('import site')) content += '\nimport site\n'
+      fs.writeFileSync(pthPath, content)
     }
-  } catch (e) {}
-
-  step('[RF] [4/5] Скачивание get-pip.py...')
-  try {
     await downloadFile('https://bootstrap.pypa.io/get-pip.py', getPipPath)
-    step('[RF] [4/5] OK')
-  } catch (e) {
-    step('[RF] [4/5] ERROR: ' + e.message)
-    return null
-  }
-
-  step('[RF] [5/5] Установка pip...')
-  try {
     const proc = spawnPy(pyExe, [getPipPath, '--no-warn-script-location'], { stdio: ['ignore', 'pipe', 'pipe'] })
-    const pipOk = await new Promise((resolve) => {
-      proc.on('close', code => resolve(code === 0))
-      proc.on('error', () => resolve(false))
-    })
+    await new Promise((resolve) => { proc.on('close', code => resolve(code === 0)) })
     try { fs.unlinkSync(zipPath) } catch (e) {}
     try { fs.unlinkSync(getPipPath) } catch (e) {}
-    if (pipOk && fs.existsSync(pyExe)) {
-      step('[RF] ✓ EMBEDDED Python 3.12 готов')
-      return pyExe
-    }
-    return null
-  } catch (e) {
-    return null
-  }
-}
-
-async function installPython312Installer() {
-  step('[RF] Запускаю установщик Python 3.12...')
-  const installerUrl = 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe'
-  const installerPath = path.join(__dirname, 'python-3.12.9-installer.exe')
-  const targetDir = path.join(__dirname, '.python312')
-  const pyExe = path.join(targetDir, 'python.exe')
-
-  try {
-    await downloadFile(installerUrl, installerPath)
-  } catch (e) {
-    step('[RF] ERROR: ' + e.message)
-    return null
-  }
-
-  const args = [
-    '/passive', 'InstallAllUsers=0', 'TargetDir=' + targetDir, 'PrependPath=0',
-    'Include_pip=1', 'Include_test=0', 'Include_doc=0', 'Include_launcher=0'
-  ]
-  const cmdLine = '"' + installerPath + '" ' + args.join(' ')
-  
-  const installResult = await new Promise(resolve => {
-    const proc = spawn('cmd.exe', ['/c', cmdLine], winOpts({ stdio: ['ignore', 'pipe', 'pipe'] }))
-    proc.on('close', code => resolve({ code }))
-    proc.on('error', e => resolve({ code: -1 }))
-  })
-
-  if (fs.existsSync(pyExe)) {
-    try { fs.unlinkSync(installerPath) } catch (e) {}
-    return pyExe
-  }
+    if (fs.existsSync(pyExe)) return pyExe
+  } catch (e) {}
   return null
 }
 
@@ -427,8 +325,6 @@ async function ensurePython312() {
   }
   const embedded = await installPython312Embeddable()
   if (embedded) return embedded
-  const installed = await installPython312Installer()
-  if (installed) return installed
   return null
 }
 
@@ -438,7 +334,7 @@ async function installAllPackages(exe, missing) {
   return new Promise(resolve => {
     const proc = spawnPy(exe, ['-m', 'pip', 'install', '--upgrade', 'pip'], { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.on('close', () => {
-      const installArgs = ['-m', 'pip', 'install', 'inference', 'uvicorn', 'fastapi', 'python-multipart', 'asgi-correlation-id', 'fastapi-cprofile', 'supervision']
+      const installArgs = ['-m', 'pip', 'install', 'inference', 'uvicorn', 'fastapi', 'python-multipart']
       const proc2 = spawnPy(exe, installArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
       proc2.on('close', code => resolve(code === 0))
       proc2.on('error', () => resolve(false))
@@ -460,67 +356,89 @@ function checkAllPackages(exe) {
   return missing
 }
 
-// v3.7.21: ПОЛНОСТЬЮ переписанный startInferenceServer
-async function startInferenceServer(exe) {
-  step('[RF] === ЗАПУСК INFERENCE SERVER ===')
-  step('[RF] Порт: ' + RF_PORT)
-  step('[RF] Python: ' + exe)
+// v3.7.22: ЗАПУСК ОФИЦИАЛЬНОГО `python -m inference`
+async function startOfficialInference(exe) {
+  step('[RF] [1/2] Запуск официального inference (`python -m inference`)...')
   
-  // Убиваем старый процесс
+  const env = Object.assign({}, process.env, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+    PORT: String(RF_PORT),
+    HOST: '0.0.0.0',
+    ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False',
+    REDIS_HOST: '',
+    REDIS_PORT: '',
+    MODEL_MANAGER: 'local',
+    DISABLE_VERSION_CHECK: 'True'
+  })
+
+  let proc = null
+  try {
+    proc = spawnPy(exe, ['-m', 'inference'], {
+      detached: true,
+      stdio: 'ignore',
+      env: env
+    })
+    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); return false })
+    proc.unref()
+    step('[RF] PID: ' + (proc.pid || '?'))
+  } catch (e) {
+    step('[RF] ERROR spawn: ' + e.message)
+    return false
+  }
+
+  // Ждём старта с проверкой
+  const start = Date.now()
+  const timeout = 60000
+  let lastCheck = 0
+  let lastTestStatus = 0
+
+  while (Date.now() - start < timeout) {
+    await sleep(3000)
+    const isListening = await checkLocalhostHealth()
+    
+    if (isListening) {
+      const test = await testRoboflowEndpoint()
+      lastTestStatus = test.status
+      step('[RF] Тест POST: status=' + test.status)
+      
+      if (test.ok) {
+        step('[RF] ✓✓✓ Официальный inference готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+        localhostAlive = true
+        return true
+      }
+    }
+    
+    const elapsed = Math.round((Date.now() - start) / 1000)
+    if (elapsed - lastCheck >= 10) { 
+      step('[RF] Ожидание inference... ' + elapsed + 'с (порт ' + (isListening ? 'слушает' : 'молчит') + ', last status=' + lastTestStatus + ')')
+      lastCheck = elapsed 
+    }
+  }
+
+  step('[RF] [1/2] FAIL: официальный inference не поднялся за 60с (последний status=' + lastTestStatus + ')')
+  // Убиваем процесс, чтобы освободить порт
+  if (proc && proc.pid) {
+    try { 
+      process.kill(-proc.pid, 'SIGTERM')
+      execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' }))
+    } catch (e) {}
+  }
   await killProcessOnPort(RF_PORT)
+  return false
+}
 
-  // === СПОСОБ 1: официальный CLI inference ===
-  step('[RF] [Попытка 1/3] Официальный inference CLI...')
-  const cliResult = await new Promise(resolve => {
-    const proc = spawnPy(exe, ['-m', 'inference_cli', 'server', 'start', '--port', String(RF_PORT), '--host', '0.0.0.0'], {
-      detached: true,
-      stdio: 'ignore',
-      env: Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
-    })
-    proc.on('error', e => { step('[RF] CLI error: ' + e.message); resolve(false) })
-    proc.unref()
-    setTimeout(async () => {
-      if (await checkLocalhostHealth()) {
-        step('[RF] ✓ CLI inference запущен')
-        resolve(true)
-      } else {
-        resolve(false)
-      }
-    }, 15000)
-  })
-  if (cliResult) { localhostAlive = true; return true }
-
-  // === СПОСОБ 2: альтернативный CLI ===
-  step('[RF] [Попытка 2/3] Альтернативный CLI (inference.core.interfaces.http)...')
-  const cli2Result = await new Promise(resolve => {
-    const proc = spawnPy(exe, ['-m', 'inference.core.interfaces.http', '--port', String(RF_PORT), '--host', '0.0.0.0'], {
-      detached: true,
-      stdio: 'ignore',
-      env: Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
-    })
-    proc.on('error', () => resolve(false))
-    proc.unref()
-    setTimeout(async () => {
-      if (await checkLocalhostHealth()) {
-        step('[RF] ✓ CLI alt запущен')
-        resolve(true)
-      } else {
-        resolve(false)
-      }
-    }, 10000)
-  })
-  if (cli2Result) { localhostAlive = true; return true }
-
-  // === СПОСОБ 3: наш скрипт с правильным эмулятором ===
-  step('[RF] [Попытка 3/3] Наш скрипт с правильным эмулятором (с {path:path})...')
+// v3.7.22: FALLBACK — чистый FastAPI эмулятор БЕЗ импорта inference
+async function startEmulatorServer(exe) {
+  step('[RF] [2/2] Запуск чистого FastAPI эмулятора (БЕЗ inference)...')
   
-  const scriptPath = path.join(__dirname, '.inference_server.py')
-  const logPath = path.join(__dirname, '.inference_server.log')
+  const scriptPath = path.join(__dirname, '.emulator_server.py')
+  const logPath = path.join(__dirname, '.emulator_server.log')
   try { fs.unlinkSync(logPath) } catch (e) {}
 
-  // v3.7.21: эмулятор с {path:path} — матчит пути с /
+  // v3.7.22: ЧИСТЫЙ FastAPI эмулятор — никаких импортов inference!
   const pythonScript = `
-import sys, os, warnings, traceback
+import sys, os
 
 LOG_PATH = r'''${logPath}'''
 PORT = ${RF_PORT}
@@ -551,139 +469,74 @@ sys.stdout = logger
 sys.stderr = logger
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
-os.environ['ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS'] = 'False'
-warnings.filterwarnings('ignore')
 
 def log(msg):
-    print('[RF server] ' + str(msg), flush=True)
+    print('[RF emu] ' + str(msg), flush=True)
 
-log('=== SCRIPT STARTED ===')
+log('=== EMULATOR STARTED ===')
 log('Python: ' + sys.executable)
 log('Port: ' + str(PORT))
 
-app = None
-method = ''
-
-# Попытка 1: HttpInterface без model_manager (работает в некоторых версиях)
 try:
-    log('Trying HttpInterface()...')
-    from inference.core.interfaces.http.http_api import HttpInterface
-    interface = HttpInterface()
-    app = interface.app
-    method = 'HttpInterface()'
-    log('OK: using ' + method)
-except Exception as e1:
-    log('FAIL e1: ' + str(e1))
-    
-    # Попытка 2: inference.app
-    try:
-        log('Trying inference.app...')
-        import inference
-        if hasattr(inference, 'app'):
-            app = inference.app
-            method = 'inference.app'
-            log('OK: using ' + method)
-    except Exception as e2:
-        log('FAIL e2: ' + str(e2))
-        
-        # Попытка 3: create app напрямую
-        try:
-            log('Trying create app...')
-            from inference.core.interfaces.http.http_api import HttpInterface
-            from inference.core.managers.base import ModelManager
-            # В новых версиях ModelManager может требовать аргументы
-            try:
-                mm = ModelManager()
-            except:
-                mm = ModelManager(api_key=None)
-            interface = HttpInterface(model_manager=mm)
-            app = interface.app
-            method = 'HttpInterface+ModelManager'
-            log('OK: using ' + method)
-        except Exception as e3:
-            log('FAIL e3: ' + str(e3))
-            
-            # Fallback: правильный эмулятор с {path:path}
-            try:
-                log('Building EMULATOR with {path:path} (catches all paths with /)...')
-                from fastapi import FastAPI, Request, UploadFile, File, Form
-                from fastapi.responses import JSONResponse
-                app = FastAPI()
-
-                @app.get('/')
-                def root():
-                    return {'status': 'ok', 'service': 'MC Bot Inference Emulator v3.7.21'}
-
-                @app.get('/healthz')
-                def healthz():
-                    return {'status': 'ok'}
-
-                # КЛЮЧЕВОЕ: {path:path} матчит ЛЮБОЙ путь включая /
-                @app.post('/{path:path}')
-                async def detect_any(
-                    path: str,
-                    request: Request,
-                    api_key: str = None,
-                    confidence: float = 0.25,
-                    overlap: float = 0.3,
-                    file: UploadFile = File(None)
-                ):
-                    log('Received POST /' + path)
-                    return JSONResponse(content={
-                        'predictions': [],
-                        'image': {'width': 1024, 'height': 512},
-                        'model_id': path,
-                        'emulator': True
-                    })
-
-                @app.post('/infer')
-                async def infer(
-                    request: Request,
-                    model_id: str = None,
-                    file: UploadFile = File(None)
-                ):
-                    log('Received POST /infer model=' + str(model_id))
-                    return JSONResponse(content={
-                        'predictions': [],
-                        'image': {'width': 1024, 'height': 512}
-                    })
-
-                method = 'emulated API with {path:path}'
-                log('OK: emulator ready')
-            except Exception as e:
-                log('FATAL: cannot create app: ' + str(e))
-                traceback.print_exc()
-                sys.exit(1)
-
-try:
+    from fastapi import FastAPI, UploadFile, File, Form
+    from fastapi.responses import JSONResponse
     import uvicorn
+    
+    app = FastAPI()
+
+    @app.get('/')
+    def root():
+        return {'status': 'ok', 'service': 'MC Bot Inference Emulator v3.7.22', 'emulator': True}
+
+    @app.get('/healthz')
+    def healthz():
+        return {'status': 'ok', 'emulator': True}
+
+    # КЛЮЧЕВОЕ: {path:path} матчит ЛЮБОЙ путь включая /
+    @app.post('/{path:path}')
+    async def detect_any(
+        path: str,
+        file: UploadFile = File(None),
+        api_key: str = None,
+        confidence: float = 0.25,
+        overlap: float = 0.3
+    ):
+        log('Received POST /' + path)
+        # Возвращаем пустые predictions (будет использоваться OCR)
+        return JSONResponse(content={
+            'predictions': [],
+            'image': {'width': 1024, 'height': 512},
+            'model_id': path,
+            'emulator': True,
+            'time': 0.001
+        })
+
     log('Starting uvicorn on 0.0.0.0:' + str(PORT) + '...')
     uvicorn.run(app, host='0.0.0.0', port=PORT, log_level='warning', access_log=False, log_config=None)
 except Exception as e:
-    log('FATAL: uvicorn failed: ' + str(e))
+    log('FATAL: ' + str(e))
+    import traceback
     traceback.print_exc()
     sys.exit(1)
 `.trim()
 
   fs.writeFileSync(scriptPath, pythonScript, 'utf8')
-  step('[RF] Скрипт записан: ' + scriptPath)
+  step('[RF] Эмулятор записан: ' + scriptPath)
 
   const env = Object.assign({}, process.env, {
     PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',
-    ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False'
+    PYTHONUTF8: '1'
   })
 
   try {
     const serverProc = spawnPy(exe, [scriptPath], {
       detached: true,
       stdio: 'ignore',
-      env: env,
-      cwd: path.dirname(scriptPath)
+      env: env
     })
     serverProc.on('error', e => step('[RF] ERROR spawn: ' + e.message))
     serverProc.unref()
-    step('[RF] direct spawn: ' + exe)
+    step('[RF] PID эмулятора: ' + (serverProc.pid || '?'))
   } catch (e) {
     step('[RF] ERROR spawn: ' + e.message)
     return false
@@ -705,37 +558,52 @@ except Exception as e:
   }
 
   const start = Date.now()
-  const timeout = 120000  // 2 минуты
+  const timeout = 60000
   let lastCheck = 0
 
   while (Date.now() - start < timeout) {
     await sleep(2000)
     readLog()
+    
     if (await checkLocalhostHealth()) {
-      readLog()
-      // Делаем тестовый запрос, чтобы убедиться что сервер не даёт 404
       const test = await testRoboflowEndpoint()
-      step('[RF] Тестовый запрос: status=' + test.status + ' ok=' + test.ok)
+      step('[RF] Тест POST: status=' + test.status + ' ok=' + test.ok)
+      
       if (test.ok) {
-        step('[RF] ✓ inference server готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+        readLog()
+        step('[RF] ✓✓✓ Эмулятор готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
         localhostAlive = true
         return true
-      } else {
-        step('[RF] [WARN] сервер отвечает но status=' + test.status + ', продолжаем ждать...')
       }
     }
+    
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 10) { step('[RF] Ожидание... ' + elapsed + 'с'); lastCheck = elapsed }
+    if (elapsed - lastCheck >= 10) { 
+      step('[RF] Ожидание эмулятора... ' + elapsed + 'с')
+      lastCheck = elapsed 
+    }
   }
 
-  step('[RF] ERROR: сервер не поднялся за 2 минуты')
+  step('[RF] ERROR: эмулятор не поднялся за 60с')
   readLog()
   return false
 }
 
-// v3.7.21: умный ensureInferenceServer с проверкой и перезапуском
+async function startInferenceServer(exe) {
+  step('[RF] === ЗАПУСК INFERENCE SERVER ===')
+  step('[RF] Порт: ' + RF_PORT)
+  step('[RF] Python: ' + exe)
+  
+  await killProcessOnPort(RF_PORT)
+
+  // Попытка 1: официальный `python -m inference`
+  if (await startOfficialInference(exe)) return true
+
+  // Попытка 2: чистый FastAPI эмулятор (fallback)
+  return await startEmulatorServer(exe)
+}
+
 async function ensureInferenceServer() {
-  // 1. Проверяем, работает ли уже сервер
   const isListening = await checkLocalhostHealth()
   
   if (isListening) {
@@ -748,13 +616,12 @@ async function ensureInferenceServer() {
       localhostAlive = true
       return true
     } else {
-      step('[RF] [WARN] Сервер даёт 404 (status=' + test.status + ') — ПЕРЕЗАПУСКАЕМ')
+      step('[RF] [WARN] Сервер даёт status=' + test.status + ' — ПЕРЕЗАПУСКАЕМ')
       await killProcessOnPort(RF_PORT)
       await sleep(2000)
     }
   }
 
-  // 2. Ищем Python
   PY_EXE = await ensurePython312()
   if (!PY_EXE) {
     step('[RF] ERROR: не удалось получить Python 3.10-3.12')
@@ -763,7 +630,6 @@ async function ensureInferenceServer() {
   }
   step('[RF] ✓ Python: ' + PY_EXE)
 
-  // 3. Устанавливаем пакеты
   const missing = checkAllPackages(PY_EXE)
   if (missing.length > 0) {
     step('[RF] Отсутствуют: ' + missing.join(', '))
@@ -775,7 +641,6 @@ async function ensureInferenceServer() {
     step('[RF] OK: все пакеты установлены')
   }
 
-  // 4. Запускаем сервер
   return await startInferenceServer(PY_EXE)
 }
 
@@ -790,10 +655,10 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MC_Bot/3.7.21', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.22', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
-      const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout ' + timeoutMs + 'ms (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
+      const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
       try {
         req = mod.get(u, opts, res => {
           if (stopped) { try { res.resume() } catch (e) {}; return }
@@ -804,10 +669,10 @@ function plainGet(urlStr, timeoutMs) {
           try { res.setEncoding('utf8') } catch (e) {}
           res.on('data', c => { d += c; if (d.length > 200000) d = d.slice(-100000) })
           res.on('end', () => { if (stopped) return; stopped = true; resolve({ status: sc, body: d.trim() }) })
-          res.on('error', e => { if (stopped) return; const msg = ((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || String(e)); lastErr = msg + ' (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure) })
+          res.on('error', e => { if (stopped) return; attempt(urls, idx + 1, redirectsLeft, insecure) })
         })
-      } catch (e) { clearTimeout(timer); const msg = ((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || String(e)); lastErr = msg + ' (' + u + ')'; attempt(urls, idx + 1, redirectsLeft, insecure); return }
-      req.on('error', e => { if (stopped) return; clearTimeout(timer); const msg = ((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || String(e)); lastErr = msg + ' (' + u + ')'; if (!insecure && /CERT|SELF_SIGNED|UNABLE_TO_VERIFY|DEPTH_ZERO|HANDSHAKE|SSL|TLS/i.test(msg)) { attempt(urls, idx, redirectsLeft, true); return }; attempt(urls, idx + 1, redirectsLeft, insecure) })
+      } catch (e) { clearTimeout(timer); attempt(urls, idx + 1, redirectsLeft, insecure); return }
+      req.on('error', e => { if (stopped) return; clearTimeout(timer); if (!insecure && /CERT|SELF_SIGNED|UNABLE_TO_VERIFY|DEPTH_ZERO|HANDSHAKE|SSL|TLS/i.test((e && e.message) || '')) { attempt(urls, idx, redirectsLeft, true); return }; attempt(urls, idx + 1, redirectsLeft, insecure) })
     }
     attempt(buildList(urlStr), 0, 3, false)
   })
@@ -912,7 +777,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.21\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.22\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -937,7 +802,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.21', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.22', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1097,7 +962,7 @@ const DIGITS={'0':[[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[
 
 function matchPat(mask,W,H,bx,by,bw,bh){const pat=[];for(let py=0;py<7;py++){const row=[];for(let px=0;px<5;px++){const sx=bx+Math.floor(px*bw/5),ex=bx+Math.floor((px+1)*bw/5),sy=by+Math.floor(py*bh/7),ey=by+Math.floor((py+1)*bh/7);let c=0,t=0;for(let y=sy;y<ey;y++)for(let x=sx;x<ex;x++){c+=mask[y*W+x];t++};row.push(t&&(c/t)>0.35?1:0)};pat.push(row)};let bd='?',bs=0;for(const d in DIGITS){let m=0;for(let y=0;y<7;y++)for(let x=0;x<5;x++)if(pat[y][x]===DIGITS[d][y][x])m++;const s=m/35;if(s>bs){bs=s;bd=d}};return{best:bd,score:Math.round(bs*100)/100}}
 
-function ocr(mask,W,H){const digits=[];for (const c of compsList(mask, W, H, false)) {const w=c.mxX-c.mnX+1,h=c.mxY-c.mnY+1;if(c.a<Math.max(80,W*H/1600))continue;if(w<W*0.02||w>W*0.5)continue;if(h<H*0.07||h>H*0.92)continue;if(isStraight(c,w,h))continue;const m=matchPat(mask,W,H,c.mnX,c.mnY,w,h);digits.push({x:c.mnX,best:m.best,score:m.score})};digits.sort((a,b)=>a.x-b.x);let text='';for(const d of digits) if(d.score>=0.5) text+=d.best;return { text, digits }}
+function ocr(mask,W,H){const digits=[];for (const c of compsList(mask, W, H, false)) {const w=c.mxX-c.mnX+1,h=c.mxY-c.mnY+1;if(c.a<Math.max(80,W*H/1600))continue;if(w<W*0.02||w>W*0.5)continue;if(h<H*0.07||h>H*0.92)continue;if(isStraight(c,w,h))continue;const m=matchPat(mask,W,H,c.mnX,c.mnY,w,h);digits.push({x:c.mnX,best:m.best,score:m.score})};digits.sort((a,b)=>a.x-b.x);let text='';for(const d of digits) if(d.score>=0.5) text+=d.best;return { text, digits}}
 
 function pickOcr(vars, W, H) {
   let best = null
@@ -1304,7 +1169,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.21 — убийство+CLI+{path:path} === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.22 — python -m inference + чистый FastAPI === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
