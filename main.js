@@ -1,6 +1,7 @@
-// VERSION: 3.7.31
+// VERSION: 3.7.32
 // main.js
-// v3.7.31: полный код + детальное логирование + SOCKS первым + try-catch
+// v3.7.32: ОТДЕЛЬНЫЙ SOCKS-прокси для Roboflow API (45.130.129.70:8000)
+//          + Minecraft через bproxy.site (два разных прокси)
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -26,7 +27,7 @@ const VIEW_SIGN = 1
 const CLOUD_RF_TIMEOUT_MS = 30000
 const CREATE_NO_WINDOW = 0x08000000
 
-// ========================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (для отлова ошибок) =========================
+// ========================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =========================
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-')
 const SLOG = []
 let REC_ROOT = null
@@ -46,7 +47,6 @@ function flushReport(extra) {
   }
 }
 
-// v3.7.31: ЛОВИМ ВСЕ ошибки на старте
 process.on('uncaughtException', e => {
   console.error('\n!!! UNCAUGHT EXCEPTION !!!')
   console.error('Message:', e.message)
@@ -206,6 +206,7 @@ const MC = {
   port: cfgGet(CFG, 'minecraft.port', 25565),
   version: cfgGet(CFG, 'minecraft.version', '1.21.1')
 }
+// Прокси для Minecraft (bproxy.site)
 const PROXY = {
   host: cfgGet(CFG, 'proxy.host', ''),
   port: cfgGet(CFG, 'proxy.port', 1080),
@@ -231,7 +232,34 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= ROBLOW (HARDCODED) =========================
+// ========================= v3.7.32: ROBLOW + ОТДЕЛЬНЫЙ SOCKS ДЛЯ API =========================
+// Специальный SOCKS-прокси для Roboflow API (поддерживает HTTPS/TLS)
+const RF_SOCKS_URL = 'socks5://5xBLgY:S8hzBU@45.130.129.70:8000'
+
+// Парсим URL формата socks5://user:pass@host:port
+function parseRfSocksUrl() {
+  try {
+    const m = RF_SOCKS_URL.match(/^socks5[h]?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/?$/i)
+    if (!m) {
+      step('[RF] ❌ Неправильный формат RF_SOCKS_URL: ' + RF_SOCKS_URL)
+      return null
+    }
+    const parsed = {
+      host: m[3],
+      port: Number(m[4]),
+      username: decodeURIComponent(m[1]),
+      password: decodeURIComponent(m[2])
+    }
+    step('[RF] ✓ RF SOCKS прокси: ' + parsed.host + ':' + parsed.port + ' (user: ' + parsed.username + ')')
+    return parsed
+  } catch (e) {
+    step('[RF] ❌ Ошибка парсинга RF_SOCKS_URL: ' + e.message)
+    return null
+  }
+}
+
+const RF_SOCKS = parseRfSocksUrl()
+
 const ROBOFLOW = {
   enabled: true,
   apiKey: 'kTAPmOyqKcxeBTyi18FD',
@@ -278,7 +306,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.31', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.32', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => {
@@ -414,7 +442,7 @@ async function rotateIp() {
   return currentRunIp
 }
 
-// ========================= v3.7.31: ROBLOW HTTP (ПОЛНОЕ ЛОГИРОВАНИЕ) =========================
+// ========================= v3.7.32: ROBLOW HTTP (с отдельным SOCKS) =========================
 function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
   return new Promise(resolve => {
     const mod = useTls ? https : http
@@ -514,6 +542,7 @@ function socksConnectSocket(host, port, useTls, proxyHost, proxyPort, proxyUser,
   })
 }
 
+// v3.7.32: SOCKS использует ОТДЕЛЬНЫЙ RF_SOCKS (не bproxy.site)
 async function rfPostOnce(transport, url, headers, body, timeoutMs) {
   let u = null
   try { u = new URL(url) } catch (e) {
@@ -534,14 +563,22 @@ async function rfPostOnce(transport, url, headers, body, timeoutMs) {
   }
   
   if (transport === 'socks') {
-    step('[RF]    → [' + transport + '] подключение к ' + hostname + ':' + port + ' через ' + PROXY.host + ':' + PROXY.port)
+    if (!RF_SOCKS) {
+      step('[RF]    ❌ [' + transport + '] RF_SOCKS не настроен, пропускаю')
+      return { status: 0, body: 'RF_SOCKS not configured', via: 'socks' }
+    }
+    
+    step('[RF]    → [' + transport + '] подключение к ' + hostname + ':' + port + ' через RF_SOCKS ' + RF_SOCKS.host + ':' + RF_SOCKS.port)
     let sk = null
     try {
-      sk = await socksConnectSocket(hostname, port, useTls, PROXY.host, PROXY.port, PROXY.username, PROXY.password)
-      step('[RF]    ✓ [' + transport + '] SOCKS OK, отправляю запрос...')
+      sk = await socksConnectSocket(
+        hostname, port, useTls,
+        RF_SOCKS.host, RF_SOCKS.port, RF_SOCKS.username, RF_SOCKS.password
+      )
+      step('[RF]    ✓ [' + transport + '] SOCKS OK через ' + RF_SOCKS.host + ', отправляю запрос...')
     } catch (e) {
       const errMsg = ((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || e)
-      step('[RF]    ❌ [' + transport + '] SOCKS ошибка: ' + errMsg)
+      step('[RF]    ❌ [' + transport + '] SOCKS ошибка через ' + RF_SOCKS.host + ': ' + errMsg)
       return { status: 0, body: 'SOCKS ERR: ' + errMsg, via: 'socks' }
     }
     try {
@@ -563,7 +600,7 @@ async function rfPost(url, headers, body) {
   const timeoutMs = CLOUD_RF_TIMEOUT_MS
   
   const transports = []
-  if (PROXY.host) transports.push('socks')
+  if (RF_SOCKS) transports.push('socks')  // v3.7.32: проверяем наличие RF_SOCKS
   transports.push('direct')
   
   step('[RF]  📡 Порядок транспортов: ' + transports.join(' → '))
@@ -1363,6 +1400,7 @@ function connectAndCapture(tag) {
     hardT = setTimeout(() => finish(linkedNow() >= 8 && col.prompts >= 1, 'timeout'), CAPTCHA_TIMEOUT_MS)
     if (!PROXY.host) { finish(false, 'нет proxy.host'); return }
 
+    // Minecraft через bproxy.site (не RF_SOCKS!)
     SocksClient.createConnection({
       proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password },
       command: 'connect',
@@ -1461,7 +1499,10 @@ function connectAndCapture(tag) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.7.31 ===')
+  step('=== СТАРТ v3.7.32 ===')
+  step('🎯 ДВА РАЗНЫХ ПРОКСИ:')
+  step('   Minecraft: ' + PROXY.host + ':' + PROXY.port + ' (bproxy.site)')
+  step('   Roboflow:  ' + (RF_SOCKS ? RF_SOCKS.host + ':' + RF_SOCKS.port : 'НЕ НАСТРОЕН') + ' (45.130.129.70)')
   
   if (!CFG_PATH) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
 
@@ -1470,7 +1511,6 @@ async function main() {
   let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
-  step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('ROBOFLOW (HARDCODED):')
   step('  serverlessUrl = ' + ROBOFLOW.serverlessUrl)
   step('  detectUrl     = ' + ROBOFLOW.detectUrl)
@@ -1544,7 +1584,6 @@ async function main() {
   setTimeout(() => process.exit(0), 2000)
 }
 
-// v3.7.31: ЛОВИМ ВСЕ ошибки main
 main().catch(e => {
   console.error('\n!!! FATAL MAIN ERROR !!!')
   console.error('Message:', e.message)
