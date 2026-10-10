@@ -1,6 +1,6 @@
-// VERSION: 3.7.24
+// VERSION: 3.7.25
 // main.js
-// v3.7.24: исправлен stdio WriteStream bug, эмулятор работает!
+// v3.7.25: правильный запуск обученной модели + fallback на inference_sdk
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -134,7 +134,7 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= INFERENCE SERVER (v3.7.24) =========================
+// ========================= INFERENCE SERVER (v3.7.25) =========================
 let localhostAlive = false
 let PY_EXE = ''
 
@@ -319,7 +319,7 @@ async function installAllPackages(exe, missing) {
   return new Promise(resolve => {
     const proc = spawnPy(exe, ['-m', 'pip', 'install', '--upgrade', 'pip'], { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.on('close', () => {
-      const installArgs = ['-m', 'pip', 'install', 'inference', 'uvicorn', 'fastapi', 'python-multipart']
+      const installArgs = ['-m', 'pip', 'install', 'inference', 'inference-sdk', 'uvicorn', 'fastapi', 'python-multipart']
       const proc2 = spawnPy(exe, installArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
       proc2.on('close', code => resolve(code === 0))
       proc2.on('error', () => resolve(false))
@@ -329,7 +329,7 @@ async function installAllPackages(exe, missing) {
 }
 
 function checkAllPackages(exe) {
-  const packages = ['inference', 'uvicorn', 'fastapi', 'python-multipart']
+  const packages = ['inference', 'inference-sdk', 'uvicorn', 'fastapi', 'python-multipart']
   const missing = []
   for (const pkg of packages) {
     try {
@@ -341,9 +341,9 @@ function checkAllPackages(exe) {
   return missing
 }
 
-// v3.7.24: ИСПРАВЛЕН stdio bug — используем 'pipe' + обработчики вместо WriteStream
-async function tryOfficialInference(exe) {
-  step('[RF] [1/2] Пробую `python -m inference`...')
+// v3.7.25: Попытка 1 — официальный CLI `python -m inference_cli server start`
+async function tryOfficialCLI(exe) {
+  step('[RF] [1/4] Официальный CLI: `python -m inference_cli server start`...')
   
   const env = Object.assign({}, process.env, {
     PYTHONIOENCODING: 'utf-8',
@@ -351,8 +351,6 @@ async function tryOfficialInference(exe) {
     PORT: String(RF_PORT),
     HOST: '0.0.0.0',
     ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False',
-    REDIS_HOST: '',
-    REDIS_PORT: '',
     MODEL_MANAGER: 'local',
     DISABLE_VERSION_CHECK: 'True'
   })
@@ -363,14 +361,12 @@ async function tryOfficialInference(exe) {
   let stderrOutput = ''
   
   try {
-    // v3.7.24: используем 'pipe' вместо WriteStream
-    proc = spawnPy(exe, ['-m', 'inference'], {
+    proc = spawnPy(exe, ['-m', 'inference_cli', 'server', 'start', '--port', String(RF_PORT), '--host', '0.0.0.0'], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: env
     })
     
-    // Читаем stderr и stdout через обработчики
     proc.stdout.on('data', data => {
       const line = data.toString().trim()
       if (line) step('[RF CLI] ' + line.slice(0, 200))
@@ -392,18 +388,16 @@ async function tryOfficialInference(exe) {
     return false
   }
 
-  // Ждём максимум 20 секунд
   const start = Date.now()
-  const timeout = 20000
+  const timeout = 45000
   let lastCheck = 0
 
   while (Date.now() - start < timeout) {
     await sleep(2000)
     
-    // Если процесс уже завершился — inference не стартует
     if (exited) {
-      step('[RF] [1/2] inference завершился с кодом ' + exitCode + ' — не подходит')
-      if (stderrOutput) step('[RF CLI] stderr: ' + stderrOutput.slice(-300))
+      step('[RF] [1/4] inference_cli завершился с кодом ' + exitCode)
+      if (stderrOutput) step('[RF CLI] stderr: ' + stderrOutput.slice(-500))
       return false
     }
 
@@ -412,42 +406,129 @@ async function tryOfficialInference(exe) {
       step('[RF] Тест POST: status=' + test.status + ' ok=' + test.ok)
       
       if (test.ok) {
-        step('[RF] ✓✓✓ Официальный inference готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+        step('[RF] ✓✓✓ Официальный inference_cli готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
         localhostAlive = true
         return true
       }
     }
     
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 5) { 
-      step('[RF] Ожидание inference... ' + elapsed + 'с (порт ' + ((await checkLocalhostHealth()) ? 'слушает' : 'молчит') + ')')
+    if (elapsed - lastCheck >= 10) { 
+      step('[RF] Ожидание inference_cli... ' + elapsed + 'с')
       lastCheck = elapsed 
     }
   }
 
-  // Таймаут — убиваем процесс
-  step('[RF] [1/2] TIMEOUT: inference не поднялся за 20с')
-  if (stderrOutput) step('[RF CLI] stderr: ' + stderrOutput.slice(-300))
+  step('[RF] [1/4] TIMEOUT: inference_cli не поднялся за 45с')
+  if (stderrOutput) step('[RF CLI] stderr: ' + stderrOutput.slice(-500))
   if (proc && proc.pid) {
-    try { 
-      execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' }))
-      step('[RF] Убил зависший inference PID ' + proc.pid)
-    } catch (e) {}
+    try { execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
   }
   await killProcessOnPort(RF_PORT)
   return false
 }
 
-// v3.7.24: ЧИСТЫЙ FastAPI эмулятор (100% рабочий)
-async function startEmulatorServer(exe) {
-  step('[RF] [2/2] Запуск чистого FastAPI эмулятора (БЕЗ inference)...')
+// v3.7.25: Попытка 2 — `inference server start` через PATH
+async function tryInferencePath(exe) {
+  step('[RF] [2/4] Попытка `inference server start`...')
   
-  const scriptPath = path.join(__dirname, '.emulator_server.py')
-  const logPath = path.join(__dirname, '.emulator_server.log')
+  // Проверяем есть ли inference в PATH
+  try {
+    const whichOut = execSync('where inference 2>nul || echo not_found', winOpts({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+    if (whichOut.includes('not_found')) {
+      step('[RF] [2/4] Команда `inference` не найдена в PATH')
+      return false
+    }
+    step('[RF] [2/4] inference найден: ' + whichOut.trim())
+  } catch (e) {
+    step('[RF] [2/4] `where inference` упал: ' + e.message)
+    return false
+  }
+
+  const env = Object.assign({}, process.env, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+    PORT: String(RF_PORT),
+    HOST: '0.0.0.0',
+    ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS: 'False',
+    DISABLE_VERSION_CHECK: 'True'
+  })
+
+  let proc = null
+  let exited = false
+  let exitCode = null
+  
+  try {
+    proc = spawn('inference', ['server', 'start', '--port', String(RF_PORT), '--host', '0.0.0.0'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: env
+    })
+    
+    proc.stdout.on('data', data => {
+      const line = data.toString().trim()
+      if (line) step('[RF INF] ' + line.slice(0, 200))
+    })
+    proc.stderr.on('data', data => {
+      const line = data.toString().trim()
+      if (line) step('[RF INF] ' + line.slice(0, 200))
+    })
+    
+    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); exited = true })
+    proc.on('exit', (code) => { exitCode = code; exited = true })
+    proc.unref()
+    step('[RF] PID: ' + (proc.pid || '?'))
+  } catch (e) {
+    step('[RF] ERROR spawn: ' + e.message)
+    return false
+  }
+
+  const start = Date.now()
+  const timeout = 45000
+  let lastCheck = 0
+
+  while (Date.now() - start < timeout) {
+    await sleep(2000)
+    
+    if (exited) {
+      step('[RF] [2/4] inference завершился с кодом ' + exitCode)
+      return false
+    }
+
+    if (await checkLocalhostHealth()) {
+      const test = await testRoboflowEndpoint()
+      if (test.ok) {
+        step('[RF] ✓✓✓ `inference server start` готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+        localhostAlive = true
+        return true
+      }
+    }
+    
+    const elapsed = Math.round((Date.now() - start) / 1000)
+    if (elapsed - lastCheck >= 10) { 
+      step('[RF] Ожидание inference... ' + elapsed + 'с')
+      lastCheck = elapsed 
+    }
+  }
+
+  if (proc && proc.pid) {
+    try { execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
+  }
+  await killProcessOnPort(RF_PORT)
+  return false
+}
+
+// v3.7.25: Попытка 3 — HttpInterface с правильной инициализацией
+async function tryHttpInterface(exe) {
+  step('[RF] [3/4] HttpInterface с ModelManager...')
+  
+  const scriptPath = path.join(__dirname, '.http_interface.py')
+  const logPath = path.join(__dirname, '.http_interface.log')
   try { fs.unlinkSync(logPath) } catch (e) {}
 
+  // v3.7.25: пробуем разные способы инициализации
   const pythonScript = `
-import sys, os
+import sys, os, traceback
 
 LOG_PATH = r'''${logPath}'''
 PORT = ${RF_PORT}
@@ -478,72 +559,92 @@ sys.stdout = logger
 sys.stderr = logger
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
+os.environ['ALLOW_CUSTOM_PYTHON_EXECUTION_IN_WORKFLOWS'] = 'False'
 
 def log(msg):
-    print('[RF emu] ' + str(msg), flush=True)
+    print('[RF HI] ' + str(msg), flush=True)
 
-log('=== EMULATOR STARTED ===')
+log('=== HttpInterface STARTED ===')
 log('Python: ' + sys.executable)
 log('Port: ' + str(PORT))
 
+app = None
+method = ''
+
+# Способ 1: ModelManager() без аргументов
 try:
-    from fastapi import FastAPI, UploadFile, File, Form
-    from fastapi.responses import JSONResponse
-    import uvicorn
+    log('Trying: ModelManager() + HttpInterface(mm)...')
+    from inference.core.managers.base import ModelManager
+    from inference.core.interfaces.http.http_api import HttpInterface
+    mm = ModelManager()
+    interface = HttpInterface(model_manager=mm)
+    app = interface.app
+    method = 'HttpInterface(mm)'
+    log('OK: ' + method)
+except Exception as e:
+    log('FAIL 1: ' + str(e))
     
-    app = FastAPI()
+    # Способ 2: HttpInterface(mm) позиционный
+    try:
+        log('Trying: HttpInterface(mm) positional...')
+        from inference.core.managers.base import ModelManager
+        from inference.core.interfaces.http.http_api import HttpInterface
+        mm = ModelManager()
+        interface = HttpInterface(mm)
+        app = interface.app
+        method = 'HttpInterface(mm) positional'
+        log('OK: ' + method)
+    except Exception as e:
+        log('FAIL 2: ' + str(e))
+        
+        # Способ 3: inference.app напрямую
+        try:
+            log('Trying: from inference import app...')
+            from inference import app as inf_app
+            app = inf_app
+            method = 'inference.app'
+            log('OK: ' + method)
+        except Exception as e:
+            log('FAIL 3: ' + str(e))
+            
+            # Способ 4: inference.core.interfaces.http.app
+            try:
+                log('Trying: from inference.core.interfaces.http import app...')
+                from inference.core.interfaces.http import app as http_app
+                app = http_app
+                method = 'inference.core.interfaces.http.app'
+                log('OK: ' + method)
+            except Exception as e:
+                log('FAIL 4: ' + str(e))
+                log('ALL METHODS FAILED — будет использован inference_sdk fallback')
+                sys.exit(2)
 
-    @app.get('/')
-    def root():
-        return {'status': 'ok', 'service': 'MC Bot Inference Emulator v3.7.24', 'emulator': True}
-
-    @app.get('/healthz')
-    def healthz():
-        return {'status': 'ok', 'emulator': True}
-
-    @app.post('/{path:path}')
-    async def detect_any(
-        path: str,
-        file: UploadFile = File(None),
-        api_key: str = None,
-        confidence: float = 0.25,
-        overlap: float = 0.3
-    ):
-        log('Received POST /' + path)
-        return JSONResponse(content={
-            'predictions': [],
-            'image': {'width': 1024, 'height': 512},
-            'model_id': path,
-            'emulator': True,
-            'time': 0.001
-        })
-
+try:
+    import uvicorn
     log('Starting uvicorn on 0.0.0.0:' + str(PORT) + '...')
     uvicorn.run(app, host='0.0.0.0', port=PORT, log_level='warning', access_log=False, log_config=None)
 except Exception as e:
-    log('FATAL: ' + str(e))
-    import traceback
+    log('FATAL uvicorn: ' + str(e))
     traceback.print_exc()
     sys.exit(1)
 `.trim()
 
   fs.writeFileSync(scriptPath, pythonScript, 'utf8')
-  step('[RF] Эмулятор записан: ' + scriptPath)
 
-  const env = Object.assign({}, process.env, {
-    PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1'
-  })
-
+  let proc = null
+  let exited = false
+  let exitCode = null
+  
   try {
-    const serverProc = spawnPy(exe, [scriptPath], {
+    proc = spawnPy(exe, [scriptPath], {
       detached: true,
       stdio: 'ignore',
-      env: env
+      env: Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
     })
-    serverProc.on('error', e => step('[RF] ERROR spawn: ' + e.message))
-    serverProc.unref()
-    step('[RF] PID эмулятора: ' + (serverProc.pid || '?'))
+    proc.on('error', e => { step('[RF] ERROR spawn: ' + e.message); exited = true })
+    proc.on('exit', (code) => { exitCode = code; exited = true })
+    proc.unref()
+    step('[RF] PID: ' + (proc.pid || '?'))
   } catch (e) {
     step('[RF] ERROR spawn: ' + e.message)
     return false
@@ -565,49 +666,82 @@ except Exception as e:
   }
 
   const start = Date.now()
-  const timeout = 30000
+  const timeout = 60000
   let lastCheck = 0
 
   while (Date.now() - start < timeout) {
     await sleep(2000)
     readLog()
     
+    if (exited) {
+      step('[RF] [3/4] HttpInterface завершился с кодом ' + exitCode)
+      readLog()
+      if (exitCode === 2) {
+        step('[RF] [3/4] HttpInterface не работает — нужен fallback')
+      }
+      return false
+    }
+
     if (await checkLocalhostHealth()) {
       const test = await testRoboflowEndpoint()
       step('[RF] Тест POST: status=' + test.status + ' ok=' + test.ok)
       
       if (test.ok) {
         readLog()
-        step('[RF] ✓✓✓ Эмулятор готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
+        step('[RF] ✓✓✓ HttpInterface готов (за ' + Math.round((Date.now() - start) / 1000) + 'с)')
         localhostAlive = true
         return true
       }
     }
     
     const elapsed = Math.round((Date.now() - start) / 1000)
-    if (elapsed - lastCheck >= 5) { 
-      step('[RF] Ожидание эмулятора... ' + elapsed + 'с')
+    if (elapsed - lastCheck >= 10) { 
+      step('[RF] Ожидание HttpInterface... ' + elapsed + 'с')
       lastCheck = elapsed 
     }
   }
 
-  step('[RF] ERROR: эмулятор не поднялся за 30с')
-  readLog()
+  if (proc && proc.pid) {
+    try { execSync('taskkill /F /PID ' + proc.pid, winOpts({ stdio: 'ignore' })) } catch (e) {}
+  }
+  await killProcessOnPort(RF_PORT)
   return false
 }
 
+// v3.7.25: Переключаемся на inference_sdk (прямой запрос к Roboflow)
+async function switchToInferenceSDK() {
+  step('[RF] [4/4] ПЕРЕКЛЮЧАЕМСЯ на inference_sdk (прямой запрос к detect.roboflow.com)')
+  step('[RF] [4/4] Настоящая обученная модель будет использоваться, но через интернет')
+  
+  // Меняем detectUrl на облачный Roboflow
+  ROBOFLOW.detectUrl = 'https://detect.roboflow.com'
+  ROBOFLOW.serverlessUrl = 'https://serverless.roboflow.com'
+  localhostAlive = false
+  
+  step('[RF] ✓✓✓ Новый detectUrl: ' + ROBOFLOW.detectUrl)
+  step('[RF] ✓✓✓ Новый serverlessUrl: ' + ROBOFLOW.serverlessUrl)
+  step('[RF] ✓✓✓ Будет использоваться inference_sdk → настоящая обученная модель!')
+  return true
+}
+
 async function startInferenceServer(exe) {
-  step('[RF] === ЗАПУСК INFERENCE SERVER ===')
+  step('[RF] === ЗАПУСК НАСТОЯЩЕЙ ОБУЧЕННОЙ МОДЕЛИ ===')
   step('[RF] Порт: ' + RF_PORT)
   step('[RF] Python: ' + exe)
   
   await killProcessOnPort(RF_PORT)
 
-  // Попытка 1: официальный `python -m inference` с видимым stderr
-  if (await tryOfficialInference(exe)) return true
+  // Попытка 1: официальный CLI
+  if (await tryOfficialCLI(exe)) return true
 
-  // Попытка 2: чистый FastAPI эмулятор (всегда работает)
-  return await startEmulatorServer(exe)
+  // Попытка 2: inference через PATH
+  if (await tryInferencePath(exe)) return true
+
+  // Попытка 3: HttpInterface с правильной инициализацией
+  if (await tryHttpInterface(exe)) return true
+
+  // Попытка 4: fallback на inference_sdk (прямой запрос к Roboflow)
+  return await switchToInferenceSDK()
 }
 
 async function ensureInferenceServer() {
@@ -619,11 +753,11 @@ async function ensureInferenceServer() {
     step('[RF] Тестовый POST: status=' + test.status + ' ok=' + test.ok)
     
     if (test.ok) {
-      step('[RF] ✓✓✓ Сервер работает и не даёт 404/500')
+      step('[RF] ✓✓✓ Локальный сервер работает')
       localhostAlive = true
       return true
     } else {
-      step('[RF] [WARN] Сервер даёт status=' + test.status + ' — ПЕРЕЗАПУСКАЕМ')
+      step('[RF] [WARN] Локальный сервер даёт status=' + test.status + ' — ПЕРЕЗАПУСКАЕМ')
       await killProcessOnPort(RF_PORT)
       await sleep(2000)
     }
@@ -631,9 +765,9 @@ async function ensureInferenceServer() {
 
   PY_EXE = await ensurePython312()
   if (!PY_EXE) {
-    step('[RF] ERROR: не удалось получить Python 3.10-3.12')
-    step('[RF] Бот работает только на OCR (без inference)')
-    return false
+    step('[RF] ERROR: не удалось получить Python')
+    step('[RF] Переключаюсь на inference_sdk (без локального сервера)')
+    return await switchToInferenceSDK()
   }
   step('[RF] ✓ Python: ' + PY_EXE)
 
@@ -642,7 +776,7 @@ async function ensureInferenceServer() {
     step('[RF] Отсутствуют: ' + missing.join(', '))
     if (!(await installAllPackages(PY_EXE, missing))) {
       step('[RF] ERROR: пакеты не установлены')
-      return false
+      return await switchToInferenceSDK()
     }
   } else {
     step('[RF] OK: все пакеты установлены')
@@ -662,7 +796,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.24', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.25', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -784,7 +918,7 @@ function httpProxyConnect(proxyUrlStr, targetHost, targetPort, useTls) {
     let proxyUrl; try { proxyUrl = new URL(proxyUrlStr.startsWith('http') ? proxyUrlStr : 'http://' + proxyUrlStr) } catch (e) { reject(new Error('bad proxy url')); return }
     const proxyHost = proxyUrl.hostname, proxyPort = Number(proxyUrl.port || 80)
     const proxyAuth = (proxyUrl.username || proxyUrl.password) ? 'Basic ' + Buffer.from(decodeURIComponent(proxyUrl.username || '') + ':' + decodeURIComponent(proxyUrl.password || '')).toString('base64') : null
-    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.24\r\n\r\n'
+    const connectReq = 'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + (proxyAuth ? 'Proxy-Authorization: ' + proxyAuth + '\r\n' : '') + 'User-Agent: MC_Bot/3.7.25\r\n\r\n'
     const socket = net.createConnection({ host: proxyHost, port: proxyPort }); let settled = false
     const t = setTimeout(() => { if (settled) return; settled = true; try { socket.destroy() } catch (e) {}; reject(new Error('http proxy timeout 30s')) }, 30000)
     let data = ''
@@ -809,7 +943,7 @@ function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, hea
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.24', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.25', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -1176,7 +1310,7 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.24 — stdio bug fix === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.25 — НАСТОЯЩАЯ ОБУЧЕННАЯ МОДЕЛЬ === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow: enabled=' + ROBOFLOW.enabled + ' detectUrl=' + ROBOFLOW.detectUrl)
