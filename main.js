@@ -1,6 +1,6 @@
-// VERSION: 3.7.26
+// VERSION: 3.7.27
 // main.js
-// v3.7.26: прямой запрос к detect.roboflow.com (без локального inference!)
+// v3.7.27: автофикс localhost в config + login timeout 30с + авто-ротация
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
@@ -19,8 +19,8 @@ const MIN_PLACED = 10
 const SETTLE_MS = 2000
 const CAPTCHA_TIMEOUT_MS = 45000
 const CONNECT_TIMEOUT_MS = 35000
-const LOGIN_TIMEOUT_MS = 15000
-const MAX_ROTATIONS_ON_FAIL = 4
+const LOGIN_TIMEOUT_MS = 30000  // v3.7.27: увеличен с 15000 до 30000
+const MAX_ROTATIONS_ON_FAIL = 6  // v3.7.27: увеличен с 4 до 6
 const VIEW_SIGN = 1
 
 const CLOUD_RF_TIMEOUT_MS = 30000
@@ -131,13 +131,29 @@ const badIPs = new Set()
 let currentRunIp = null
 let proxyDead = false
 
-// ========================= ROBLOW API (v3.7.26: ПРЯМОЙ ЗАПРОС В ОБЛАКО) =========================
+// ========================= ROBLOW API (v3.7.27: АВТОФИКС КОНФИГА) =========================
+// v3.7.27: читаем из конфига, но ПРИНУДИТЕЛЬНО исправляем localhost на detect.roboflow.com
+let _cfgDetectUrl = cfgGet(CFG, 'roboflow.detectUrl', 'http://localhost:9001')
+let _cfgModelId = cfgGet(CFG, 'roboflow.modelId', 'captchas-gz2yx/funtimecaptcha/1')
+
+// v3.7.27: АВТОФИКС — если detectUrl localhost, заменяем на настоящий
+if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0)/i.test(_cfgDetectUrl.replace(/^https?:\/\//, ''))) {
+  step('[RF] ⚠️ ВНИМАНИЕ: detectUrl в конфиге указывает на localhost — АВТОЗАМЕНА на https://detect.roboflow.com')
+  step('[RF] ⚠️ Откройте config.json и измените roboflow.detectUrl вручную!')
+  _cfgDetectUrl = 'https://detect.roboflow.com'
+}
+
+// v3.7.27: АВТОФИКС modelId — заменяем старый на правильный
+if (_cfgModelId === 'captchas-gz2yx/funtimecaptcha/1') {
+  step('[RF] ⚠️ ВНИМАНИЕ: modelId неправильный (старая модель) — АВТОЗАМЕНА на funtimecapth/captcha-funtime/1')
+  _cfgModelId = 'funtimecapth/captcha-funtime/1'
+}
+
 const ROBOFLOW = {
   enabled: cfgGet(CFG, 'roboflow.enabled', true),
-  apiKey: cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD'),
-  modelId: cfgGet(CFG, 'roboflow.modelId', 'captchas-gz2yx/funtimecaptcha/1'),
-  // v3.7.26: ПРЯМО detect.roboflow.com! Никакого localhost!
-  detectUrl: cfgGet(CFG, 'roboflow.detectUrl', 'https://detect.roboflow.com'),
+  apiKey: cfgGet(CFG, 'roboflow.apiKey', ''),
+  modelId: _cfgModelId,
+  detectUrl: _cfgDetectUrl,
   serverlessUrl: cfgGet(CFG, 'roboflow.serverlessUrl', 'https://serverless.roboflow.com'),
   confidence: cfgGet(CFG, 'roboflow.confidence', 25),
   overlap: cfgGet(CFG, 'roboflow.overlap', 20),
@@ -152,7 +168,6 @@ function rfMultipart(buf, filename, boundary) {
   return Buffer.concat([head, buf, tail])
 }
 
-// v3.7.26: Убиваем мусор на порту 9001 (эмулятор от предыдущих запусков)
 async function killPort9001() {
   try {
     const out = execSync('netstat -ano | findstr :9001', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, creationFlags: CREATE_NO_WINDOW })
@@ -182,7 +197,7 @@ function plainGet(urlStr, timeoutMs) {
       if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
       const u = urls[idx]
       const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.26', 'Accept': '*/*' } }
+      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.27', 'Accept': '*/*' } }
       if (insecure) opts.rejectUnauthorized = false
       let req = null
       const timer = setTimeout(() => { if (stopped) return; try { if (req) req.destroy() } catch (e) {}; lastErr = 'timeout'; attempt(urls, idx + 1, redirectsLeft, insecure) }, timeoutMs)
@@ -243,12 +258,12 @@ async function rotateIp() {
   currentRunIp = await currentIp(); return currentRunIp
 }
 
-// ========================= ROBLOW: ПРЯМОЙ HTTP ЗАПРОС К detect.roboflow.com =========================
+// ========================= ROBLOW: ПРЯМОЙ HTTP =========================
 function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
   return new Promise(resolve => {
     const mod = useTls ? https : http; const defaultPort = useTls ? 443 : 80
     const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.26', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
+    const h = Object.assign({ 'User-Agent': 'MC_Bot/3.7.27', 'Accept': 'application/json,*/*', 'Accept-Encoding': 'identity', 'Connection': 'close', 'Host': hostHeader }, headers || {})
     if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
     const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }; if (socket) opts.socket = socket
     let done = false; const finish = obj => { if (done) return; done = true; resolve(obj) }
@@ -277,7 +292,6 @@ function socksConnectSocket(host, port, useTls, proxyHost, proxyPort, proxyUser,
   })
 }
 
-// v3.7.26: Прямой запрос к detect.roboflow.com через SOCKS прокси (или напрямую)
 async function rfPostOnce(transport, url, headers, body, timeoutMs) {
   let u = null; try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL: ' + ((e && e.message) || e), via: transport } }
   const useTls = u.protocol === 'https:'
@@ -291,7 +305,6 @@ async function rfPostOnce(transport, url, headers, body, timeoutMs) {
     return r
   }
   
-  // Через SOCKS прокси
   let sk = null
   try {
     sk = await socksConnectSocket(hostname, port, useTls, PROXY.host, PROXY.port, PROXY.username, PROXY.password)
@@ -307,16 +320,12 @@ async function rfPostOnce(transport, url, headers, body, timeoutMs) {
   }
 }
 
-// v3.7.26: умная отправка с fallback'ом и детальным логированием
 async function rfPost(url, headers, body) {
   let u; try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL', via: 'none' } }
   const timeoutMs = CLOUD_RF_TIMEOUT_MS
-  
-  // v3.7.26: пробуем сначала напрямую, потом через SOCKS
   const transports = []
   if (PROXY.host) transports.push('socks')
   transports.push('direct')
-  
   const attemptsLog = []; let last = null
   for (const tr of transports) {
     const r = await rfPostOnce(tr, url, headers, body, timeoutMs)
@@ -324,10 +333,7 @@ async function rfPost(url, headers, body) {
     last = r
     const st = Number(r.status || 0)
     if (st >= 200 && st < 400) { last._attempts = attemptsLog; return last }
-    if (st === 401 || st === 403 || st === 404) { 
-      last._attempts = attemptsLog
-      return last 
-    }
+    if (st === 401 || st === 403 || st === 404) { last._attempts = attemptsLog; return last }
     await sleep(500)
   }
   if (last) last._attempts = attemptsLog
@@ -386,22 +392,20 @@ function rfMetrics(preds) {
   return { n, avg: Math.round(avg * 1000) / 1000, row, plausible, strong, score, text: digits.map(d => d.digit).join(''), digits }
 }
 
-// v3.7.26: отправка с детальным логированием
 async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
   if (!ROBOFLOW || ROBOFLOW.enabled === false || !ROBOFLOW.apiKey) {
     return { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
   }
   
   const key = String(ROBOFLOW.apiKey)
-  const model = String(ROBOFLOW.modelId || 'funtimecapth/captcha-funtime/1').replace(/^\/+|\/+$/g, '')
-  const detectBase = String(ROBOFLOW.detectUrl || 'https://detect.roboflow.com').replace(/\/+$/, '')
+  const model = String(ROBOFLOW.modelId).replace(/^\/+|\/+$/g, '')
+  const detectBase = String(ROBOFLOW.detectUrl).replace(/\/+$/, '')
   const conf = encodeURIComponent(ROBOFLOW.confidence || 25)
   const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
   const boundary = '----MCBotRF' + Date.now() + Math.floor(Math.random() * 1000000)
   const mp = rfMultipart(pngBuffer, filename, boundary)
   const detectUrl = detectBase + '/' + model + '?api_key=' + encodeURIComponent(key) + '&confidence=' + conf + '&overlap=' + ov
   
-  // v3.7.26: логируем URL (без api_key)
   const safeUrl = detectUrl.replace(/api_key=[^&]+/, 'api_key=***')
   step('[RF] Запрос к: ' + safeUrl)
   
@@ -413,31 +417,20 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
   let last = null
   for (const at of attempts) {
     const r = await rfPost(at.url, at.headers, at.body)
-    
-    // v3.7.26: детальное логирование ответа
     const bodyPreview = String(r.body || '').slice(0, 500).replace(/\s+/g, ' ')
     step('[RF] Ответ ' + at.name + ': status=' + r.status + ' via=' + (r.via || '?') + ' body=' + bodyPreview)
     
-    // v3.7.26: обработка специфических ошибок
     if (r.status === 401) {
-      step('[RF] ❌ 401 Unauthorized — НЕВЕРНЫЙ API-КЛЮЧ! Проверьте roboflow.apiKey в конфиге')
-      step('[RF] Получите ключ на https://app.roboflow.com/ → Settings → API Key')
+      step('[RF] ❌ 401 Unauthorized — НЕВЕРНЫЙ API-КЛЮЧ!')
       return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY', raw: r.body }
     }
     if (r.status === 403) {
-      step('[RF] ❌ 403 Forbidden — НЕТ ДОСТУПА К МОДЕЛИ!')
-      step('[RF] Ваша модель "' + model + '" закрытая. Проверьте:')
-      step('[RF]   1. API-ключ принадлежит тому же workspace, что и модель')
-      step('[RF]   2. У вас есть права на модель (owner/member)')
-      step('[RF]   3. Либо используйте публичную модель (workspace/project)')
-      return { ok: false, status: 403, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'ACCESS DENIED to model ' + model, raw: r.body }
+      step('[RF] ❌ 403 Forbidden — НЕТ ДОСТУПА К МОДЕЛИ "' + model + '"')
+      return { ok: false, status: 403, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'ACCESS DENIED', raw: r.body }
     }
     if (r.status === 404) {
-      step('[RF] ❌ 404 Not Found — МОДЕЛЬ НЕ НАЙДЕНА!')
-      step('[RF] Проверьте roboflow.modelId в конфиге. Сейчас: "' + model + '"')
-      step('[RF] Правильный формат: workspace-id/project-id/version')
-      step('[RF] Пример: funtimecapth/captcha-funtime/1')
-      return { ok: false, status: 404, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'MODEL NOT FOUND: ' + model, raw: r.body }
+      step('[RF] ❌ 404 Not Found — МОДЕЛЬ "' + model + '" НЕ НАЙДЕНА')
+      return { ok: false, status: 404, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'MODEL NOT FOUND', raw: r.body }
     }
     
     let json = null
@@ -446,35 +439,23 @@ async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
     const metrics = rfMetrics(predictions)
     const ok = r.status >= 200 && r.status < 300 && !!json
     
-    const item = { 
-      ok, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics, 
-      raw: String(r.body || '').slice(0, 3000), 
-      attempts: r._attempts || [], 
-      error: ok ? null : (String(r.body || '').replace(/\s+/g, ' ').slice(0, 300) || 'HTTP ' + r.status) 
-    }
+    const item = { ok, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics, raw: String(r.body || '').slice(0, 3000), attempts: r._attempts || [], error: ok ? null : (String(r.body || '').replace(/\s+/g, ' ').slice(0, 300) || 'HTTP ' + r.status) }
     
-    // Сохраняем debug файлы
     if (debugDir) {
       try {
         fs.mkdirSync(debugDir, { recursive: true })
-        fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'), 
-          'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nATTEMPT: ' + at.name + '\nURL: ' + safeUrl + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
+        fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'), 'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + safeUrl + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
       } catch (e) {}
     }
     
     if (label && typeof step === 'function') {
-      step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') + 
-        (ok ? ' ✓ НАЙДЕНО ЦИФР: ' + metrics.n + ' row=' + metrics.row + ' text="' + metrics.text + '"' 
-            : ' ' + String(item.raw || '').replace(/\s+/g, ' ').slice(0, 140)))
+      step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') + (ok ? ' ✓ ЦИФР: ' + metrics.n + ' text="' + metrics.text + '"' : ' ' + String(item.raw || '').replace(/\s+/g, ' ').slice(0, 140)))
     }
     
     if (ok) return item
     last = item
-    
-    // Если 401/403/404 — не пробуем другие способы
     if (r.status === 401 || r.status === 403 || r.status === 404) break
   }
-  
   return last || { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'no attempts' }
 }
 
@@ -666,7 +647,6 @@ async function saveRecord(outDir, snap, label) {
     label + ': ORIGINAL=' + w.tag +
     ' rfDigits=' + (best.rf && best.rf.metrics ? best.rf.metrics.n : 0) +
     ' rfText="' + (best.rf && best.rf.metrics ? best.rf.metrics.text : '') + '"' +
-    ' confAdj=' + best.confAdj.toFixed(2) +
     ' ocr="' + best.pick.text + '" (' + best.pick.name + ')' +
     ' -> ' + outDir
   )
@@ -709,7 +689,8 @@ function connectAndCapture(tag) {
         ev('socks ok -> ' + MC.host)
         const nick = (NICK_PREFIX + Math.floor(Math.random() * 9000 + 1000)).slice(0, 16); const tConn = Date.now()
         const tSpawn = setTimeout(() => { if (!finished) finish(false, 'spawn timeout') }, CONNECT_TIMEOUT_MS)
-        loginT = setTimeout(() => { if (!finished) finish(false, 'login timeout') }, LOGIN_TIMEOUT_MS)
+        // v3.7.27: увеличен login timeout
+        loginT = setTimeout(() => { if (!finished) { ev('⚠️ login timeout через 30с — сервер ' + MC.host + ' не отвечает'); finish(false, 'login timeout') } }, LOGIN_TIMEOUT_MS)
 
         bot = mineflayer.createBot({ username: nick, host: MC.host, port: MC.port, version: MC.version, socket: conn.socket, hideErrors: true, auth: 'offline', keepAlive: true })
         bot._client.on('packet', (data, meta) => { try { if (!meta || !meta.name) return; if (col.packets.length < 4000) col.packets.push(new Date().toISOString() + ' PKT ' + meta.name) } catch (e) {} })
@@ -729,8 +710,8 @@ function connectAndCapture(tag) {
         bot.on('message', msg => { let t = ''; try { t = msg.toString() } catch (e) { try { t = JSON.stringify(msg.json || msg) } catch (e2) {} }; col.chats.push(t); if (/введите номер|номер с картинки|введите капчу/i.test(t)) { col.prompts++; ev('промпт капчи #' + col.prompts) } })
         bot.on('login', () => { clearTimeout(loginT); ev('login ok (' + nick + ') за ' + (Date.now() - tConn) + 'мс') })
         bot.on('spawn', () => { clearTimeout(tSpawn); ev('spawn ok за ' + (Date.now() - tConn) + 'мс') })
-        bot.on('kicked', r => { if (finished) return; col.dead = true; col.reason = 'kicked'; ev('kicked'); setTimeout(() => { if (!finished && !(col.prompts >= 1 && linkedNow() >= 8)) finish(false, 'kicked before captcha') }, 600) })
-        bot.on('end', () => { if (finished) return; col.dead = true; if (!col.reason) col.reason = 'end'; setTimeout(() => { if (!finished && !(col.prompts >= 1 && linkedNow() >= 8)) finish(false, col.reason) }, 600) })
+        bot.on('kicked', r => { if (finished) return; col.dead = true; col.reason = 'kicked'; ev('kicked: ' + String(r || '').slice(0, 100)); setTimeout(() => { if (!finished && !(col.prompts >= 1 && linkedNow() >= 8)) finish(false, 'kicked') }, 600) })
+        bot.on('end', (reason) => { if (finished) return; col.dead = true; if (!col.reason) col.reason = 'end: ' + String(reason || '').slice(0, 100); ev('end: ' + col.reason); setTimeout(() => { if (!finished && !(col.prompts >= 1 && linkedNow() >= 8)) finish(false, col.reason) }, 600) })
         bot.on('error', e => { if (finished) return; col.dead = true; if (!col.reason) col.reason = 'error: ' + e.message; ev(col.reason); if (col.prompts < 1) finish(false, col.reason) })
 
         pollT = setInterval(() => {
@@ -747,14 +728,14 @@ async function main() {
 
   const results = []; const tGlobal = Date.now(); let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
 
-  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.26 — ПРЯМОЙ ЗАПРОС К detect.roboflow.com === ' + STAMP)
+  step('=== ' + TARGET_ROUNDS + ' РАУНДОВ: v3.7.27 — АВТОФИКС КОНФИГА + login 30с === ' + STAMP)
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('proxy.host=' + (PROXY.host || '(ПУСТО!)'))
   step('roboflow.detectUrl=' + ROBOFLOW.detectUrl)
   step('roboflow.modelId=' + ROBOFLOW.modelId)
-  step('roboflow.apiKey=' + ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4))
+  step('roboflow.apiKey=' + (ROBOFLOW.apiKey ? ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4) : '(ПУСТО!)'))
+  step('LOGIN_TIMEOUT=' + LOGIN_TIMEOUT_MS + 'мс, MAX_ROTATIONS=' + MAX_ROTATIONS_ON_FAIL)
   
-  // v3.7.26: Убиваем мусорный локальный сервер (если он остался от прошлых запусков)
   await killPort9001()
 
   currentRunIp = await rotateIp(); step('IP забега: ' + (currentRunIp || '?'))
@@ -762,8 +743,15 @@ async function main() {
   for (let r = 1; r <= TARGET_ROUNDS && !aborted; r++) {
     let rec = null, lastNetFail = false
     for (let attempt = 1; attempt <= ATTEMPTS_PER_ROUND && !rec && !aborted; attempt++) {
-      if (attempt > 1 && lastNetFail && !proxyDead && rotationsUsed < MAX_ROTATIONS_ON_FAIL) { rotationsUsed++; step('ротация IP (' + rotationsUsed + '/' + MAX_ROTATIONS_ON_FAIL + ')'); await rotateIp(); await sleep(2500) }
-      else if (attempt > 1) await sleep(1500); else await sleep(1000 + Math.floor(Math.random() * 1000))
+      // v3.7.27: при login timeout тоже делаем ротацию
+      if (attempt > 1 && (lastNetFail || consecutiveNetFails > 0) && !proxyDead && rotationsUsed < MAX_ROTATIONS_ON_FAIL) { 
+        rotationsUsed++
+        step('🔄 ротация IP (' + rotationsUsed + '/' + MAX_ROTATIONS_ON_FAIL + ') из-за сетевой проблемы')
+        await rotateIp()
+        await sleep(2500) 
+      }
+      else if (attempt > 1) await sleep(1500)
+      else await sleep(1000 + Math.floor(Math.random() * 1000))
 
       step('--- РАУНД ' + r + '/' + TARGET_ROUNDS + ' (попытка ' + attempt + ', IP ' + (currentRunIp || '?') + ') ---')
       const res = await connectAndCapture('r' + r + 'a' + attempt)
@@ -776,20 +764,24 @@ async function main() {
       } else {
         const note = res ? res.note : '?'; step('раунд ' + r + ' попытка ' + attempt + ': ' + note)
         if (PROXY_DEAD_RE.test(note)) { proxyFails++; if (proxyFails >= 2) { proxyDead = true; aborted = true; step('ПРОКСИ МЁРТВ') } }
-        else if (lastNetFail) { if (currentRunIp) badIPs.add(currentRunIp); consecutiveNetFails++; if (consecutiveNetFails >= 4) { aborted = true; step('4 сетевых фейла подряд') } }
+        else if (lastNetFail) { 
+          if (currentRunIp) badIPs.add(currentRunIp)
+          consecutiveNetFails++
+          if (consecutiveNetFails >= 6) { aborted = true; step('6 сетевых фейлов подряд — прокси похоже банят') } 
+        }
         else consecutiveNetFails = 0
       }
     }
     if (rec) {
       results.push({ n: r, ok: true, rec: rec })
-      step('РАУНД ' + r + ' сохранён: ORIGINAL=' + rec.wall + ' rfDigits=' + (rec.rfMetrics ? rec.rfMetrics.n : 0) + ' rfText="' + (rec.rfMetrics ? rec.rfMetrics.text : '') + '" ocr="' + rec.ocrText + '" via ' + rec.ocrVia)
+      step('РАУНД ' + r + ' сохранён: ORIGINAL=' + rec.wall + ' rfDigits=' + (rec.rfMetrics ? rec.rfMetrics.n : 0) + ' rfText="' + (rec.rfMetrics ? rec.rfMetrics.text : '') + '" ocr="' + rec.ocrText + '"')
     } else if (!aborted) { results.push({ n: r, ok: false, note: 'fail' }); step('РАУНД ' + r + ' провален') }
     if (r < TARGET_ROUNDS && !aborted) await sleep(PAUSE_BETWEEN_MS)
   }
 
   const okList = results.filter(x => x.ok && x.rec); const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - tGlobal) / 1000) + 'с')
-  for (const x of results) L.push('  #' + x.n + ': ' + (x.rec ? 'ORIGINAL=' + x.rec.wall + ' rfDigits=' + (x.rec.rfMetrics ? x.rec.rfMetrics.n : 0) + ' ocr="' + x.rec.ocrText + '"' : 'FAIL'))
+  for (const x of results) L.push('  #' + x.n + ': ' + (x.rec ? 'ORIGINAL=' + x.rec.wall + ' rfDigits=' + (x.rec.rfMetrics ? x.rec.rfMetrics.n : 0) + ' rfText="' + (x.rec.rfMetrics ? x.rec.rfMetrics.text : '') + '" ocr="' + x.rec.ocrText + '"' : 'FAIL'))
   step('готово.'); flushReport(L.join('\n')); console.log('\n' + L.join('\n'))
   setTimeout(() => process.exit(0), 2000)
 }
