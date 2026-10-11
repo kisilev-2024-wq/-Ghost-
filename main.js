@@ -1,36 +1,27 @@
-// VERSION: 3.7.32
+// VERSION: 3.8.1
 // main.js
-// v3.7.32: ОТДЕЛЬНЫЙ SOCKS-прокси для Roboflow API (45.130.129.70:8000)
-//          + Minecraft через bproxy.site (два разных прокси)
+// v3.8.1: АВТО-УСТАНОВКА tesseract.js + прогресс загрузки
 const mineflayer = require('mineflayer')
 const { SocksClient } = require('socks')
 const fs = require('fs')
 const path = require('path')
 const zlib = require('zlib')
-const http = require('http')
-const https = require('https')
-const tls = require('tls')
-const net = require('net')
 const { spawn, spawnSync, execSync } = require('child_process')
 
 const TARGET_ROUNDS = 10
-const ATTEMPTS_PER_ROUND = 2
-const PAUSE_BETWEEN_MS = 2000
+const PAUSE_BETWEEN_MS = 3000
 const MIN_PLACED = 10
-const SETTLE_MS = 2000
 const CAPTCHA_TIMEOUT_MS = 45000
 const CONNECT_TIMEOUT_MS = 35000
 const LOGIN_TIMEOUT_MS = 30000
-const MAX_ROTATIONS_ON_FAIL = 6
-const VIEW_SIGN = 1
-
-const CLOUD_RF_TIMEOUT_MS = 30000
-const CREATE_NO_WINDOW = 0x08000000
+const ANSWER_TIMEOUT_MS = 8000
 
 // ========================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =========================
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-')
 const SLOG = []
 let REC_ROOT = null
+let tesseractWorker = null
+let Tesseract = null  // загружается динамически
 
 function step(s) {
   const l = new Date().toISOString().slice(11, 19) + ' [step] ' + s
@@ -40,173 +31,153 @@ function step(s) {
 
 function flushReport(extra) {
   if (!REC_ROOT) return
-  try {
-    fs.writeFileSync(path.join(REC_ROOT, 'report_' + STAMP + '.txt'), SLOG.join('\n') + '\n' + (extra || ''))
-  } catch (e) {
-    console.error('flushReport err:', e.message)
-  }
+  try { fs.writeFileSync(path.join(REC_ROOT, 'report_' + STAMP + '.txt'), SLOG.join('\n') + '\n' + (extra || '')) } catch (e) {}
 }
 
 process.on('uncaughtException', e => {
-  console.error('\n!!! UNCAUGHT EXCEPTION !!!')
-  console.error('Message:', e.message)
-  console.error('Stack:', e.stack)
+  console.error('\n!!! UNCAUGHT !!!', e.message, '\n', e.stack)
   flushReport('UNCAUGHT: ' + (e.stack || e.message))
   setTimeout(() => process.exit(1), 1000)
 })
 
 process.on('unhandledRejection', e => {
-  console.error('\n!!! UNHANDLED REJECTION !!!')
-  console.error('Error:', e)
+  console.error('\n!!! REJECTION !!!', e)
   flushReport('REJECTION: ' + (e && e.message ? e.message : String(e)))
 })
 
+// ========================= АВТО-УСТАНОВКА ПАКЕТОВ =========================
+
+// Проверка и установка tesseract.js
+async function ensureTesseract() {
+  const packagePath = path.join(__dirname, 'node_modules', 'tesseract.js', 'package.json')
+  
+  if (fs.existsSync(packagePath)) {
+    step('[SETUP] ✓ tesseract.js уже установлен')
+  } else {
+    step('[SETUP] 📦 tesseract.js НЕ НАЙДЕН — устанавливаю...')
+    step('[SETUP] ⏳ Это может занять 30-60 секунд (загрузка ~50МБ)')
+    
+    await installPackage('tesseract.js')
+    
+    if (!fs.existsSync(packagePath)) {
+      throw new Error('Не удалось установить tesseract.js')
+    }
+    step('[SETUP] ✅ tesseract.js успешно установлен')
+  }
+  
+  // Динамическая загрузка
+  try {
+    Tesseract = require('tesseract.js')
+    step('[SETUP] ✓ Tesseract.js модуль загружен')
+  } catch (e) {
+    throw new Error('Не удалось загрузить tesseract.js: ' + e.message)
+  }
+}
+
+// Проверка и установка mineflayer (на всякий случай)
+async function ensureMineflayer() {
+  const packagePath = path.join(__dirname, 'node_modules', 'mineflayer', 'package.json')
+  if (fs.existsSync(packagePath)) {
+    step('[SETUP] ✓ mineflayer уже установлен')
+    return
+  }
+  step('[SETUP] 📦 mineflayer НЕ НАЙДЕН — устанавливаю...')
+  await installPackage('mineflayer')
+}
+
+// Проверка socks
+async function ensureSocks() {
+  const packagePath = path.join(__dirname, 'node_modules', 'socks', 'package.json')
+  if (fs.existsSync(packagePath)) {
+    step('[SETUP] ✓ socks уже установлен')
+    return
+  }
+  step('[SETUP] 📦 socks НЕ НАЙДЕН — устанавливаю...')
+  await installPackage('socks')
+}
+
+// Установка npm-пакета с выводом прогресса
+function installPackage(name) {
+  return new Promise((resolve, reject) => {
+    step('[NPM] Запуск: npm install ' + name)
+    
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const child = spawn(npm, ['install', name, '--no-audit', '--no-fund', '--loglevel=error'], {
+      cwd: __dirname,
+      stdio: 'inherit',
+      shell: process.platform === 'win32'
+    })
+    
+    const timeout = setTimeout(() => {
+      try { child.kill() } catch (e) {}
+      reject(new Error('Таймаут установки ' + name + ' (120с)'))
+    }, 120000)
+    
+    child.on('close', code => {
+      clearTimeout(timeout)
+      if (code === 0) {
+        step('[NPM] ✅ ' + name + ' установлен успешно')
+        resolve()
+      } else {
+        reject(new Error('npm install ' + name + ' завершился с кодом ' + code))
+      }
+    })
+    
+    child.on('error', err => {
+      clearTimeout(timeout)
+      reject(new Error('Ошибка запуска npm: ' + err.message + '\nУбедитесь что Node.js и npm установлены: https://nodejs.org/'))
+    })
+  })
+}
+
+// Проверка что package.json существует, если нет — создаём
+function ensurePackageJson() {
+  const pkgPath = path.join(__dirname, 'package.json')
+  if (!fs.existsSync(pkgPath)) {
+    step('[SETUP] 📝 Создаю package.json...')
+    const pkg = {
+      name: 'funtime-captcha-bot',
+      version: '3.8.1',
+      description: 'Minecraft captcha solver with Tesseract.js OCR',
+      main: 'main.js',
+      private: true,
+      dependencies: {}
+    }
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2))
+    step('[SETUP] ✓ package.json создан')
+  }
+}
+
 // ========================= КОНФИГ =========================
-let CFG_PARENT, CFG_LOCAL, CFG_PATH, CFG = {}, CFG_STRATEGY = 'none', CFG_PATCHED = []
+let CFG_PATH, CFG = {}, CFG_STRATEGY = 'none'
 
 try {
-  CFG_PARENT = path.join(__dirname, '..', 'config.json')
-  CFG_LOCAL = path.join(__dirname, 'config.json')
+  const CFG_PARENT = path.join(__dirname, '..', 'config.json')
+  const CFG_LOCAL = path.join(__dirname, 'config.json')
   CFG_PATH = fs.existsSync(CFG_LOCAL) ? CFG_LOCAL : (fs.existsSync(CFG_PARENT) ? CFG_PARENT : null)
-} catch (e) {
-  console.error('CFG_PATH error:', e.message)
-}
+} catch (e) {}
 
 function cfgGet(o, kp, d) {
   let c = o
-  for (const k of kp.split('.')) {
-    if (!c || c[k] === undefined) return d
-    c = c[k]
-  }
+  for (const k of kp.split('.')) { if (!c || c[k] === undefined) return d; c = c[k] }
   return c
 }
 
-function isEmptyCfgVal(v) {
-  return v === undefined || v === null || v === '' || (typeof v === 'number' && Number.isNaN(v))
+function parseCfgSafe(p) {
+  try {
+    const raw = fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '')
+    const obj = JSON.parse(raw)
+    return obj && typeof obj === 'object' ? obj : {}
+  } catch (e) { return {} }
 }
 
-function softCleanJson(t) {
-  let s = String(t || '').replace(/^\uFEFF/, '')
-  s = s.replace(/:\s*""(?=[^",\s\]}])/g, ': "')
-  s = s.replace(/,\s*([}\]])/g, '$1')
-  s = s.replace(/(^|[^:"'\\])\/\/[^\n\r]*/g, '$1')
-  return s
-}
-
-function extractJsonObject(t) {
-  const s = String(t || '')
-  const i = s.indexOf('{')
-  const j = s.lastIndexOf('}')
-  if (i >= 0 && j > i) return s.slice(i, j + 1)
-  return ''
-}
-
-function parseCfgRaw(raw) {
-  const candidates = [String(raw || ''), softCleanJson(raw), extractJsonObject(raw), softCleanJson(extractJsonObject(raw))]
-  for (const c of candidates) {
-    if (!c) continue
-    try {
-      const o = JSON.parse(c)
-      if (o && typeof o === 'object' && !Array.isArray(o)) return o
-    } catch (e) {}
-  }
-  return null
-}
-
-function sectionBody(raw, name) {
-  const s = String(raw || '')
-  const keyRe = new RegExp('"' + name + '"\\s*:\\s*\\{')
-  const km = s.match(keyRe)
-  if (!km) return ''
-  const start = km.index + km[0].length - 1
-  let depth = 0, inStr = false, esc = false
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i]
-    if (esc) { esc = false; continue }
-    if (ch === '\\') { esc = true; continue }
-    if (ch === '"') { inStr = !inStr; continue }
-    if (inStr) continue
-    if (ch === '{') depth++
-    else if (ch === '}') { depth--; if (depth === 0) return s.slice(start, i + 1) }
-  }
-  return ''
-}
-
-function grabIn(body, key) {
-  const m = String(body || '').match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'))
-  return m ? m[1] : undefined
-}
-function grabNumIn(body, key) {
-  const m = String(body || '').match(new RegExp('"' + key + '"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)'))
-  return m ? Number(m[1]) : undefined
-}
-function grabBoolIn(body, key) {
-  const m = String(body || '').match(new RegExp('"' + key + '"\\s*:\\s*(true|false)'))
-  return m ? (m[1] === 'true') : undefined
-}
-
-function regexCfg(raw) {
-  const cfg = {}
-  const put = (sec, key, val) => {
-    if (isEmptyCfgVal(val)) return
-    if (!cfg[sec]) cfg[sec] = {}
-    cfg[sec][key] = val
-  }
-  const mc = sectionBody(raw, 'minecraft')
-  if (mc) {
-    put('minecraft', 'server', grabIn(mc, 'server'))
-    put('minecraft', 'port', grabNumIn(mc, 'port'))
-    put('minecraft', 'version', grabIn(mc, 'version'))
-  }
-  const px = sectionBody(raw, 'proxy')
-  if (px) {
-    put('proxy', 'host', grabIn(px, 'host'))
-    put('proxy', 'port', grabNumIn(px, 'port'))
-    put('proxy', 'username', grabIn(px, 'username'))
-    put('proxy', 'password', grabIn(px, 'password'))
-    put('proxy', 'type', grabNumIn(px, 'type'))
-    put('proxy', 'changeIpUrl', grabIn(px, 'changeIpUrl'))
-    put('proxy', 'waitAfterIpChangeSec', grabNumIn(px, 'waitAfterIpChangeSec'))
-  }
-  const ac = sectionBody(raw, 'accounts')
-  if (ac) {
-    put('accounts', 'nickPrefix', grabIn(ac, 'nickPrefix'))
-    put('accounts', 'countDefault', grabNumIn(ac, 'countDefault'))
-    put('accounts', 'sessionMinutes', grabNumIn(ac, 'sessionMinutes'))
-  }
-  const tg = sectionBody(raw, 'telegram')
-  if (tg) {
-    put('telegram', 'token', grabIn(tg, 'token'))
-    put('telegram', 'chatId', grabNumIn(tg, 'chatId'))
-    put('telegram', 'apiProxy', grabIn(tg, 'apiProxy'))
-  }
-  return cfg
-}
-
-try {
-  if (CFG_PATH) {
-    let raw = ''
-    try { raw = fs.readFileSync(CFG_PATH, 'utf8').replace(/^\uFEFF/, '') } catch (e) { raw = '' }
-    const parsed = parseCfgRaw(raw)
-    const fb = regexCfg(raw)
-    if (parsed) {
-      CFG = parsed
-      CFG_STRATEGY = 'json'
-    } else if (Object.keys(fb).length) {
-      CFG = fb
-      CFG_STRATEGY = 'regex-fallback'
-    }
-  }
-} catch (e) {
-  console.error('CFG parse error:', e.message)
-}
+if (CFG_PATH) { CFG = parseCfgSafe(CFG_PATH); CFG_STRATEGY = 'json' }
 
 const MC = {
   host: cfgGet(CFG, 'minecraft.server', 'connect.funtime.su'),
   port: cfgGet(CFG, 'minecraft.port', 25565),
   version: cfgGet(CFG, 'minecraft.version', '1.21.1')
 }
-// Прокси для Minecraft (bproxy.site)
 const PROXY = {
   host: cfgGet(CFG, 'proxy.host', ''),
   port: cfgGet(CFG, 'proxy.port', 1080),
@@ -220,590 +191,10 @@ const NICK_PREFIX = String(cfgGet(CFG, 'accounts.nickPrefix', 'Player')).replace
 try {
   REC_ROOT = path.join(__dirname, 'records')
   fs.mkdirSync(REC_ROOT, { recursive: true })
-} catch (e) {
-  console.error('REC_ROOT error:', e.message)
-}
+} catch (e) {}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
-
-const NET_FAIL_RE = /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|socket hang up|socks|login timeout|spawn timeout/i
-const PROXY_DEAD_RE = /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ECONNABORTED/i
-const badIPs = new Set()
 let currentRunIp = null
-let proxyDead = false
-
-// ========================= v3.7.32: ROBLOW + ОТДЕЛЬНЫЙ SOCKS ДЛЯ API =========================
-// Специальный SOCKS-прокси для Roboflow API (поддерживает HTTPS/TLS)
-const RF_SOCKS_URL = 'socks5://5xBLgY:S8hzBU@45.130.129.70:8000'
-
-// Парсим URL формата socks5://user:pass@host:port
-function parseRfSocksUrl() {
-  try {
-    const m = RF_SOCKS_URL.match(/^socks5[h]?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/?$/i)
-    if (!m) {
-      step('[RF] ❌ Неправильный формат RF_SOCKS_URL: ' + RF_SOCKS_URL)
-      return null
-    }
-    const parsed = {
-      host: m[3],
-      port: Number(m[4]),
-      username: decodeURIComponent(m[1]),
-      password: decodeURIComponent(m[2])
-    }
-    step('[RF] ✓ RF SOCKS прокси: ' + parsed.host + ':' + parsed.port + ' (user: ' + parsed.username + ')')
-    return parsed
-  } catch (e) {
-    step('[RF] ❌ Ошибка парсинга RF_SOCKS_URL: ' + e.message)
-    return null
-  }
-}
-
-const RF_SOCKS = parseRfSocksUrl()
-
-const ROBOFLOW = {
-  enabled: true,
-  apiKey: 'kTAPmOyqKcxeBTyi18FD',
-  modelId: 's-workspace-juqs3/captcha-funtime-vn60f/2',
-  serverlessUrl: 'https://serverless.roboflow.com',
-  detectUrl: 'https://detect.roboflow.com',
-  confidence: 25,
-  overlap: 20
-}
-
-function rfMultipart(buf, filename, boundary) {
-  const safe = String(filename || 'captcha.png').replace(/"/g, '')
-  const head = Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' + safe + '"\r\nContent-Type: image/png\r\n\r\n')
-  const tail = Buffer.from('\r\n--' + boundary + '--\r\n')
-  return Buffer.concat([head, buf, tail])
-}
-
-async function killPort9001() {
-  try {
-    const out = execSync('netstat -ano | findstr :9001', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, creationFlags: CREATE_NO_WINDOW })
-    const lines = String(out || '').split('\n').filter(l => l.includes('LISTENING'))
-    const pids = new Set()
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/)
-      const pid = parts[parts.length - 1]
-      if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid)
-    }
-    for (const pid of pids) {
-      step('[RF] Убиваю мусорный процесс: PID ' + pid)
-      try { execSync('taskkill /F /PID ' + pid, { stdio: 'ignore', windowsHide: true, creationFlags: CREATE_NO_WINDOW }) } catch (e) {}
-    }
-    if (pids.size > 0) await sleep(1000)
-  } catch (e) {}
-}
-
-// ========================= HTTP / IP =========================
-function plainGet(urlStr, timeoutMs) {
-  timeoutMs = timeoutMs || 15000
-  const buildList = u => { u = String(u || ''); return u.startsWith('https:') ? [u, u.replace('https:', 'http:')] : [u, u.replace('http:', 'https:')] }
-  return new Promise((resolve, reject) => {
-    let stopped = false, lastErr = 'get failed'
-    const attempt = (urls, idx, redirectsLeft, insecure) => {
-      if (stopped) return
-      if (idx >= urls.length) { stopped = true; reject(new Error(lastErr)); return }
-      const u = urls[idx]
-      const mod = String(u).startsWith('https') ? https : http
-      const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0 MC_Bot/3.7.32', 'Accept': '*/*' } }
-      if (insecure) opts.rejectUnauthorized = false
-      let req = null
-      const timer = setTimeout(() => {
-        if (stopped) return
-        try { if (req) req.destroy() } catch (e) {}
-        lastErr = 'timeout'
-        attempt(urls, idx + 1, redirectsLeft, insecure)
-      }, timeoutMs)
-      try {
-        req = mod.get(u, opts, res => {
-          if (stopped) { try { res.resume() } catch (e) {}; return }
-          clearTimeout(timer)
-          const sc = res.statusCode
-          if (sc >= 300 && sc < 400 && res.headers.location && redirectsLeft > 0) {
-            let next = String(res.headers.location)
-            try { next = new URL(next, u).toString() } catch (e) {}
-            try { res.resume() } catch (e) {}
-            attempt(buildList(next), 0, redirectsLeft - 1, insecure)
-            return
-          }
-          let d = ''
-          try { res.setEncoding('utf8') } catch (e) {}
-          res.on('data', c => { d += c; if (d.length > 200000) d = d.slice(-100000) })
-          res.on('end', () => {
-            if (stopped) return
-            stopped = true
-            resolve({ status: sc, body: d.trim() })
-          })
-          res.on('error', e => {
-            if (stopped) return
-            attempt(urls, idx + 1, redirectsLeft, insecure)
-          })
-        })
-      } catch (e) {
-        clearTimeout(timer)
-        attempt(urls, idx + 1, redirectsLeft, insecure)
-        return
-      }
-      req.on('error', e => {
-        if (stopped) return
-        clearTimeout(timer)
-        if (!insecure && /CERT|SELF_SIGNED|UNABLE_TO_VERIFY|DEPTH_ZERO|HANDSHAKE|SSL|TLS/i.test((e && e.message) || '')) {
-          attempt(urls, idx, redirectsLeft, true)
-          return
-        }
-        attempt(urls, idx + 1, redirectsLeft, insecure)
-      })
-    }
-    attempt(buildList(urlStr), 0, 3, false)
-  })
-}
-
-function socksHttpGet(host, reqText) {
-  return new Promise(resolve => {
-    SocksClient.createConnection({
-      proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password },
-      command: 'connect',
-      destination: { host, port: 80 }
-    }).then(conn => {
-      let data = ''
-      const t = setTimeout(() => { try { conn.socket.destroy() } catch (e) {}; resolve(null) }, 10000)
-      conn.socket.on('data', d => {
-        data += d.toString()
-        const m = data.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
-        if (m && data.includes('\r\n\r\n')) {
-          clearTimeout(t)
-          try { conn.socket.destroy() } catch (e) {}
-          resolve(m[1])
-        }
-      })
-      conn.socket.on('error', () => { clearTimeout(t); resolve(null) })
-      conn.socket.on('end', () => {
-        clearTimeout(t)
-        const m = data.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
-        resolve(m ? m[1] : null)
-      })
-      conn.socket.write(reqText)
-    }).catch(() => resolve(null))
-  })
-}
-
-async function currentIp() {
-  return await socksHttpGet('api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n')
-}
-
-async function rotateIp() {
-  if (!PROXY.changeIpUrl || PROXY.changeIpUrl.includes('YOUR_KEY')) {
-    step('changeIpUrl не задан')
-    currentRunIp = await currentIp()
-    return currentRunIp
-  }
-  for (let round = 1; round <= 2; round++) {
-    const oldIp = await currentIp()
-    step('IP до ротации: ' + (oldIp || '?'))
-    let hit = 'fail', ok = false
-    for (let t = 1; t <= 2; t++) {
-      try {
-        const r = await plainGet(PROXY.changeIpUrl, 15000)
-        const body = String(r.body || '').replace(/\s+/g, ' ').slice(0, 90)
-        hit = 'direct:' + r.status + (body ? ' body=' + body : '')
-        ok = r.status >= 200 && r.status < 400
-      } catch (e) {
-        hit = 'direct:ERR ' + ((e && e.message) || e)
-        ok = false
-      }
-      if (ok) break
-      if (t < 2) {
-        step('changeIp ' + t + ' не удалась, повтор')
-        await sleep(3000)
-      }
-    }
-    step('changeIp: ' + hit)
-    const t0 = Date.now()
-    let newIp = null
-    const waitMs = Math.max(8000, (Number(PROXY.waitSec) || 12) * 1000)
-    while (Date.now() - t0 < waitMs) {
-      await sleep(2000)
-      newIp = await currentIp()
-      if (newIp && (!oldIp || newIp !== oldIp)) break
-    }
-    if (newIp && (!oldIp || newIp !== oldIp)) {
-      if (oldIp && badIPs.has(newIp)) {
-        step('новый IP ' + newIp + ' уже плох — кручу')
-        continue
-      }
-      step('IP СМЕНЁН: ' + (oldIp || '?') + ' -> ' + newIp + ' за ' + Math.round((Date.now() - t0) / 1000) + 'с')
-      currentRunIp = newIp
-      return newIp
-    }
-    step('IP не сменился')
-  }
-  currentRunIp = await currentIp()
-  return currentRunIp
-}
-
-// ========================= v3.7.32: ROBLOW HTTP (с отдельным SOCKS) =========================
-function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
-  return new Promise(resolve => {
-    const mod = useTls ? https : http
-    const defaultPort = useTls ? 443 : 80
-    const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    
-    const h = Object.assign({
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'identity',
-      'Cache-Control': 'no-cache',
-      'Connection': 'close',
-      'Host': hostHeader,
-      'Origin': 'https://app.roboflow.com',
-      'Referer': 'https://app.roboflow.com/'
-    }, headers || {})
-    
-    if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
-    
-    const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }
-    if (socket) opts.socket = socket
-    
-    let done = false
-    const finish = obj => { if (done) return; done = true; resolve(obj) }
-    let req = null
-    
-    try {
-      req = mod.request(opts, res => {
-        const chunks = []
-        res.on('data', c => chunks.push(c))
-        res.on('end', () => finish({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
-        res.on('error', e => finish({ status: 0, body: 'RES ERR: ' + ((e && e.message) || e) }))
-      })
-    } catch (e) {
-      finish({ status: 0, body: 'REQ THROW: ' + ((e && e.message) || e) })
-      return
-    }
-    
-    req.on('error', e => finish({ status: 0, body: 'REQ ERR: ' + ((e && e.message) || e) }))
-    req.on('timeout', () => { try { req.destroy() } catch (e) {}; finish({ status: 0, body: 'TIMEOUT' }) })
-    
-    if (body != null) req.write(body)
-    req.end()
-  })
-}
-
-function socksConnectSocket(host, port, useTls, proxyHost, proxyPort, proxyUser, proxyPass) {
-  return new Promise((resolve, reject) => {
-    if (!proxyHost) { reject(new Error('proxy host пуст')); return }
-    let settled = false
-    const connTimeout = setTimeout(() => {
-      if (settled) return
-      settled = true
-      reject(new Error('SOCKS timeout 30s'))
-    }, 30000)
-    SocksClient.createConnection({
-      proxy: { host: proxyHost, port: proxyPort, type: 5, userId: proxyUser, password: proxyPass },
-      command: 'connect',
-      destination: { host, port }
-    }).then(conn => {
-      if (settled) { try { conn.socket.destroy() } catch (e) {}; return }
-      if (!useTls) {
-        settled = true
-        clearTimeout(connTimeout)
-        resolve({ socket: conn.socket, cleanup() { try { conn.socket.destroy() } catch (e) {} } })
-        return
-      }
-      let secure = null
-      const fail = e => {
-        if (settled) return
-        settled = true
-        clearTimeout(connTimeout)
-        try { conn.socket.destroy() } catch (x) {}
-        if (secure) try { secure.destroy() } catch (x) {}
-        reject(e)
-      }
-      try {
-        secure = tls.connect({ socket: conn.socket, servername: host, minVersion: 'TLSv1.2' }, () => {
-          if (settled) return
-          settled = true
-          clearTimeout(connTimeout)
-          resolve({
-            socket: secure,
-            cleanup() { try { secure.destroy() } catch (e) {}; try { conn.socket.destroy() } catch (e) {} }
-          })
-        })
-      } catch (e) { fail(e); return }
-      secure.on('error', fail)
-      conn.socket.on('error', fail)
-    }).catch(e => {
-      if (settled) return
-      settled = true
-      clearTimeout(connTimeout)
-      reject(e)
-    })
-  })
-}
-
-// v3.7.32: SOCKS использует ОТДЕЛЬНЫЙ RF_SOCKS (не bproxy.site)
-async function rfPostOnce(transport, url, headers, body, timeoutMs) {
-  let u = null
-  try { u = new URL(url) } catch (e) {
-    step('[RF]    ❌ [' + transport + '] BAD URL: ' + ((e && e.message) || e))
-    return { status: 0, body: 'BAD URL: ' + ((e && e.message) || e), via: transport }
-  }
-  const useTls = u.protocol === 'https:'
-  const port = Number(u.port || (useTls ? 443 : 80))
-  const reqPath = u.pathname + u.search
-  const hostname = u.hostname
-  
-  if (transport === 'direct') {
-    step('[RF]    → [' + transport + '] запрос к ' + hostname + ':' + port)
-    const r = await rawRequestOnSocket(useTls, null, hostname, port, 'POST', reqPath, headers, body, timeoutMs)
-    r.via = 'direct'
-    step('[RF]    ← [' + transport + '] status=' + r.status)
-    return r
-  }
-  
-  if (transport === 'socks') {
-    if (!RF_SOCKS) {
-      step('[RF]    ❌ [' + transport + '] RF_SOCKS не настроен, пропускаю')
-      return { status: 0, body: 'RF_SOCKS not configured', via: 'socks' }
-    }
-    
-    step('[RF]    → [' + transport + '] подключение к ' + hostname + ':' + port + ' через RF_SOCKS ' + RF_SOCKS.host + ':' + RF_SOCKS.port)
-    let sk = null
-    try {
-      sk = await socksConnectSocket(
-        hostname, port, useTls,
-        RF_SOCKS.host, RF_SOCKS.port, RF_SOCKS.username, RF_SOCKS.password
-      )
-      step('[RF]    ✓ [' + transport + '] SOCKS OK через ' + RF_SOCKS.host + ', отправляю запрос...')
-    } catch (e) {
-      const errMsg = ((e && e.code) ? e.code + ' ' : '') + ((e && e.message) || e)
-      step('[RF]    ❌ [' + transport + '] SOCKS ошибка через ' + RF_SOCKS.host + ': ' + errMsg)
-      return { status: 0, body: 'SOCKS ERR: ' + errMsg, via: 'socks' }
-    }
-    try {
-      const r = await rawRequestOnSocket(useTls, sk.socket, hostname, port, 'POST', reqPath, headers, body, timeoutMs)
-      r.via = 'socks'
-      step('[RF]    ← [' + transport + '] status=' + r.status)
-      return r
-    } finally {
-      try { sk.cleanup() } catch (e) {}
-    }
-  }
-  
-  return { status: 0, body: 'unknown transport', via: transport }
-}
-
-async function rfPost(url, headers, body) {
-  let u
-  try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL', via: 'none' } }
-  const timeoutMs = CLOUD_RF_TIMEOUT_MS
-  
-  const transports = []
-  if (RF_SOCKS) transports.push('socks')  // v3.7.32: проверяем наличие RF_SOCKS
-  transports.push('direct')
-  
-  step('[RF]  📡 Порядок транспортов: ' + transports.join(' → '))
-  
-  const attemptsLog = []
-  let last = null
-  
-  for (const tr of transports) {
-    const r = await rfPostOnce(tr, url, headers, body, timeoutMs)
-    attemptsLog.push(tr + ':' + r.status)
-    last = r
-    const st = Number(r.status || 0)
-    
-    if (st >= 200 && st < 400) {
-      last._attempts = attemptsLog
-      return last
-    }
-    if (st === 401 || st === 404) {
-      last._attempts = attemptsLog
-      return last
-    }
-    
-    if (st === 403) {
-      const bodyStr = String(r.body || '')
-      if (bodyStr.includes('Cloudflare') || bodyStr.includes('Attention Required')) {
-        step('[RF]  ⚠️ Cloudflare 403 via=' + tr + ', следующий через 2с...')
-        await sleep(2000)
-        continue
-      }
-      last._attempts = attemptsLog
-      return last
-    }
-    
-    await sleep(1000)
-  }
-  
-  if (last) last._attempts = attemptsLog
-  return last || { status: 0, body: 'no transport', via: 'none' }
-}
-
-function rfGetPredictions(json) {
-  if (!json) return []
-  if (Array.isArray(json.predictions)) return json.predictions
-  if (Array.isArray(json.results)) return json.results
-  if (json.prediction && Array.isArray(json.prediction.predictions)) return json.prediction.predictions
-  if (json.object && Array.isArray(json.object.predictions)) return json.object.predictions
-  return []
-}
-function rfDigitFromPrediction(p) {
-  const s = String(p.class || p.class_name || p.label || p.name || '')
-  const m = s.match(/\d/)
-  return m ? m[0] : null
-}
-function rfNormConf(c) { c = Number(c || 0); if (c > 1) c = c / 100; return c }
-
-function rfMetrics(preds) {
-  const digits = []
-  for (const p of preds) {
-    const d = rfDigitFromPrediction(p)
-    const conf = rfNormConf(p.confidence != null ? p.confidence : p.score)
-    if (d !== null && conf >= 0.15) digits.push({ digit: d, conf, x: Number(p.x || 0), y: Number(p.y || 0), w: Number(p.width || p.w || 0), h: Number(p.height || p.h || 0) })
-  }
-  digits.sort((a, b) => a.x - b.x)
-  const n = digits.length
-  const avg = n ? digits.reduce((a, d) => a + d.conf, 0) / n : 0
-  let row = 0
-  if (n > 0) {
-    const hs = digits.map(d => d.h).filter(x => x > 0).sort((a, b) => a - b)
-    const medH = hs.length ? hs[Math.floor(hs.length / 2)] : 40
-    const band = Math.max(25, medH * 0.8)
-    const sorted = digits.slice().sort((a, b) => a.y - b.y)
-    for (let i = 0; i < sorted.length; i++) {
-      const group = [sorted[i]]
-      for (let j = i + 1; j < sorted.length; j++) {
-        if (Math.abs(sorted[j].y - sorted[i].y) <= band) group.push(sorted[j])
-        else break
-      }
-      group.sort((a, b) => a.x - b.x)
-      let cnt = 0, lastRight = -1e9
-      for (const d of group) {
-        const left = d.x - d.w / 2, right = d.x + d.w / 2
-        if (left >= lastRight - Math.max(3, d.w * 0.15)) { cnt++; lastRight = right }
-      }
-      if (cnt > row) row = cnt
-    }
-  }
-  const plausible = n >= 3 && n <= 8
-  const strong = avg >= 0.35
-  const score = (plausible ? 10000 : 0) + (strong ? 3000 : 0) + n * 1000 + row * 700 + Math.round(avg * 1000)
-  return { n, avg: Math.round(avg * 1000) / 1000, row, plausible, strong, score, text: digits.map(d => d.digit).join(''), digits }
-}
-
-async function sendToRoboflow(pngBuffer, filename, debugDir, label) {
-  if (!ROBOFLOW.enabled || !ROBOFLOW.apiKey) {
-    return { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
-  }
-  
-  const key = String(ROBOFLOW.apiKey)
-  const modelId = String(ROBOFLOW.modelId).replace(/^\/+|\/+$/g, '')
-  const conf = encodeURIComponent(ROBOFLOW.confidence || 25)
-  const ov = encodeURIComponent(ROBOFLOW.overlap || 20)
-  
-  const endpoints = [
-    { name: 'serverless', base: 'https://serverless.roboflow.com' },
-    { name: 'detect',     base: 'https://detect.roboflow.com' }
-  ]
-  
-  const boundary = '----WebKitFormBoundary' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
-  const mp = rfMultipart(pngBuffer, filename, boundary)
-  
-  for (const ep of endpoints) {
-    const inferUrl = ep.base + '/' + modelId + '?confidence=' + conf + '&overlap=' + ov
-    
-    step('[RF] 🎯 Endpoint: ' + ep.name + ' → ' + inferUrl)
-    step('[RF]   Auth: Bearer ' + key.slice(0, 6) + '...' + key.slice(-4))
-    
-    const attempts = [
-      {
-        name: ep.name + '_multipart',
-        url: inferUrl,
-        headers: {
-          'Content-Type': 'multipart/form-data; boundary=' + boundary,
-          'Authorization': 'Bearer ' + key
-        },
-        body: mp
-      },
-      {
-        name: ep.name + '_raw',
-        url: inferUrl,
-        headers: {
-          'Content-Type': 'image/png',
-          'Authorization': 'Bearer ' + key
-        },
-        body: pngBuffer
-      }
-    ]
-    
-    let last = null
-    for (const at of attempts) {
-      const r = await rfPost(at.url, at.headers, at.body)
-      const bodyPreview = String(r.body || '').slice(0, 500).replace(/\s+/g, ' ')
-      step('[RF] Итог ' + at.name + ': status=' + r.status + ' via=' + (r.via || '?'))
-      
-      if (r.status === 401) {
-        step('[RF] ❌ 401 — НЕВЕРНЫЙ API-КЛЮЧ!')
-        return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY' }
-      }
-      if (r.status === 403) {
-        const bodyStr = String(r.body || '')
-        if (bodyStr.includes('Cloudflare') || bodyStr.includes('Attention Required')) {
-          step('[RF] ❌ Cloudflare 403 на ' + ep.name + ' — следующий endpoint через 3с...')
-          await sleep(3000)
-          break
-        }
-        step('[RF] ❌ 403 Forbidden')
-        return { ok: false, status: 403, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'ACCESS DENIED', raw: r.body }
-      }
-      if (r.status === 404) {
-        step('[RF] ❌ 404 — модель не найдена на ' + ep.name)
-        break
-      }
-      
-      let json = null
-      try { json = JSON.parse(r.body) } catch (e) {}
-      const predictions = rfGetPredictions(json)
-      const metrics = rfMetrics(predictions)
-      const ok = r.status >= 200 && r.status < 300 && !!json
-      
-      const item = {
-        ok, status: r.status, attempt: at.name, url: at.url, json, predictions, metrics,
-        raw: String(r.body || '').slice(0, 3000),
-        attempts: r._attempts || [],
-        error: ok ? null : (bodyPreview.slice(0, 300) || 'HTTP ' + r.status),
-        modelId: modelId
-      }
-      
-      if (debugDir) {
-        try {
-          fs.mkdirSync(debugDir, { recursive: true })
-          fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'),
-            'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + inferUrl +
-            '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
-        } catch (e) {}
-      }
-      
-      if (label && typeof step === 'function') {
-        step(label + ': RF ' + at.name + ' -> ' + r.status + ' via ' + (r.via || '?') +
-          (ok ? ' ✓ ЦИФР: ' + metrics.n + ' text="' + metrics.text + '"'
-              : ' ' + bodyPreview.slice(0, 140)))
-      }
-      
-      if (ok) {
-        step('[RF] ✅ ' + ep.name + ' РАБОТАЕТ!')
-        return item
-      }
-      last = item
-    }
-    
-    if (last) step('[RF] ⚠️ Endpoint ' + ep.name + ' не сработал')
-  }
-  
-  return { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'all endpoints failed' }
-}
 
 // ========================= ПАЛИТРА / PNG =========================
 const BASE_COLORS = [[0,0,0],[127,178,56],[247,233,163],[199,199,199],[255,0,0],[160,160,255],[167,167,167],[0,124,0],[255,255,255],[164,168,184],[151,109,77],[112,112,112],[64,128,255],[104,83,50],[255,252,245],[216,127,51],[178,76,216],[102,153,216],[229,229,51],[127,204,25],[242,127,165],[76,76,76],[153,153,153],[76,127,153],[127,63,178],[51,76,178],[102,76,51],[102,127,51],[153,51,51],[25,25,25],[250,238,77],[92,219,213],[74,128,255],[0,217,58],[135,107,58],[112,2,2],[143,119,100],[161,83,37],[149,88,108],[114,119,139],[186,133,35],[103,117,52],[160,77,78],[57,42,35],[135,106,97],[86,91,91],[118,70,86],[74,59,91],[77,51,35],[76,83,42],[143,61,46],[37,22,16],[189,48,49],[148,63,97],[126,32,44],[22,119,121],[58,142,140],[74,117,116],[23,121,121],[90,90,90],[224,169,112],[127,106,82],[221,169,46],[156,104,66]]
@@ -815,9 +206,7 @@ const PALETTE = (() => {
     if (v !== 0) {
       const base = BASE_COLORS[v >> 2] || [0, 0, 0]
       const m = SHADE_MULT[v & 3] / 255
-      r = Math.round(base[0] * m)
-      g = Math.round(base[1] * m)
-      b = Math.round(base[2] * m)
+      r = Math.round(base[0] * m); g = Math.round(base[1] * m); b = Math.round(base[2] * m)
     }
     p[v * 3] = r; p[v * 3 + 1] = g; p[v * 3 + 2] = b
   }
@@ -869,50 +258,182 @@ function colorPng(data, W, H, sc) {
   }
   return encodePng(SW, SH, rgba)
 }
-function bwPng(mask, W, H, sc) {
-  const SW=W*sc,SH=H*sc,rgba=Buffer.alloc(SW*SH*4)
-  for(let y=0;y<SH;y++)for(let x=0;x<SW;x++){
-    const v=mask[Math.floor(y/sc)*W+Math.floor(x/sc)]?30:255
-    const i=(y*SW+x)*4
-    rgba[i]=rgba[i+1]=rgba[i+2]=v; rgba[i+3]=255
+
+// ========================= TESSERACT.JS ИНТЕГРАЦИЯ =========================
+
+async function initTesseract() {
+  if (tesseractWorker) return tesseractWorker
+  
+  step('[OCR] 🚀 Инициализация Tesseract.js...')
+  step('[OCR] ⏳ Первый запуск: загрузка языковых данных (~20МБ)')
+  const t0 = Date.now()
+  
+  let lastStatus = ''
+  let lastProgress = -1
+  
+  try {
+    tesseractWorker = await Tesseract.createWorker('eng', 1, {
+      logger: m => {
+        if (m.status !== lastStatus) {
+          lastStatus = m.status
+          if (m.status === 'loading tesseract core') {
+            step('[OCR] 📥 Загрузка ядра Tesseract...')
+          } else if (m.status === 'initializing tesseract') {
+            step('[OCR] ⚙️ Инициализация Tesseract...')
+          } else if (m.status === 'loading language traineddata') {
+            step('[OCR] 📥 Загрузка языковых данных (eng)...')
+          } else if (m.status === 'initializing api') {
+            step('[OCR] ⚙️ Инициализация API...')
+          }
+        }
+        if (m.progress && Math.floor(m.progress * 10) !== lastProgress) {
+          lastProgress = Math.floor(m.progress * 10)
+          if (m.status === 'loading language traineddata' || m.status === 'loading tesseract core') {
+            const pct = Math.round(m.progress * 100)
+            process.stdout.write('\r[OCR] 📥 ' + m.status + ': ' + pct + '%   ')
+            if (pct >= 100) process.stdout.write('\n')
+          }
+        }
+      }
+    })
+    
+    // Настраиваем только для цифр
+    await tesseractWorker.setParameters({
+      tessedit_char_whitelist: '0123456789',
+      tessedit_pageseg_mode: '7',
+      preserve_interword_spaces: '0'
+    })
+    
+    const elapsed = Math.round((Date.now() - t0) / 1000)
+    step('[OCR] ✅ Tesseract готов за ' + elapsed + 'с')
+    return tesseractWorker
+  } catch (e) {
+    step('[OCR] ❌ Ошибка инициализации: ' + e.message)
+    throw e
   }
-  return encodePng(SW,SH,rgba)
 }
 
+function computeOtsuThreshold(data, W, H) {
+  const histogram = new Array(256).fill(0)
+  for (let i = 0; i < data.length; i++) histogram[LUM[data[i]]]++
+  const total = W * H
+  let sum = 0
+  for (let i = 0; i < 256; i++) sum += i * histogram[i]
+  let sumB = 0, wB = 0, wF = 0
+  let maxVariance = 0, threshold = 128
+  for (let t = 0; t < 256; t++) {
+    wB += histogram[t]
+    if (wB === 0) continue
+    wF = total - wB
+    if (wF === 0) break
+    sumB += t * histogram[t]
+    const mB = sumB / wB
+    const mF = (sum - sumB) / wF
+    const variance = wB * wF * (mB - mF) * (mB - mF)
+    if (variance > maxVariance) { maxVariance = variance; threshold = t }
+  }
+  return threshold
+}
+
+function preprocessVariant(data, W, H, variant) {
+  const result = Buffer.alloc(W * H * 4)
+  const threshold = variant === 'otsu' ? computeOtsuThreshold(data, W, H) : 128
+  
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x
+      const v = data[idx]
+      const lum = LUM[v]
+      let gray
+      switch (variant) {
+        case 'otsu': gray = lum < threshold ? 0 : 255; break
+        case 'dark_only': gray = lum < 128 ? 0 : 255; break
+        case 'bright_only': gray = lum >= 128 ? 255 : 0; break
+        case 'high_contrast': gray = lum < 100 ? 0 : (lum > 200 ? 255 : Math.round((lum - 100) * 2.55)); break
+        case 'inverted': gray = 255 - lum; break
+        default: gray = lum
+      }
+      const i = idx * 4
+      result[i] = gray; result[i + 1] = gray; result[i + 2] = gray; result[i + 3] = 255
+    }
+  }
+  return result
+}
+
+async function ocrWithTesseract(data, W, H, label) {
+  const worker = await initTesseract()
+  if (!worker) return { text: '', confidence: 0, variants: [] }
+  
+  const variants = ['otsu', 'dark_only', 'high_contrast', 'inverted', 'bright_only']
+  const results = []
+  
+  for (const variant of variants) {
+    try {
+      const preprocessed = preprocessVariant(data, W, H, variant)
+      const pngBuffer = encodePng(W, H, preprocessed)
+      const result = await worker.recognize(pngBuffer)
+      const text = result.data.text.replace(/\s+/g, '').trim()
+      const digits = text.replace(/[^0-9]/g, '')
+      const conf = result.data.confidence || 0
+      results.push({ variant, rawText: text, digits, confidence: conf, length: digits.length })
+    } catch (e) {
+      results.push({ variant, digits: '', confidence: 0, length: 0, error: e.message })
+    }
+  }
+  
+  results.sort((a, b) => {
+    const aGood = a.length >= 4 && a.length <= 7 ? 1 : 0
+    const bGood = b.length >= 4 && b.length <= 7 ? 1 : 0
+    if (aGood !== bGood) return bGood - aGood
+    if (a.confidence !== b.confidence) return b.confidence - a.confidence
+    return b.length - a.length
+  })
+  
+  if (label) {
+    step('[OCR] Результаты для ' + label + ':')
+    for (const r of results) {
+      const marker = r === results[0] ? '⭐' : '  '
+      step('[OCR]   ' + marker + ' ' + r.variant.padEnd(15) + ' | "' + r.digits.padEnd(8) + '" | conf=' + r.confidence.toFixed(1) + ' | len=' + r.length)
+    }
+  }
+  
+  const best = results[0]
+  const validResults = results.filter(r => r.length >= 4 && r.length <= 7 && r.confidence > 30)
+  
+  if (validResults.length === 0) {
+    return { text: best.digits, confidence: best.confidence, method: best.variant, variants: results, voting: false }
+  }
+  
+  const maxLength = Math.max(...validResults.map(r => r.length))
+  const votes = []
+  for (let pos = 0; pos < maxLength; pos++) {
+    const digitCounts = {}
+    for (const r of validResults) {
+      if (pos < r.digits.length) {
+        const d = r.digits[pos]
+        digitCounts[d] = (digitCounts[d] || 0) + 1
+      }
+    }
+    let bestDigit = '0', bestCount = 0
+    for (const [d, count] of Object.entries(digitCounts)) {
+      if (count > bestCount) { bestCount = count; bestDigit = d }
+    }
+    votes.push({ digit: bestDigit, count: bestCount, total: validResults.length })
+  }
+  
+  const votedText = votes.map(v => v.digit).join('')
+  const avgConfidence = votes.reduce((a, v) => a + (v.count / v.total), 0) / votes.length * 100
+  
+  if (label) {
+    step('[OCR] 🗳 Голосование: "' + votedText + '" (avg conf=' + avgConfidence.toFixed(1) + '%)')
+    step('[OCR] 🏆 Лучший: "' + best.digits + '" (' + best.variant + ', conf=' + best.confidence.toFixed(1) + ')')
+  }
+  
+  return { text: votedText, confidence: avgConfidence, method: 'voting', bestVariant: best.variant, bestSingle: best.digits, variants: results, voting: true }
+}
+
+// ========================= ОБРАБОТКА =========================
 const NB8 = [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]]
-function erode(m,W,H){const o=new Uint8Array(m.length);for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){const i=y*W+x;if(m[i]&&m[i-1]&&m[i+1]&&m[i-W]&&m[i+W])o[i]=1}return o}
-function dilate(m,W,H){const o=new Uint8Array(m.length);for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=y*W+x;if(m[i]||(x>0&&m[i-1])||(x<W-1&&m[i+1])||(y>0&&m[i-W])||(y<H-1&&m[i+W]))o[i]=1}return o}
-function opening(m,W,H,r){let x=m;for(let i=0;i<r;i++)x=erode(x,W,H);for(let i=0;i<r;i++)x=dilate(x,W,H);return x}
-function closing(m,W,H,r){let x=m;for(let i=0;i<r;i++)x=dilate(x,W,H);for(let i=0;i<r;i++)x=erode(x,W,H);return x}
-
-function removeNoise(mask,W,H,minSize,minFill){
-  minSize=minSize||5;minFill=minFill||0
-  const vis=new Uint8Array(mask.length),clean=new Uint8Array(mask.length)
-  const i0=(x,y)=>y*W+x
-  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-    const i=i0(x,y);if(!mask[i]||vis[i])continue
-    const st=[x,y];vis[i]=1;const comp=[]
-    let mnX=x,mxX=x,mnY=y,mxY=y
-    while(st.length){const cy=st.pop(),cx=st.pop();comp.push(cx,cy);if(cx<mnX)mnX=cx;if(cx>mxX)mxX=cx;if(cy<mnY)mnY=cy;if(cy>mxY)mxY=cy;for(const nb of NB8){const nx=cx+nb[0],ny=cy+nb[1];if(nx<0||ny<0||nx>=W||ny>=H)continue;const ni=i0(nx,ny);if(mask[ni]&&!vis[ni]){vis[ni]=1;st.push(nx,ny)}}}
-    const cnt=comp.length/2,fill=cnt/((mxX-mnX+1)*(mxY-mnY+1))
-    if(cnt>=minSize&&fill>=minFill)for(let k=0;k<comp.length;k+=2)clean[i0(comp[k],comp[k+1])]=1
-  }
-  return clean
-}
-function dropLines(mask,W,H){
-  const vis=new Uint8Array(mask.length),out=new Uint8Array(mask.length)
-  const i0=(x,y)=>y*W+x
-  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
-    const i=i0(x,y);if(!mask[i]||vis[i])continue
-    const st=[x,y];vis[i]=1;const comp=[]
-    let mnX=x,mxX=x,mnY=y,mxY=y
-    while(st.length){const cy=st.pop(),cx=st.pop();comp.push(cx,cy);if(cx<mnX)mnX=cx;if(cx>mxX)mxX=cx;if(cy<mnY)mnY=cy;if(cy>mxY)mxY=cy;for(const nb of NB8){const nx=cx+nb[0],ny=cy+nb[1];if(nx<0||ny<0||nx>=W||ny>=H)continue;const ni=i0(nx,ny);if(mask[ni]&&!vis[ni]){vis[ni]=1;st.push(nx,ny)}}}
-    const w=mxX-mnX+1,h=mxY-mnY+1
-    const isLine=(w>250||h>250)||(w+h>320&&(comp.length/2)/(w*h)<0.12)
-    if(!isLine)for(let k=0;k<comp.length;k+=2)out[i0(comp[k],comp[k+1])]=1
-  }
-  return out
-}
 
 function inkMaskWall(data,W,H){
   const wc=new Int32Array(256);for(let i=0;i<data.length;i++) wc[data[i]]++
@@ -934,140 +455,7 @@ function inkMaskWall(data,W,H){
     for(let v=1;v<256;v++){if(LUM[v]>=120 && (counts[v]>=1200 || (iso[v]||0)>=0.6)) bg.add(v)}
     for(let y=0;y<128;y++)for(let x=0;x<128;x++){const i=(y0+y)*W+x0+x;const v=data[i];if(v!==0&&!bg.has(v))ink[i]=1}
   }
-  let n=0;for(let i=0;i<ink.length;i++) if(ink[i]) n++
-  return { ink, inkCount:n }
-}
-function thickScore(ink,W,H){let s=0;for(let y=0;y<H-1;y++)for(let x=0;x<W-1;x++){const i=y*W+x;if(ink[i]&&ink[i+1]&&ink[i+W]&&ink[i+W+1])s++}return s}
-
-function compsList(mask, W, H, wantPx) {
-  const vis = new Uint8Array(mask.length), out = []
-  const i0 = (x,y) => y*W+x
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const i = i0(x,y)
-    if (!mask[i] || vis[i]) continue
-    const st = [x,y]; vis[i] = 1
-    let a = 0, mnX = x, mxX = x, mnY = y, mxY = y
-    let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0
-    const px = wantPx ? [i] : null
-    while (st.length) {
-      const cy = st.pop(), cx = st.pop()
-      a++; sx += cx; sy += cy; sxx += cx*cx; syy += cy*cy; sxy += cx*cy
-      if (cx<mnX) mnX=cx; if (cx>mxX) mxX=cx
-      if (cy<mnY) mnY=cy; if (cy>mxY) mxY=cy
-      for (const nb of NB8) {
-        const nx=cx+nb[0], ny=cy+nb[1]
-        if (nx<0||ny<0||nx>=W||ny>=H) continue
-        const ni = i0(nx,ny)
-        if (mask[ni] && !vis[ni]) {
-          vis[ni]=1; st.push(nx,ny)
-          if (wantPx) px.push(ni)
-        }
-      }
-    }
-    const mx = sx/a, my = sy/a
-    const vx = sxx/a - mx*mx, vy = syy/a - my*my, vxy = sxy/a - mx*my
-    const half = (vx + vy) / 2, det = vx*vy - vxy*vxy
-    const disc = Math.sqrt(Math.max(0, half*half - Math.max(0, det)))
-    const varMinor = Math.max(0, half - disc)
-    out.push({ mnX, mxX, mnY, mxY, a, px, varMinor, cx: mx, cy: my })
-  }
-  return out
-}
-function isStraight(c, w, h) { return c.varMinor < 10 && (w + h) > 100 }
-function analyzeColors(data, ink, W, H) {
-  const colorCounts = new Int32Array(256)
-  for (let i = 0; i < ink.length; i++) if (ink[i]) colorCounts[data[i]]++
-  const digitMask = new Uint8Array(ink.length), cands = []
-  let dmColor = 0
-  for (let v = 1; v < 256; v++) {
-    if (colorCounts[v] < 60) continue
-    const m = new Uint8Array(ink.length)
-    for (let i = 0; i < ink.length; i++) if (ink[i] && data[i] === v) m[i] = 1
-    const comps = compsList(m, W, H, true)
-    for (const c of comps) {
-      const w = c.mxX - c.mnX + 1, h = c.mxY - c.mnY + 1
-      if (c.a < 80) continue
-      if (h < H * 0.07 || h > H * 0.85) continue
-      if (w < W * 0.02 || w > W * 0.30) continue
-      if (w + h > W * 0.75) continue
-      const fill = c.a / (w * h)
-      if (fill < 0.05 || fill > 0.97) continue
-      if (isStraight(c, w, h)) continue
-      dmColor++
-      cands.push({ cx: c.cx, cy: c.cy, w, h })
-      for (let k = 0; k < c.px.length; k++) digitMask[c.px[k]] = 1
-    }
-  }
-  return { dmColor, digitMask, cands }
-}
-function rowScore(cands, H) {
-  if (!cands.length) return 0
-  const sorted = cands.slice().sort((a, b) => a.cy - b.cy)
-  let best = 0
-  for (let i = 0; i < sorted.length; i++) {
-    const band = [sorted[i]]
-    for (let j = i + 1; j < sorted.length; j++) {
-      if (sorted[j].cy - sorted[i].cy <= H * 0.25) band.push(sorted[j])
-      else break
-    }
-    band.sort((a, b) => a.cx - b.cx)
-    let cnt = 0, lastRight = -1
-    for (const c of band) {
-      const left = c.cx - c.w / 2, right = c.cx + c.w / 2
-      if (left >= lastRight - 2) { cnt++; lastRight = right }
-    }
-    if (cnt > best) best = cnt
-  }
-  return best
-}
-
-const DIGITS={'0':[[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0]],'1':[[0,0,1,0,0],[0,1,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,1,1,1,0]],'2':[[0,1,1,1,0],[1,0,0,0,1],[0,0,0,0,1],[0,0,0,1,0],[0,0,1,0,0],[0,1,0,0,0],[1,1,1,1,1]],'3':[[0,1,1,1,0],[1,0,0,0,1],[0,0,0,0,1],[0,0,1,1,0],[0,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0]],'4':[[0,0,0,1,0],[0,0,1,1,0],[0,1,0,1,0],[1,0,0,1,0],[1,1,1,1,1],[0,0,0,1,0],[0,0,0,1,0]],'5':[[1,1,1,1,1],[1,0,0,0,0],[1,1,1,1,0],[0,0,0,0,1],[0,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0]],'6':[[0,1,1,1,0],[1,0,0,0,0],[1,0,0,0,0],[1,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0]],'7':[[1,1,1,1,1],[0,0,0,0,1],[0,0,0,1,0],[0,0,1,0,0],[0,0,1,0,0],[0,0,1,0,0],[0,0,1,0,0]],'8':[[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,0]],'9':[[0,1,1,1,0],[1,0,0,0,1],[1,0,0,0,1],[0,1,1,1,1],[0,0,0,0,1],[0,0,0,0,1],[0,1,1,1,0]]}
-
-function matchPat(mask,W,H,bx,by,bw,bh){
-  const pat=[]
-  for(let py=0;py<7;py++){
-    const row=[]
-    for(let px=0;px<5;px++){
-      const sx=bx+Math.floor(px*bw/5),ex=bx+Math.floor((px+1)*bw/5),sy=by+Math.floor(py*bh/7),ey=by+Math.floor((py+1)*bh/7)
-      let c=0,t=0
-      for(let y=sy;y<ey;y++)for(let x=sx;x<ex;x++){c+=mask[y*W+x];t++}
-      row.push(t&&(c/t)>0.35?1:0)
-    }
-    pat.push(row)
-  }
-  let bd='?',bs=0
-  for(const d in DIGITS){let m=0;for(let y=0;y<7;y++)for(let x=0;x<5;x++)if(pat[y][x]===DIGITS[d][y][x])m++;const s=m/35;if(s>bs){bs=s;bd=d}}
-  return{best:bd,score:Math.round(bs*100)/100}
-}
-
-function ocr(mask,W,H){
-  const digits=[]
-  for (const c of compsList(mask, W, H, false)) {
-    const w=c.mxX-c.mnX+1,h=c.mxY-c.mnY+1
-    if(c.a<Math.max(80,W*H/1600))continue
-    if(w<W*0.02||w>W*0.5)continue
-    if(h<H*0.07||h>H*0.92)continue
-    if(isStraight(c,w,h))continue
-    const m=matchPat(mask,W,H,c.mnX,c.mnY,w,h)
-    digits.push({x:c.mnX,best:m.best,score:m.score})
-  }
-  digits.sort((a,b)=>a.x-b.x)
-  let text=''
-  for(const d of digits) if(d.score>=0.5) text+=d.best
-  return { text, digits }
-}
-
-function pickOcr(vars, W, H) {
-  let best = null
-  for (const v of vars) {
-    const r = ocr(v.mask, W, H)
-    const n = r.digits.filter(d => d.score >= 0.5).length
-    const plausible = n >= 4 && n <= 6
-    const conf = n > 6 ? 0 : r.digits.filter(d => d.score >= 0.65).reduce((a, d) => a + d.score, 0)
-    const score = (plausible ? 1000 : 0) + conf * 100 + n * 10 + r.digits.reduce((a, d) => a + d.score, 0) - (n > 6 ? 800 : 0)
-    if (!best || score > best.score) best = { name: v.name, text: r.text, n, plausible, conf, score }
-  }
-  return best
+  return { ink, inkCount: ink.reduce((a, b) => a + b, 0) }
 }
 
 function rotQ(d,q){
@@ -1077,6 +465,7 @@ function rotQ(d,q){
   for(let y=0;y<128;y++)for(let x=0;x<128;x++){const v=d[y*128+x];if(q===1)o[x*128+127-y]=v;else if(q===2)o[(127-y)*128+(127-x)]=v;else o[(127-x)*128+y]=v}
   return o
 }
+
 function clusterWalls(frames){
   const counts={}
   frames.forEach(f=>{counts['x:'+Math.round(f.x)]=(counts['x:'+Math.round(f.x)]||0)+1;counts['z:'+Math.round(f.z)]=(counts['z:'+Math.round(f.z)]||0)+1})
@@ -1087,14 +476,12 @@ function clusterWalls(frames){
     const members=frames.filter(f=>!used.has(f.id)&&Math.round(f[axis])===+val)
     if(members.length<8)continue
     members.forEach(f=>used.add(f.id))
-    let fSign=0
-    for(const f of members){const fr=f[axis]-Math.floor(f[axis]);if(Math.abs(fr-0.5)>0.1){fSign=fr<0.5?1:-1;break}}
-    if(!fSign)fSign=1
-    walls.push({axis,value:+val,frames:members,fSign,tag:axis+val})
+    walls.push({axis,value:+val,frames:members,tag:axis+val})
     if(walls.length===2)break
   }
   return walls
 }
+
 function clusterCoords(vals) {
   if (!vals || !vals.length) return []
   const sorted = vals.slice().sort((a, b) => a - b)
@@ -1114,14 +501,9 @@ function wallCellsAdvanced(wall) {
   const yVals = wall.frames.map(f => f.y)
   const hCenters = clusterCoords(hVals)
   const yCenters = clusterCoords(yVals)
-  const orientations = [
-    { hAsc: true, yAsc: false, name: 'hAsc_yDesc' },
-    { hAsc: false, yAsc: false, name: 'hDesc_yDesc' },
-    { hAsc: true, yAsc: true, name: 'hAsc_yAsc' },
-    { hAsc: false, yAsc: true, name: 'hDesc_yAsc' }
-  ]
   const cols = hCenters.length, rows = yCenters.length
   if (cols * rows !== wall.frames.length) return null
+  const orientations = [{hAsc:true,yAsc:false},{hAsc:false,yAsc:false},{hAsc:true,yAsc:true},{hAsc:false,yAsc:true}]
   const results = []
   for (const ori of orientations) {
     const hs = ori.hAsc ? hCenters.slice() : hCenters.slice().reverse()
@@ -1138,7 +520,7 @@ function wallCellsAdvanced(wall) {
       cells[idx] = f
     }
     if (missing > 0 || cells.some(c => !c)) continue
-    results.push({ cells, cols, rows, ori })
+    results.push({ cells, cols, rows })
   }
   return results.length ? results : null
 }
@@ -1147,27 +529,7 @@ function seamV_ink(inkA, inkB) {
   let cost = 0
   for (let y = 0; y < 128; y++) {
     const va = inkA[y * 128 + 127], vb = inkB[y * 128 + 0]
-    if (va !== vb) {
-      const va1 = y > 0 ? inkA[(y - 1) * 128 + 127] : 0, va2 = y < 127 ? inkA[(y + 1) * 128 + 127] : 0
-      const vb1 = y > 0 ? inkB[(y - 1) * 128 + 0] : 0, vb2 = y < 127 ? inkB[(y + 1) * 128 + 0] : 0
-      const vaL = inkA[y * 128 + 126], vbR = inkB[y * 128 + 1]
-      if (va === vb1 || va === vb2 || vaL === vb || va1 === vb || va2 === vb) cost += 2
-      else cost += 10
-    }
-  }
-  return cost
-}
-function seamH_ink(inkA, inkB) {
-  let cost = 0
-  for (let x = 0; x < 128; x++) {
-    const va = inkA[127 * 128 + x], vb = inkB[0 * 128 + x]
-    if (va !== vb) {
-      const vaL = x > 0 ? inkA[127 * 128 + x - 1] : 0, vaR = x < 127 ? inkA[127 * 128 + x + 1] : 0
-      const vbL = x > 0 ? inkB[0 * 128 + x - 1] : 0, vbR = x < 127 ? inkB[0 * 128 + x + 1] : 0
-      const vaU = inkA[126 * 128 + x], vbD = inkB[1 * 128 + x]
-      if (va === vbL || va === vbR || vaL === vb || vaR === vb || vaU === vb || va === vbD) cost += 2
-      else cost += 10
-    }
+    if (va !== vb) cost += 10
   }
   return cost
 }
@@ -1181,191 +543,41 @@ function perms(arr) {
   }
   return res
 }
-function assembleWall(wall,tiles,raw){
-  const wca = wallCellsAdvanced(wall)
-  if(!wca || !wca.length) return null
-  const wc = wca[0]
-  const W=wc.cols*128,H=wc.rows*128
-  const out=new Uint8Array(W*H)
-  let placed=0
-  for(let i=0;i<wc.cells.length;i++){
-    const f=wc.cells[i];const t=tiles.get(f.mapId);if(!t)continue
-    const q=raw?0:((f.rotation||0)%4);const d=rotQ(t,q)
-    const cx=(i%wc.cols)*128,cy=((i/wc.cols)|0)*128
-    for(let y=0;y<128;y++)for(let x=0;x<128;x++)out[(cy+y)*W+cx+x]=d[y*128+x]
-    placed++
-  }
-  return{data:out,W,H,placed,wc}
-}
 
 function assembleWallAuto(wall, tiles) {
   const wca = wallCellsAdvanced(wall)
   if (!wca || !wca.length) return null
   let globalBest = null
   for (const wc of wca) {
-    const { cells, cols, rows, ori } = wc
-    const colPerms = perms([...Array(cols).keys()])
-    const P = [], Ink = []
+    const { cells, cols, rows } = wc
+    const colPerms = cols <= 5 ? perms([...Array(cols).keys()]) : [[...Array(cols).keys()]]
+    const Ink = []
     for (let i = 0; i < cells.length; i++) {
       const cell = cells[i]; const t = tiles.get(cell.mapId)
-      let d = new Uint8Array(16384), ink = new Uint8Array(16384)
-      if (t) { d = rotQ(t, (cell.rotation || 0) % 4); const im = inkMaskWall(d, 128, 128); ink = im.ink }
-      P.push(d); Ink.push(ink)
+      let ink = new Uint8Array(16384)
+      if (t) { const d = rotQ(t, (cell.rotation || 0) % 4); const im = inkMaskWall(d, 128, 128); ink = im.ink }
+      Ink.push(ink)
     }
     for (const cp of colPerms) {
       let cost = 0
       for (let r = 0; r < rows; r++) for (let k = 0; k < cols - 1; k++) cost += seamV_ink(Ink[r * cols + cp[k]], Ink[r * cols + cp[k + 1]])
-      for (let k = 0; k < cols; k++) for (let r = 0; r < rows - 1; r++) cost += seamH_ink(Ink[r * cols + cp[k]], Ink[(r + 1) * cols + cp[k]])
-      if (!globalBest || cost < globalBest.cost) globalBest = { cost, cp, rp: [...Array(rows).keys()], ori, cells, cols, rows }
+      if (!globalBest || cost < globalBest.cost) globalBest = { cost, cp, cells, cols, rows }
     }
   }
   if (!globalBest) return null
-  const { cp, cells, cols, rows, ori } = globalBest
+  const { cp, cells, cols, rows } = globalBest
   const W = cols * 128, H = rows * 128
   const out = new Uint8Array(W * H)
   let placed = 0
   for (let k = 0; k < cols; k++) for (let m = 0; m < rows; m++) {
-    const c = cp[k], r = m, cell = cells[r * cols + c]
+    const c = cp[k], cell = cells[m * cols + c]
     if (cell && tiles.has(cell.mapId)) placed++
     const t = tiles.get(cell.mapId)
     let patch = new Uint8Array(16384)
     if (t) patch = rotQ(t, (cell.rotation || 0) % 4)
     for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) out[(m * 128 + y) * W + (k * 128 + x)] = patch[y * 128 + x]
   }
-  return { data: out, W, H, placed, wc: { cells, cols, rows }, colPerm: cp, rowPerm: [...Array(rows).keys()], seamCost: globalBest.cost, ori: ori.name }
-}
-
-function buildVariants(ink, digitMask, W, H){
-  return [
-    {name:'v09_colordigits',mask:digitMask},
-    {name:'v08_drop_raw',mask:dropLines(ink,W,H)},
-    {name:'v06_drop_open2',mask:dropLines(opening(ink,W,H,2),W,H)},
-    {name:'v07_drop_open3',mask:dropLines(opening(ink,W,H,3),W,H)},
-    {name:'v00_open2',mask:opening(ink,W,H,2)},
-    {name:'v01_open3',mask:opening(ink,W,H,3)},
-    {name:'v02_open4',mask:opening(ink,W,H,4)},
-    {name:'v03_close1_open2',mask:opening(closing(ink,W,H,1),W,H,2)},
-    {name:'v04_open2_keepbig',mask:removeNoise(opening(ink,W,H,2),W,H,300,0)},
-    {name:'v05_open3_keepbig',mask:removeNoise(opening(ink,W,H,3),W,H,300,0)}
-  ]
-}
-function wallDot(wall, view) {
-  if (!view || typeof view.yaw !== 'number') return null
-  let cx = 0, cz = 0
-  for (const f of wall.frames) { cx += f.x; cz += f.z }
-  cx /= wall.frames.length; cz /= wall.frames.length
-  let dx = cx - view.x, dz = cz - view.z
-  const len = Math.sqrt(dx * dx + dz * dz)
-  if (len < 0.001) return 0
-  dx /= len; dz /= len
-  const vx = -Math.sin(view.yaw), vz = Math.cos(view.yaw)
-  return vx * dx + vz * dz
-}
-
-async function saveRecord(outDir, snap, label) {
-  fs.mkdirSync(outDir, { recursive: true })
-  fs.writeFileSync(path.join(outDir, 'frames.json'), JSON.stringify(snap.frames, null, 2))
-  fs.writeFileSync(path.join(outDir, 'chat.log'), snap.chats.join('\n'))
-  fs.writeFileSync(path.join(outDir, 'packets.log'), snap.packets.join('\n'))
-  fs.writeFileSync(path.join(outDir, 'session_log.txt'), snap.events.join('\n'))
-  if (snap.view) fs.writeFileSync(path.join(outDir, 'view.json'), JSON.stringify(snap.view, null, 2))
-
-  const linked = snap.frames.filter(f => f.mapId !== null && snap.maps.has(f.mapId))
-  const walls = clusterWalls(linked)
-  if (!walls.length) { step(label + ': стен не найдено'); return null }
-
-  const stats = []
-  for (const w of walls) {
-    const asm = assembleWallAuto(w, snap.maps)
-    if (!asm || asm.placed < 8) continue
-    const im = inkMaskWall(asm.data, asm.W, asm.H); const ink = im.ink
-    const drop = dropLines(ink, asm.W, asm.H)
-    const clean = dropLines(opening(ink, asm.W, asm.H, 2), asm.W, asm.H)
-    const th = thickScore(ink, asm.W, asm.H)
-    const ac = analyzeColors(asm.data, ink, asm.W, asm.H)
-    const nRow = rowScore(ac.cands, asm.H)
-    const vars = buildVariants(ink, ac.digitMask, asm.W, asm.H)
-    const pick = pickOcr(vars, asm.W, asm.H)
-    const dot = wallDot(w, snap.view)
-    const confAdj = pick.conf * (nRow >= 8 ? 0.3 : 1)
-    const dotBonus = (dot !== null && dot * VIEW_SIGN >= 0.85) ? 400 : 0
-    const seamPenalty = asm.seamCost * 0.5
-
-    let rf = { ok: false, status: 0, attempt: 'none', predictions: [], metrics: rfMetrics([]), error: 'not sent' }
-    try {
-      const wallPng = colorPng(asm.data, asm.W, asm.H, 2)
-      const rfPng = colorPng(asm.data, asm.W, asm.H, 1)
-      const fname = 'ROBOFLOW_input_' + w.tag + '.png'
-      const rfName = 'ROBOFLOW_input_small_' + w.tag + '.png'
-      fs.writeFileSync(path.join(outDir, fname), wallPng)
-      fs.writeFileSync(path.join(outDir, rfName), rfPng)
-      rf = await sendToRoboflow(rfPng, rfName, outDir, label + ' ' + w.tag)
-      fs.writeFileSync(path.join(outDir, 'roboflow_' + w.tag + '.json'), JSON.stringify({
-        ok: rf.ok, status: rf.status, attempt: rf.attempt, error: rf.error || null,
-        metrics: rf.metrics, predictionsCount: (rf.predictions || []).length,
-        predictions: (rf.predictions || []).slice(0, 50), modelId: rf.modelId || null
-      }, null, 2))
-    } catch (e) {
-      rf = { ok: false, status: 0, attempt: 'exception', predictions: [], metrics: rfMetrics([]), error: e.message }
-      try { fs.writeFileSync(path.join(outDir, 'roboflow_' + w.tag + '.json'), JSON.stringify({ ok: false, error: e.message }, null, 2)) } catch (e2) {}
-    }
-    const rfScore = rf.ok ? (rf.metrics && rf.metrics.score ? rf.metrics.score : 0) : 0
-    const score = rfScore * 100000 + confAdj * 3000 + (pick.plausible ? 800 : 0) + nRow * 100 + ac.dmColor * 30 + Math.round(th / 100) + dotBonus - seamPenalty
-    stats.push({ w, asm, ink, drop, clean, digitMask: ac.digitMask, inkCount: im.inkCount, th, nRow, vars, pick, dot, confAdj, dotBonus, rf, rfScore, score, seamPenalty })
-  }
-
-  if (!stats.length) { step(label + ': стена не собралась'); return null }
-  stats.sort((a, b) => b.score - a.score)
-  const best = stats[0]
-  const w = best.w, asm = best.asm, ink = best.ink, clean = best.clean, th = best.th
-
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA.png'), colorPng(asm.data, asm.W, asm.H, 2))
-  const raw0 = assembleWall(w, snap.maps, true)
-  if (raw0) fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_no_rotate.png'), colorPng(raw0.data, raw0.W, raw0.H, 2))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask.png'), bwPng(ink, asm.W, asm.H, 2))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask_clean.png'), bwPng(clean, asm.W, asm.H, 2))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask_drop.png'), bwPng(best.drop, asm.W, asm.H, 2))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_digits.png'), bwPng(best.digitMask, asm.W, asm.H, 2))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_raw.bin'), Buffer.from(asm.data))
-
-  for (const s of stats.slice(1)) {
-    fs.writeFileSync(path.join(outDir, 'DECOY_NOT_ORIGINAL_' + s.w.tag + '.png'), colorPng(s.asm.data, s.asm.W, s.asm.H, 2))
-    const ddir = path.join(outDir, 'tiles_decoy_' + s.w.tag)
-    fs.mkdirSync(ddir, { recursive: true })
-    s.w.frames.forEach((f, i) => { const raw = snap.maps.get(f.mapId); if (raw) fs.writeFileSync(path.join(ddir, 'tile_' + String(i).padStart(2, '0') + '_map' + f.mapId + '.bin'), Buffer.from(raw)) })
-  }
-
-  const layout = []
-  if (asm.wc) for (let i = 0; i < asm.wc.cells.length; i++) {
-    const f = asm.wc.cells[i]
-    layout.push({ cell: i, tile: f.mapId, rot: (f.rotation || 0) % 4 })
-  }
-  fs.writeFileSync(path.join(outDir, 'layout.json'), JSON.stringify(layout, null, 2))
-  fs.mkdirSync(path.join(outDir, 'tiles'), { recursive: true })
-  layout.forEach((L, i) => { const raw = snap.maps.get(L.tile); if (raw) fs.writeFileSync(path.join(outDir, 'tiles', 'tile_' + String(i).padStart(2, '0') + '_map' + L.tile + '.bin'), Buffer.from(raw)) })
-
-  fs.mkdirSync(path.join(outDir, 'variants'), { recursive: true })
-  const ocrLines = []
-  for (const v of best.vars) {
-    fs.writeFileSync(path.join(outDir, 'variants', v.name + '.png'), bwPng(v.mask, asm.W, asm.H, 2))
-    const r = ocr(v.mask, asm.W, asm.H)
-    ocrLines.push(v.name + ': "' + r.text + '" digits=' + r.digits.length)
-  }
-  fs.writeFileSync(path.join(outDir, 'ocr_variants.txt'), ocrLines.join('\n'))
-
-  step(label + ': ORIGINAL=' + w.tag +
-    ' rfDigits=' + (best.rf && best.rf.metrics ? best.rf.metrics.n : 0) +
-    ' rfText="' + (best.rf && best.rf.metrics ? best.rf.metrics.text : '') + '"' +
-    ' ocr="' + best.pick.text + '" (' + best.pick.name + ')' +
-    ' -> ' + outDir)
-
-  return {
-    wall: w.tag, asm, ink, clean, digitMask: best.digitMask, th, dot: best.dot, nRow: best.nRow, dmColor: best.dmColor,
-    conf: best.pick.conf, confAdj: best.confAdj, seamCost: best.asm.seamCost, seamPenalty: best.seamPenalty,
-    ori: best.asm.ori, colPerm: best.asm.colPerm, ocrText: best.pick.text, ocrVia: best.pick.name, plausible: best.pick.plausible,
-    rf: best.rf, rfScore: best.rfScore, rfMetrics: best.rf ? best.rf.metrics : rfMetrics([]),
-    maps: snap.maps, dir: outDir, tilesCount: asm.placed, tilesExpected: w.frames.length, originalFile: 'ORIGINAL_CAPTCHA.png'
-  }
+  return { data: out, W, H, placed }
 }
 
 function getMapId(p){
@@ -1374,47 +586,115 @@ function getMapId(p){
   return null
 }
 
-function connectAndCapture(tag) {
+// ========================= IP / HTTP =========================
+async function rotateIp() {
+  if (!PROXY.changeIpUrl || PROXY.changeIpUrl.includes('YOUR_KEY')) {
+    step('changeIpUrl не задан')
+    return null
+  }
+  const oldIp = await getIp()
+  step('IP до ротации: ' + (oldIp || '?'))
+  try {
+    const r = await httpGet(PROXY.changeIpUrl, 15000)
+    step('changeIp: status=' + r.status)
+  } catch (e) { step('changeIp fail: ' + e.message) }
+  const waitMs = Math.max(5000, (Number(PROXY.waitSec) || 12) * 1000)
+  await sleep(waitMs)
+  const newIp = await getIp()
+  if (newIp && newIp !== oldIp) {
+    step('IP СМЕНЁН: ' + oldIp + ' -> ' + newIp)
+    currentRunIp = newIp
+    return newIp
+  }
+  step('IP не сменился')
+  currentRunIp = newIp
+  return newIp
+}
+
+async function getIp() {
   return new Promise(resolve => {
-    const col = { maps: new Map(), frames: [], framesById: new Map(), chats: [], packets: [], events: [], prompts: 0, dead: false, reason: '' }
-    const ev = s => { col.events.push(new Date().toISOString() + ' ' + s); step('[' + tag + '] ' + s) }
+    SocksClient.createConnection({
+      proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password },
+      command: 'connect',
+      destination: { host: 'api.ipify.org', port: 80 }
+    }).then(conn => {
+      let data = ''
+      const t = setTimeout(() => { try { conn.socket.destroy() } catch (e) {}; resolve(null) }, 10000)
+      conn.socket.on('data', d => {
+        data += d.toString()
+        const m = data.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
+        if (m && data.includes('\r\n\r\n')) {
+          clearTimeout(t)
+          try { conn.socket.destroy() } catch (e) {}
+          resolve(m[1])
+        }
+      })
+      conn.socket.on('error', () => { clearTimeout(t); resolve(null) })
+      conn.socket.on('end', () => {
+        clearTimeout(t)
+        const m = data.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
+        resolve(m ? m[1] : null)
+      })
+      conn.socket.write('GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n')
+    }).catch(() => resolve(null))
+  })
+}
 
+async function httpGet(urlStr, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr)
+    const opts = { timeout: timeoutMs, headers: { 'User-Agent': 'Mozilla/5.0' } }
+    const req = (u.protocol === 'https:' ? require('https') : require('http')).get(urlStr, opts, res => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d }))
+    })
+    req.on('error', reject)
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')) })
+  })
+}
+
+// ========================= ГЛАВНОЕ =========================
+async function doRound(roundNum) {
+  return new Promise(resolve => {
+    const col = {
+      maps: new Map(), frames: [], framesById: new Map(),
+      chats: [], prompts: 0, dead: false,
+      answerSent: false, answerResult: null, answerText: null
+    }
+    
     let finished = false, bot = null
-    let pollT = null, hardT = null, settleT = null, loginT = null
-    const linkedNow = () => col.frames.filter(f => f.mapId !== null && col.maps.has(f.mapId)).length
-
-    const finish = (ok, note) => {
+    let hardT = null, loginT = null
+    
+    const finish = (result) => {
       if (finished) return
       finished = true
       try { if (hardT) clearTimeout(hardT) } catch (e) {}
-      try { if (pollT) clearInterval(pollT) } catch (e) {}
-      try { if (settleT) clearTimeout(settleT) } catch (e) {}
       try { if (loginT) clearTimeout(loginT) } catch (e) {}
-      let view = null
-      try { if (bot && bot.entity && bot.entity.position) view = { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z, yaw: bot.entity.yaw, pitch: bot.entity.pitch } } catch (e) {}
-      const snap = { maps: col.maps, frames: col.frames.map(f => Object.assign({}, f)), chats: col.chats.slice(), packets: col.packets.slice(), events: col.events.slice(), view: view }
       try { if (bot) bot.end('done') } catch (e) {}
-      resolve(ok ? { ok: true, snap: snap, note: note } : { ok: false, note: note || col.reason || 'fail' })
+      resolve(result)
     }
-
-    hardT = setTimeout(() => finish(linkedNow() >= 8 && col.prompts >= 1, 'timeout'), CAPTCHA_TIMEOUT_MS)
-    if (!PROXY.host) { finish(false, 'нет proxy.host'); return }
-
-    // Minecraft через bproxy.site (не RF_SOCKS!)
+    
+    hardT = setTimeout(() => finish({ ok: false, note: 'hard timeout' }), CAPTCHA_TIMEOUT_MS)
+    
+    if (!PROXY.host) { finish({ ok: false, note: 'нет proxy.host' }); return }
+    
     SocksClient.createConnection({
       proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password },
       command: 'connect',
       destination: { host: MC.host, port: MC.port }
     }).then(conn => {
-      ev('socks ok -> ' + MC.host)
+      step('[r' + roundNum + '] socks ok -> ' + MC.host)
       const nick = (NICK_PREFIX + Math.floor(Math.random() * 9000 + 1000)).slice(0, 16)
       const tConn = Date.now()
-      const tSpawn = setTimeout(() => { if (!finished) finish(false, 'spawn timeout') }, CONNECT_TIMEOUT_MS)
-      loginT = setTimeout(() => { if (!finished) { ev('⚠️ login timeout через 30с'); finish(false, 'login timeout') } }, LOGIN_TIMEOUT_MS)
-
-      bot = mineflayer.createBot({ username: nick, host: MC.host, port: MC.port, version: MC.version, socket: conn.socket, hideErrors: true, auth: 'offline', keepAlive: true })
-      bot._client.on('packet', (data, meta) => { try { if (!meta || !meta.name) return; if (col.packets.length < 4000) col.packets.push(new Date().toISOString() + ' PKT ' + meta.name) } catch (e) {} })
-
+      
+      loginT = setTimeout(() => {
+        if (!finished) finish({ ok: false, note: 'login timeout' })
+      }, LOGIN_TIMEOUT_MS)
+      
+      bot = mineflayer.createBot({
+        username: nick, host: MC.host, port: MC.port, version: MC.version,
+        socket: conn.socket, hideErrors: true, auth: 'offline', keepAlive: true
+      })
+      
       const onMap = pkt => {
         try {
           const id = getMapId(pkt)
@@ -1434,7 +714,7 @@ function connectAndCapture(tag) {
       bot._client.on('map', onMap)
       bot._client.on('map_data', onMap)
       bot._client.on('update_map', onMap)
-
+      
       bot.on('entitySpawn', ent => {
         const nm = String(ent.name || ent.type || '')
         if (!/item_frame|glow_item_frame/i.test(nm) || !ent.position) return
@@ -1443,6 +723,7 @@ function connectAndCapture(tag) {
         col.frames.push(f)
         col.framesById.set(ent.id, f)
       })
+      
       bot._client.on('entity_metadata', pk => {
         try {
           const f = col.framesById.get(pk.entityId)
@@ -1458,126 +739,210 @@ function connectAndCapture(tag) {
           }
         } catch (e) {}
       })
+      
       bot.on('message', msg => {
         let t = ''
         try { t = msg.toString() } catch (e) { try { t = JSON.stringify(msg.json || msg) } catch (e2) {} }
         col.chats.push(t)
-        if (/введите номер|номер с картинки|введите капчу/i.test(t)) { col.prompts++; ev('промпт капчи #' + col.prompts) }
+        step('[r' + roundNum + '] 💬 ' + t.slice(0, 100))
+        
+        if (col.answerSent && col.answerResult === null) {
+          if (/неверн|incorrect|wrong|ошибк|неправильн/i.test(t)) {
+            step('[r' + roundNum + '] ❌ ответ НЕВЕРНЫЙ')
+            col.answerResult = 'wrong'
+            finish({ ok: false, note: 'wrong_answer', ocrSent: col.answerText })
+            return
+          }
+          if (/принят|accepted|верно|correct|успешн|welcome/i.test(t)) {
+            step('[r' + roundNum + '] ✅ ответ ВЕРНЫЙ')
+            col.answerResult = 'correct'
+            finish({ ok: true, note: 'correct_answer', ocrSent: col.answerText })
+            return
+          }
+        }
+        
+        if (/введите номер|номер с картинки|введите капчу|captcha|enter code/i.test(t.toLowerCase())) {
+          col.prompts++
+          step('[r' + roundNum + '] 💬 ПРОМПТ КАПЧИ #' + col.prompts)
+          if (col.prompts === 1 && !col.answerSent) {
+            setTimeout(async () => {
+              if (finished || col.answerSent) return
+              await trySendAnswer(bot, col, roundNum)
+            }, 2000)
+          }
+        }
       })
-      bot.on('login', () => { clearTimeout(loginT); ev('login ok (' + nick + ') за ' + (Date.now() - tConn) + 'мс') })
-      bot.on('spawn', () => { clearTimeout(tSpawn); ev('spawn ok за ' + (Date.now() - tConn) + 'мс') })
+      
+      bot.on('login', () => {
+        clearTimeout(loginT)
+        step('[r' + roundNum + '] login ok (' + nick + ') за ' + (Date.now() - tConn) + 'мс')
+      })
+      
       bot.on('kicked', r => {
         if (finished) return
-        col.dead = true; col.reason = 'kicked'
-        ev('kicked: ' + String(r || '').slice(0, 100))
-        setTimeout(() => { if (!finished && !(col.prompts >= 1 && linkedNow() >= 8)) finish(false, 'kicked') }, 600)
+        const reason = String(r || '')
+        step('[r' + roundNum + '] kicked: ' + reason.slice(0, 150))
+        if (col.answerSent && col.answerResult === null) {
+          step('[r' + roundNum + '] ✅ KICKED после ответа = капча пройдена!')
+          finish({ ok: true, note: 'captcha_passed', ocrSent: col.answerText })
+          return
+        }
+        col.dead = true
+        finish({ ok: false, note: 'kicked: ' + reason.slice(0, 80) })
       })
+      
       bot.on('end', (reason) => {
         if (finished) return
         col.dead = true
-        if (!col.reason) col.reason = 'end: ' + String(reason || '').slice(0, 100)
-        ev('end: ' + col.reason)
-        setTimeout(() => { if (!finished && !(col.prompts >= 1 && linkedNow() >= 8)) finish(false, col.reason) }, 600)
+        finish({ ok: false, note: 'end: ' + String(reason || '').slice(0, 80) })
       })
+      
       bot.on('error', e => {
         if (finished) return
         col.dead = true
-        if (!col.reason) col.reason = 'error: ' + e.message
-        ev(col.reason)
-        if (col.prompts < 1) finish(false, col.reason)
+        finish({ ok: false, note: 'error: ' + e.message })
       })
-
-      pollT = setInterval(() => {
-        const linked = linkedNow()
-        if (col.prompts >= 1 && linked >= 8) {
-          if (!settleT) { ev('данные готовы (linked=' + linked + ')'); settleT = setTimeout(() => finish(true, 'captured'), SETTLE_MS) }
-        } else if (col.dead && linked >= 8 && col.prompts >= 1) finish(true, 'captured-before-kick')
-      }, 400)
-    }).catch(e => { ev('socks fail: ' + e.message); finish(false, 'socks: ' + e.message) })
+      
+    }).catch(e => {
+      step('[r' + roundNum + '] socks fail: ' + e.message)
+      finish({ ok: false, note: 'socks: ' + e.message })
+    })
   })
+}
+
+async function trySendAnswer(bot, col, roundNum) {
+  const linked = col.frames.filter(f => f.mapId !== null && col.maps.has(f.mapId))
+  step('[r' + roundNum + '] linked=' + linked.length)
+  
+  if (linked.length < MIN_PLACED) {
+    step('[r' + roundNum + '] ❌ Недостаточно данных')
+    return
+  }
+  
+  const walls = clusterWalls(linked)
+  if (!walls.length) {
+    step('[r' + roundNum + '] ❌ Стен не найдено')
+    return
+  }
+  
+  let bestOcr = null
+  let bestWallData = null
+  
+  for (const w of walls) {
+    const asm = assembleWallAuto(w, col.maps)
+    if (!asm || asm.placed < 8) continue
+    step('[r' + roundNum + '] OCR стена ' + w.tag + ' (' + asm.W + 'x' + asm.H + ')...')
+    const result = await ocrWithTesseract(asm.data, asm.W, asm.H, w.tag)
+    if (result.text && result.text.length >= 4 && result.text.length <= 7) {
+      if (!bestOcr || result.confidence > bestOcr.confidence) {
+        bestOcr = result
+        bestWallData = asm
+      }
+    }
+  }
+  
+  if (!bestOcr || !bestOcr.text) {
+    step('[r' + roundNum + '] ❌ Не удалось распознать')
+    return
+  }
+  
+  step('[r' + roundNum + '] 🎯 ФИНАЛЬНЫЙ ОТВЕТ: "' + bestOcr.text + '" (conf=' + bestOcr.confidence.toFixed(1) + '%)')
+  
+  try {
+    const outDir = path.join(REC_ROOT, 'captcha_' + roundNum + '_' + STAMP)
+    fs.mkdirSync(outDir, { recursive: true })
+    fs.writeFileSync(path.join(outDir, 'captcha.png'), colorPng(bestWallData.data, bestWallData.W, bestWallData.H, 2))
+    fs.writeFileSync(path.join(outDir, 'answer.txt'), bestOcr.text + '\n' + JSON.stringify(bestOcr, null, 2))
+  } catch (e) {}
+  
+  try {
+    col.answerSent = true
+    col.answerText = bestOcr.text
+    step('[r' + roundNum + '] 📤 ОТПРАВЛЯЮ В ЧАТ: "' + bestOcr.text + '"')
+    bot.chat(bestOcr.text)
+    setTimeout(() => {
+      if (!col.answerResult && !col.dead) {
+        step('[r' + roundNum + '] ⏱ Таймаут реакции')
+      }
+    }, ANSWER_TIMEOUT_MS)
+  } catch (e) {
+    step('[r' + roundNum + '] ❌ Ошибка отправки: ' + e.message)
+    col.answerSent = false
+  }
 }
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.7.32 ===')
-  step('🎯 ДВА РАЗНЫХ ПРОКСИ:')
-  step('   Minecraft: ' + PROXY.host + ':' + PROXY.port + ' (bproxy.site)')
-  step('   Roboflow:  ' + (RF_SOCKS ? RF_SOCKS.host + ':' + RF_SOCKS.port : 'НЕ НАСТРОЕН') + ' (45.130.129.70)')
+  step('=== СТАРТ v3.8.1 — АВТО-УСТАНОВКА ВСЕХ ЗАВИСИМОСТЕЙ ===')
+  step('')
+  
+  // ШАГ 1: Создаём package.json если нет
+  ensurePackageJson()
+  
+  // ШАГ 2: Проверяем и устанавливаем все нужные пакеты
+  step('[SETUP] 📦 Проверка зависимостей...')
+  await ensureMineflayer()
+  await ensureSocks()
+  await ensureTesseract()  // это скачает ~50МБ при первом запуске
+  step('')
+  
+  step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
+  step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version)
+  step('proxy: ' + PROXY.host + ':' + PROXY.port)
+  step('OCR: Tesseract.js (5 вариантов + голосование)')
+  step('')
   
   if (!CFG_PATH) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
-
+  
+  // Предварительная инициализация Tesseract
+  try {
+    await initTesseract()
+  } catch (e) {
+    step('❌ Не удалось инициализировать Tesseract: ' + e.message)
+    process.exit(1)
+  }
+  
   const results = []
   const tGlobal = Date.now()
-  let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
-
-  step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
-  step('ROBOFLOW (HARDCODED):')
-  step('  serverlessUrl = ' + ROBOFLOW.serverlessUrl)
-  step('  detectUrl     = ' + ROBOFLOW.detectUrl)
-  step('  modelId       = ' + ROBOFLOW.modelId)
-  step('  apiKey        = ' + ROBOFLOW.apiKey.slice(0, 6) + '...' + ROBOFLOW.apiKey.slice(-4))
-  step('Auth: Authorization: Bearer (header, НЕ URL)')
+  let correctCount = 0
   
-  await killPort9001()
-
-  currentRunIp = await rotateIp()
+  await rotateIp()
   step('IP забега: ' + (currentRunIp || '?'))
-
-  for (let r = 1; r <= TARGET_ROUNDS && !aborted; r++) {
-    let rec = null, lastNetFail = false
-    for (let attempt = 1; attempt <= ATTEMPTS_PER_ROUND && !rec && !aborted; attempt++) {
-      if (attempt > 1 && (lastNetFail || consecutiveNetFails > 0) && !proxyDead && rotationsUsed < MAX_ROTATIONS_ON_FAIL) {
-        rotationsUsed++
-        step('🔄 ротация IP (' + rotationsUsed + '/' + MAX_ROTATIONS_ON_FAIL + ')')
+  step('')
+  
+  for (let r = 1; r <= TARGET_ROUNDS; r++) {
+    step('--- РАУНД ' + r + '/' + TARGET_ROUNDS + ' (IP ' + (currentRunIp || '?') + ') ---')
+    const result = await doRound(r)
+    if (result.ok) {
+      correctCount++
+      step('✅ РАУНД ' + r + ' УСПЕХ! ответ: "' + (result.ocrSent || '?') + '" | ' + result.note)
+    } else {
+      step('❌ РАУНД ' + r + ' fail: ' + result.note)
+      if (result.ocrSent) step('   отправлен: "' + result.ocrSent + '"')
+      if (result.note.includes('login timeout') || result.note.includes('kicked')) {
+        step('🔄 Ротация IP...')
         await rotateIp()
-        await sleep(2500)
-      } else if (attempt > 1) await sleep(1500)
-      else await sleep(1000 + Math.floor(Math.random() * 1000))
-
-      step('--- РАУНД ' + r + '/' + TARGET_ROUNDS + ' (попытка ' + attempt + ', IP ' + (currentRunIp || '?') + ') ---')
-      const res = await connectAndCapture('r' + r + 'a' + attempt)
-      lastNetFail = !!(res && !res.ok && NET_FAIL_RE.test(res.note || ''))
-
-      if (res && res.ok) {
-        consecutiveNetFails = 0; proxyFails = 0
-        const dir = path.join(REC_ROOT, 'live_round' + r + '_' + STAMP)
-        const candidate = await saveRecord(dir, res.snap, 'РАУНД' + r)
-        if (candidate && candidate.tilesCount >= MIN_PLACED) rec = candidate
-      } else {
-        const note = res ? res.note : '?'
-        step('раунд ' + r + ' попытка ' + attempt + ': ' + note)
-        if (PROXY_DEAD_RE.test(note)) {
-          proxyFails++
-          if (proxyFails >= 2) { proxyDead = true; aborted = true; step('ПРОКСИ МЁРТВ') }
-        } else if (lastNetFail) {
-          if (currentRunIp) badIPs.add(currentRunIp)
-          consecutiveNetFails++
-          if (consecutiveNetFails >= 6) { aborted = true; step('6 сетевых фейлов') }
-        } else consecutiveNetFails = 0
+        await sleep(2000)
       }
     }
-    if (rec) {
-      results.push({ n: r, ok: true, rec: rec })
-      step('РАУНД ' + r + ' сохранён: ORIGINAL=' + rec.wall +
-        ' rfDigits=' + (rec.rfMetrics ? rec.rfMetrics.n : 0) +
-        ' rfText="' + (rec.rfMetrics ? rec.rfMetrics.text : '') + '"' +
-        ' ocr="' + rec.ocrText + '"')
-    } else if (!aborted) {
-      results.push({ n: r, ok: false, note: 'fail' })
-      step('РАУНД ' + r + ' провален')
-    }
-    if (r < TARGET_ROUNDS && !aborted) await sleep(PAUSE_BETWEEN_MS)
+    results.push({ n: r, ok: result.ok, note: result.note, ocr: result.ocrSent || '-' })
+    if (r < TARGET_ROUNDS) await sleep(PAUSE_BETWEEN_MS)
+    step('')
   }
-
-  const okList = results.filter(x => x.ok && x.rec)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ ===']
-  L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - tGlobal) / 1000) + 'с')
+  
+  if (tesseractWorker) {
+    try { await tesseractWorker.terminate() } catch (e) {}
+  }
+  
+  const L = ['=== СВОДКА ===']
+  L.push('успешных: ' + correctCount + '/' + TARGET_ROUNDS)
+  L.push('точность: ' + Math.round(correctCount/TARGET_ROUNDS*100) + '%')
+  L.push('время: ' + Math.round((Date.now() - tGlobal) / 1000) + 'с')
+  L.push('')
   for (const x of results) {
-    L.push('  #' + x.n + ': ' + (x.rec ? 'ORIGINAL=' + x.rec.wall +
-      ' rfDigits=' + (x.rec.rfMetrics ? x.rec.rfMetrics.n : 0) +
-      ' rfText="' + (x.rec.rfMetrics ? x.rec.rfMetrics.text : '') + '"' +
-      ' ocr="' + x.rec.ocrText + '"' : 'FAIL'))
+    L.push('  #' + x.n + ': ' + (x.ok ? '✅' : '❌') + ' ocr="' + x.ocr + '" — ' + x.note)
   }
+  
   step('готово.')
   flushReport(L.join('\n'))
   console.log('\n' + L.join('\n'))
@@ -1585,9 +950,7 @@ async function main() {
 }
 
 main().catch(e => {
-  console.error('\n!!! FATAL MAIN ERROR !!!')
-  console.error('Message:', e.message)
-  console.error('Stack:', e.stack)
+  console.error('\n!!! FATAL !!!', e.message, '\n', e.stack)
   flushReport('FATAL: ' + (e.stack || e.message))
   setTimeout(() => process.exit(1), 2000)
 })
