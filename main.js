@@ -1,49 +1,37 @@
-// VERSION: 3.8.0
-// main.js — сбор картинки капчи со стены item_frame'ов, 10 раундов
+// VERSION: 3.9.0
+// main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
 //
-// ======================= ЧТО ИСПРАВЛЕНО В v3.8.0 =======================
-// 1. [ГЛАВНАЯ ПРИЧИНА «КАШИ» ИЗ ПЛИТОК] Старый assembleWallAuto() ВСЕГДА
-//    перебирал все перестановки колонок и брал минимум «цены шва» по
-//    ink-маске, а ориентацию брал первую подошедшую (hAsc_yDesc, т.е.
-//    «слева меньшие x»). Это верно, только если бот смотрит на стену со
-//    стороны +z. С другой стороны картинка зеркальная, и перебор
-//    перестановок «чинил» её наугад → плитки перемешивались.
-//    Теперь: (а) направление «лево→право» считается по позиции бота
-//    относительно плоскости стены; (б) цена швов считается по реальной
-//    RGB-палитре карты, а не по бинарной маске; (в) перестановка колонок
-//    применяется ТОЛЬКО если она явно лучше (на 25%) порядка по
-//    координатам; (г) при почти равных ценах приоритет у варианта,
-//    полученного из координат+точки обзора.
-// 2. [ЦВЕТА] Множители оттенков палитры карты были [135,255,220,180].
-//    Правильно (minecraft.wiki → Map item format): [180,220,255,135]
-//    (проверка: GRASS 127,178,56 → id 4..7 = 89,125,39/109,153,48/
-//    127,178,56/67,94,29). Старая таблица портила яркость всех картинок.
-// 3. [ПОВОРОТ ПЛИТОК] Проверяются 4 правила: rot%4, (4-rot)%4, 0, rot/2 —
-//    выбирается по непрерывности швов. Лечит отсутствующие метаданные,
-//    перепутанное направление вращения и сервер, пишущий шаги по 45°.
-// 4. [МЕТАДАННЫЕ] map_id/Rotation читаются устойчиво ко всем версиям:
-//    слушаем entity_metadata / set_entity_metadata / set_entity_data,
-//    плюс поллим bot.entities[id].metadata (mineflayer сам их парсит);
-//    map_id ищем в data components ('map_id' и 'minecraft:map_id'),
-//    в NBT-теге 'map' и в старом itemDamage. Rotation — key 9 (в nmp
-//    поле type часто ЧИСЛО, старый фильтр по строке его терял).
-//    Сырые метаданные пишутся в metadata_dump.json для диагностики.
-// 5. [СЕТКА] Допускаются пропуски и дубли рамок; больше не падаем, если
-//    cols*rows != frames.length. Пустые ячейки достраиваются свободными
-//    картами по совпадению швов (hole-fill), всё логируется.
-// 6. [ОЖИДАНИЕ ДАННЫХ] Ждём ВСЕ плитки стены и «тишину» потока map_data
-//    (нет новых байт stableMs). Промпт капчи больше не обязателен —
-//    слушаем chat/system/title/actionbar. Таймаут увеличен до 75 с.
-// 7. [ROBOFLOW] Опционален (--no-rf / roboflow.enabled=false), с общим
-//    бюджетом 25 с; его ошибка НЕ влияет на успех раунда. Добавлена
-//    проверка формата modelId/apiKey и режим --rf-test FILE.
-// 8. [ВЫВОД] Каталоги раундов не перетираются (в имени номер попытки),
-//    готовые картинки дублируются в records/captchas/round_NN.png (+json),
-//    пишется records/summary.json и assembly_debug.json по каждой стене.
-// 9. [РЕЖИМЫ] --selftest (проверка геометрии без сервера, 5 кейсов),
-//    --replay DIR (пересобрать картинку из уже записанных данных),
-//    --rounds N, --no-rf, --rf-test FILE, --debug.
-// =======================================================================
+// ======================= ЧТО НОВОГО В v3.9.0 =======================
+// A. [ФИКС РАУНДА 6] Roboflow УДАЛЁН полностью (403/405, ключ не тот — «яма»).
+//    Распознавание теперь локальное и самообучающееся: digits.js + label.js.
+// B. [ФИКС РАУНДА 6] Выбран правильный детектор стены. На сервере две
+//    параллельные стены капчи, поэтому рамки обеих стен с одинаковым x
+//    образовывали «сквозную» псевдоплоскость (x4/x5/x6 по 6 рамок) с рваной
+//    сеткой — именно её v3.8.0 и выбрал в раунде 6 (seam=90 вместо 10-18).
+//    Теперь такие кандидаты отбрасываются по двум признакам:
+//      • промежуток между соседними колонками/строками сетки > 2.5 блока;
+//      • разброс yaw рамок в плоскости > 2.2 рад (рамки смотрят в разные стороны).
+//    Плюс полностью пересобран скоринг стены: геометрия (seam, размер, доля
+//    заполнения, куда смотрит бот и как далеко стена) важнее распознавания.
+//    Локальный OCR больше не может «перетянуть» мусорную стену на себя.
+// C. ЦИФРЫ: glyphs → нормализация 20×28 → k-NN по размеченной базе (+ MLP
+//    после --train). Неуверенные глифы уходят в очередь learn/queue.jsonl,
+//    разметка — node label.js (ASCII-арт в терминале, клавиша 0..9).
+//    Каждый размеченный глиф сразу улучшает следующий раунд.
+// D. Каждый раунд пишет walls_debug.json с разбором ВСЕХ кандидатов и их
+//    скорингом — если выбор опять окажется неверным, по нему сразу видно почему.
+// E. Раунд стал заметно быстрее: убраны 4-16 HTTP-запросов к Roboflow
+//    (~22 с на раунд по вашему логу).
+//
+// Запуск:
+//   node main.js                 # 10 раундов: картинки + цифры
+//   node label.js                # разметка глифов (обучение)
+//   node main.js --train         # обучить MLP по размеченной базе
+//   node main.js --selftest      # 23 проверки без сервера
+//   node main.js --replay DIR    # пересобрать картинку из старой записи
+//   node main.js --rounds 3      # короткий прогон
+//   node main.js --debug         # подробный лог
+// ====================================================================
 
 'use strict'
 
@@ -52,12 +40,12 @@ const path = require('path')
 const zlib = require('zlib')
 const http = require('http')
 const https = require('https')
-const tls = require('tls')
-const { execSync } = require('child_process')
 
 // mineflayer/socks нужны только для живого забега. Для --selftest/--replay — не нужны.
 let mineflayer = null
 try { mineflayer = require('mineflayer') } catch (e) { /* опционально */ }
+let DIG = null
+try { DIG = require('./digits.js') } catch (e) { console.error('digits.js не загружен:', e.message) }
 let SocksClient = null
 try { SocksClient = require('socks').SocksClient } catch (e) { /* опционально */ }
 
@@ -72,9 +60,11 @@ function argVal(name, dflt) {
 const CLI = {
   selftest: ARGV.includes('--selftest'),
   rounds: Number(argVal('rounds', 0)) || 0,
-  noRf: ARGV.includes('--no-rf'),
   replay: typeof argVal('replay', '') === 'string' ? argVal('replay', '') : '',
-  rfTest: typeof argVal('rf-test', '') === 'string' ? argVal('rf-test', '') : '',
+  replayAll: typeof argVal('replay-all', '') === 'string' ? argVal('replay-all', '') : '',
+  train: ARGV.includes('--train'),
+  perms: ARGV.includes('--perms'),
+  label: ARGV.includes('--label'),
   debug: ARGV.includes('--debug')
 }
 
@@ -92,9 +82,8 @@ const MIN_TILES_DEFAULT = 6       // минимум плиток, чтобы с�
 const MIN_TILES_FRACTION = 0.6    // или 60% от размера сетки
 const VIEW_SIGN = 1
 
-const CLOUD_RF_TIMEOUT_MS = 20000
-const RF_TOTAL_BUDGET_MS = 25000
-const CREATE_NO_WINDOW = 0x08000000
+// каталог обучающей базы цифр (можно переопределить переменной окружения LEARN_DIR)
+let LEARN_DIR = process.env.LEARN_DIR ? path.resolve(process.env.LEARN_DIR) : path.join(__dirname, 'learn')
 
 // ========================= ГЛОБАЛЬНЫЕ =========================
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-')
@@ -222,6 +211,20 @@ const PROXY = {
 }
 const NICK_PREFIX = String(cfgGet(CFG, 'accounts.nickPrefix', 'Player')).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'Player'
 
+const GLYPH_OPTS = {
+  minH: Number(cfgGet(CFG, 'digits.minGlyphH', 0)) || null,
+  maxH: Number(cfgGet(CFG, 'digits.maxGlyphH', 0)) || null,
+  minW: Number(cfgGet(CFG, 'digits.minGlyphW', 0)) || null,
+  maxW: Number(cfgGet(CFG, 'digits.maxGlyphW', 0)) || null,
+  digitRatio: Number(cfgGet(CFG, 'digits.digitRatio', 0.62)) || 0.62,
+  maxParts: Number(cfgGet(CFG, 'digits.maxParts', 5)) || 5
+}
+const DIG_CONF_OK = Number(cfgGet(CFG, 'digits.confOk', 0.62)) || 0.62
+// перестановка колонок — аварийный режим (по умолчанию координаты авторитетны)
+const TRY_COL_PERMS = CLI.perms === true || cfgGet(CFG, 'capture.tryColPerms', false) === true
+// порог «швы плохие» — повод предупредить о возможной неверной раскладке
+const SEAM_WARN = Number(cfgGet(CFG, 'capture.seamWarn', 25)) || 25
+
 const CAP = {
   minTiles: Number(cfgGet(CFG, 'capture.minTiles', MIN_TILES_DEFAULT)) || MIN_TILES_DEFAULT,
   stableMs: Number(cfgGet(CFG, 'capture.stableMs', STABLE_MS)) || STABLE_MS,
@@ -243,54 +246,6 @@ const PROXY_DEAD_RE = /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ECONNABORTED/i
 const FATAL_RE = /не установлен|нет proxy\.host|модуль socks/i
 const badIPs = new Set()
 let currentRunIp = null
-
-// ========================= ROBOFLOW (опционально) =========================
-const RF_SOCKS_URL = cfgGet(CFG, 'roboflow.socksUrl', 'socks5://5xBLgY:S8hzBU@45.130.129.70:8000')
-
-function parseRfSocksUrl() {
-  try {
-    const s = String(RF_SOCKS_URL || '')
-    if (!s || s.includes('YOUR_')) return null
-    const m = s.match(/^socks5[h]?:\/\/([^:]+):([^@]*)@([^:]+):(\d+)\/?$/i)
-    if (!m) return null
-    return { host: m[3], port: Number(m[4]), username: decodeURIComponent(m[1]), password: decodeURIComponent(m[2]) }
-  } catch (e) { return null }
-}
-const RF_SOCKS = parseRfSocksUrl()
-
-const ROBOFLOW = {
-  enabled: CLI.noRf ? false : (cfgGet(CFG, 'roboflow.enabled', true) !== false),
-  apiKey: String(cfgGet(CFG, 'roboflow.apiKey', 'kTAPmOyqKcxeBTyi18FD')),
-  modelId: String(cfgGet(CFG, 'roboflow.modelId', 's-workspace-juqs3/captcha-funtime-vn60f/2')).replace(/^\/+|\/+$/g, ''),
-  confidence: Number(cfgGet(CFG, 'roboflow.confidence', 25)) || 25,
-  overlap: Number(cfgGet(CFG, 'roboflow.overlap', 20)) || 20,
-  scale: Number(cfgGet(CFG, 'roboflow.scale', 1)) || 1
-}
-
-function rfMultipart(buf, filename, boundary) {
-  const safe = String(filename || 'captcha.png').replace(/"/g, '')
-  const head = Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' + safe + '"\r\nContent-Type: image/png\r\n\r\n')
-  const tail = Buffer.from('\r\n--' + boundary + '--\r\n')
-  return Buffer.concat([head, buf, tail])
-}
-
-async function killPort9001() {
-  if (process.platform !== 'win32') return
-  try {
-    const out = execSync('netstat -ano | findstr :9001', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, creationFlags: CREATE_NO_WINDOW })
-    const pids = new Set()
-    for (const line of String(out || '').split('\n')) {
-      if (!line.includes('LISTENING')) continue
-      const parts = line.trim().split(/\s+/); const pid = parts[parts.length - 1]
-      if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid)
-    }
-    for (const pid of pids) {
-      step('[RF] убиваю процесс на :9001 PID ' + pid)
-      try { execSync('taskkill /F /PID ' + pid, { stdio: 'ignore', windowsHide: true, creationFlags: CREATE_NO_WINDOW }) } catch (e) {}
-    }
-    if (pids.size) await sleep(800)
-  } catch (e) {}
-}
 
 // ========================= HTTP / IP =========================
 function plainGet(urlStr, timeoutMs) {
@@ -389,221 +344,6 @@ async function rotateIp() {
     step('IP не сменился')
   }
   currentRunIp = await currentIp(); return currentRunIp
-}
-
-// ========================= ROBOFLOW HTTP =========================
-function rawRequestOnSocket(useTls, socket, hostname, port, method, reqPath, headers, body, timeoutMs) {
-  return new Promise(resolve => {
-    const mod = useTls ? https : http
-    const defaultPort = useTls ? 443 : 80
-    const hostHeader = (port && port !== defaultPort) ? (hostname + ':' + port) : hostname
-    const h = Object.assign({
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'identity', 'Cache-Control': 'no-cache', 'Connection': 'close',
-      'Host': hostHeader, 'Origin': 'https://app.roboflow.com', 'Referer': 'https://app.roboflow.com/'
-    }, headers || {})
-    if (body != null) h['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body))
-    const opts = { hostname, port, path: reqPath, method, timeout: timeoutMs, headers: h }
-    if (socket) opts.createConnection = () => socket   // надёжнее, чем opts.socket
-    let done = false
-    const finish = o => { if (done) return; done = true; resolve(o) }
-    let req = null
-    try {
-      req = mod.request(opts, res => {
-        const chunks = []
-        res.on('data', c => chunks.push(c))
-        res.on('end', () => finish({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
-        res.on('error', e => finish({ status: 0, body: 'RES ERR: ' + ((e && e.message) || e) }))
-      })
-    } catch (e) { finish({ status: 0, body: 'REQ THROW: ' + ((e && e.message) || e) }); return }
-    req.on('error', e => finish({ status: 0, body: 'REQ ERR: ' + ((e && e.message) || e) }))
-    req.on('timeout', () => { try { req.destroy() } catch (e) {}; finish({ status: 0, body: 'TIMEOUT' }) })
-    if (body != null) req.write(body)
-    req.end()
-  })
-}
-
-function socksConnectSocket(host, port, useTls, pHost, pPort, pUser, pPass) {
-  return new Promise((resolve, reject) => {
-    if (!SocksClient) { reject(new Error('модуль socks не установлен')); return }
-    if (!pHost) { reject(new Error('proxy host пуст')); return }
-    let settled = false
-    const to = setTimeout(() => { if (!settled) { settled = true; reject(new Error('SOCKS timeout 30s')) } }, 30000)
-    SocksClient.createConnection({
-      proxy: { host: pHost, port: pPort, type: 5, userId: pUser, password: pPass },
-      command: 'connect', destination: { host, port }
-    }).then(conn => {
-      if (settled) { try { conn.socket.destroy() } catch (e) {} return }
-      if (!useTls) { settled = true; clearTimeout(to); resolve({ socket: conn.socket, cleanup() { try { conn.socket.destroy() } catch (e) {} } }); return }
-      let secure = null
-      const fail = e => {
-        if (settled) return
-        settled = true; clearTimeout(to)
-        try { conn.socket.destroy() } catch (x) {}
-        if (secure) try { secure.destroy() } catch (x) {}
-        reject(e)
-      }
-      try {
-        secure = tls.connect({ socket: conn.socket, servername: host, minVersion: 'TLSv1.2' }, () => {
-          if (settled) return
-          settled = true; clearTimeout(to)
-          resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {}; try { conn.socket.destroy() } catch (e) {} } })
-        })
-      } catch (e) { fail(e); return }
-      secure.on('error', fail); conn.socket.on('error', fail)
-    }).catch(e => { if (!settled) { settled = true; clearTimeout(to); reject(e) } })
-  })
-}
-
-async function rfPostOnce(transport, url, headers, body, timeoutMs) {
-  let u = null
-  try { u = new URL(url) } catch (e) { return { status: 0, body: 'BAD URL', via: transport } }
-  const useTls = u.protocol === 'https:'
-  const port = Number(u.port || (useTls ? 443 : 80))
-  const reqPath = u.pathname + u.search
-  if (transport === 'direct') {
-    const r = await rawRequestOnSocket(useTls, null, u.hostname, port, 'POST', reqPath, headers, body, timeoutMs)
-    r.via = 'direct'; return r
-  }
-  if (transport === 'socks') {
-    if (!RF_SOCKS) return { status: 0, body: 'RF_SOCKS not configured', via: 'socks' }
-    let sk = null
-    try {
-      sk = await socksConnectSocket(u.hostname, port, useTls, RF_SOCKS.host, RF_SOCKS.port, RF_SOCKS.username, RF_SOCKS.password)
-    } catch (e) {
-      return { status: 0, body: 'SOCKS ERR: ' + ((e && e.message) || e), via: 'socks' }
-    }
-    try {
-      const r = await rawRequestOnSocket(useTls, sk.socket, u.hostname, port, 'POST', reqPath, headers, body, timeoutMs)
-      r.via = 'socks'; return r
-    } finally { try { sk.cleanup() } catch (e) {} }
-  }
-  return { status: 0, body: 'unknown transport', via: transport }
-}
-
-async function rfPost(url, headers, body, deadline) {
-  const transports = RF_SOCKS ? ['socks', 'direct'] : ['direct']
-  const attemptsLog = []
-  let last = null
-  for (const tr of transports) {
-    if (deadline && Date.now() > deadline) break
-    const left = deadline ? Math.max(4000, deadline - Date.now()) : CLOUD_RF_TIMEOUT_MS
-    const r = await rfPostOnce(tr, url, headers, body, Math.min(CLOUD_RF_TIMEOUT_MS, left))
-    attemptsLog.push(tr + ':' + r.status)
-    last = r
-    const st = Number(r.status || 0)
-    if ((st >= 200 && st < 400) || st === 401 || st === 404) { last._attempts = attemptsLog; return last }
-    if (st === 403) {
-      const b = String(r.body || '')
-      if (b.includes('Cloudflare') || b.includes('Attention Required')) { await sleep(1500); continue }
-      last._attempts = attemptsLog; return last
-    }
-    await sleep(700)
-  }
-  if (last) last._attempts = attemptsLog
-  return last || { status: 0, body: 'no transport', via: 'none', _attempts: attemptsLog }
-}
-
-function rfGetPredictions(json) {
-  if (!json) return []
-  if (Array.isArray(json.predictions)) return json.predictions
-  if (Array.isArray(json.results)) return json.results
-  if (json.prediction && Array.isArray(json.prediction.predictions)) return json.prediction.predictions
-  if (json.object && Array.isArray(json.object.predictions)) return json.object.predictions
-  return []
-}
-function rfDigitFromPrediction(p) {
-  const s = String(p.class || p.class_name || p.label || p.name || '')
-  const m = s.match(/\d/); return m ? m[0] : null
-}
-function rfNormConf(c) { c = Number(c || 0); if (c > 1) c = c / 100; return c }
-
-function rfMetrics(preds) {
-  const digits = []
-  for (const p of (preds || [])) {
-    const d = rfDigitFromPrediction(p)
-    const conf = rfNormConf(p.confidence != null ? p.confidence : p.score)
-    if (d !== null && conf >= 0.15) digits.push({ digit: d, conf, x: Number(p.x || 0), y: Number(p.y || 0), w: Number(p.width || p.w || 0), h: Number(p.height || p.h || 0) })
-  }
-  digits.sort((a, b) => a.x - b.x)
-  const n = digits.length
-  const avg = n ? digits.reduce((a, d) => a + d.conf, 0) / n : 0
-  let row = 0
-  if (n > 0) {
-    const hs = digits.map(d => d.h).filter(x => x > 0).sort((a, b) => a - b)
-    const medH = hs.length ? hs[Math.floor(hs.length / 2)] : 40
-    const band = Math.max(25, medH * 0.8)
-    const sorted = digits.slice().sort((a, b) => a.y - b.y)
-    for (let i = 0; i < sorted.length; i++) {
-      const group = [sorted[i]]
-      for (let j = i + 1; j < sorted.length; j++) { if (Math.abs(sorted[j].y - sorted[i].y) <= band) group.push(sorted[j]); else break }
-      group.sort((a, b) => a.x - b.x)
-      let cnt = 0, lastRight = -1e9
-      for (const d of group) {
-        const left = d.x - d.w / 2, right = d.x + d.w / 2
-        if (left >= lastRight - Math.max(3, d.w * 0.15)) { cnt++; lastRight = right }
-      }
-      if (cnt > row) row = cnt
-    }
-  }
-  const plausible = n >= 3 && n <= 8
-  const strong = avg >= 0.35
-  const score = (plausible ? 10000 : 0) + (strong ? 3000 : 0) + n * 1000 + row * 700 + Math.round(avg * 1000)
-  return { n, avg: Math.round(avg * 1000) / 1000, row, plausible, strong, score, text: digits.map(d => d.digit).join(''), digits }
-}
-
-async function sendToRoboflow(pngBuffer, filename, debugDir, label, deadline) {
-  const disabled = { ok: false, status: 0, attempt: 'disabled', predictions: [], metrics: rfMetrics([]), error: 'disabled' }
-  if (!ROBOFLOW.enabled || !ROBOFLOW.apiKey) return disabled
-  if (!/^[A-Za-z0-9_\-\/]+\/[A-Za-z0-9_\-]+\/\d+$/.test(ROBOFLOW.modelId)) {
-    step('[RF] ⚠️ modelId подозрительный: "' + ROBOFLOW.modelId + '" (ожидается workspace/project/version)')
-  }
-  if (!/^[0-9a-fA-F]{24,}$/.test(ROBOFLOW.apiKey)) {
-    step('[RF] ⚠️ apiKey непохож на Roboflow private key (обычно 32 hex-символа): ' + ROBOFLOW.apiKey.slice(0, 4) + '...')
-  }
-
-  const key = ROBOFLOW.apiKey
-  const conf = encodeURIComponent(ROBOFLOW.confidence)
-  const ov = encodeURIComponent(ROBOFLOW.overlap)
-  const endpoints = ['https://serverless.roboflow.com', 'https://detect.roboflow.com']
-  const boundary = '----WebKitFormBoundary' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
-  const mp = rfMultipart(pngBuffer, filename, boundary)
-  let last = null
-
-  for (const base of endpoints) {
-    if (deadline && Date.now() > deadline) break
-    const inferUrl = base + '/' + ROBOFLOW.modelId + '?confidence=' + conf + '&overlap=' + ov
-    const attempts = [
-      { name: path.basename(base) + '_multipart', headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Authorization': 'Bearer ' + key }, body: mp },
-      { name: path.basename(base) + '_raw', headers: { 'Content-Type': 'image/png', 'Authorization': 'Bearer ' + key }, body: pngBuffer }
-    ]
-    for (const at of attempts) {
-      if (deadline && Date.now() > deadline) break
-      const r = await rfPost(inferUrl, at.headers, at.body, deadline)
-      const preview = String(r.body || '').slice(0, 400).replace(/\s+/g, ' ')
-      step('[RF] ' + (label || '') + ' ' + at.name + ': status=' + r.status + ' via=' + (r.via || '?'))
-      if (r.status === 401) return { ok: false, status: 401, attempt: at.name, predictions: [], metrics: rfMetrics([]), error: 'INVALID API KEY (401)', raw: preview }
-      if (r.status === 403 && /Cloudflare|Attention Required/.test(String(r.body || ''))) { await sleep(1500); break }
-      if (r.status === 404) { step('[RF] 404 — модель не найдена на ' + base); break }
-      let json = null
-      try { json = JSON.parse(r.body) } catch (e) {}
-      const predictions = rfGetPredictions(json)
-      const metrics = rfMetrics(predictions)
-      const ok = r.status >= 200 && r.status < 300 && !!json
-      const item = { ok, status: r.status, attempt: at.name, url: inferUrl, json, predictions, metrics, raw: String(r.body || '').slice(0, 3000), attempts: r._attempts || [], error: ok ? null : (preview.slice(0, 300) || 'HTTP ' + r.status), modelId: ROBOFLOW.modelId }
-      if (debugDir) {
-        try {
-          fs.mkdirSync(debugDir, { recursive: true })
-          fs.writeFileSync(path.join(debugDir, 'roboflow_debug_' + at.name + '.txt'),
-            'STATUS: ' + r.status + '\nVIA: ' + (r.via || '?') + '\nURL: ' + inferUrl + '\nBODY:\n' + String(r.body || '').slice(0, 8000) + '\n')
-        } catch (e) {}
-      }
-      if (ok) { step('[RF] ✅ ' + at.name + ' ЦИФР: ' + metrics.n + ' text="' + metrics.text + '"'); return item }
-      last = item
-    }
-  }
-  return last || Object.assign(disabled, { error: 'all endpoints failed' })
 }
 
 // ========================= ПАЛИТРА КАРТЫ MINECRAFT =========================
@@ -857,9 +597,36 @@ function nearestIdx(centers, v) {
   return { idx: bi, dist: bd }
 }
 
+// максимальный разброс yaw в группе (с учётом перехода через ±PI)
+function yawSpread(frames) {
+  const ys = frames.map(f => f.yaw).filter(v => typeof v === 'number' && isFinite(v))
+  if (ys.length < 2) return 0
+  let maxGap = 0
+  const sorted = ys.slice().sort((a, b) => a - b)
+  for (let i = 1; i < sorted.length; i++) maxGap = Math.max(maxGap, sorted[i] - sorted[i - 1])
+  const wrap = (sorted[0] + Math.PI * 2) - sorted[sorted.length - 1]
+  // наибольший «пустой» сектор => все остальные лежат в дуге (2PI - maxGap)
+  const largest = Math.max(maxGap, wrap)
+  return Math.round((Math.PI * 2 - largest) * 1000) / 1000
+}
+
+// максимальный промежуток между соседними центрами колонок/строк сетки
+function maxGridGap(centers) {
+  if (!centers || centers.length < 2) return 0
+  const s = centers.slice().sort((a, b) => a - b)
+  let g = 0
+  for (let i = 1; i < s.length; i++) g = Math.max(g, s[i] - s[i - 1])
+  return Math.round(g * 1000) / 1000
+}
+
 // все плоскости-стены: x=const и z=const.
-// Отбрасываем «линии» (ряд рамок в одну строку/колонку) — иначе каждая колонка
-// настоящей стены выглядит отдельной стеной и уводит выбор.
+// Отбрасываем:
+//  • «линии» (ряд рамок в одну строку/колонку);
+//  • СКВОЗНЫЕ артефакты: если на сервере две параллельные стены капчи, рамки
+//    обеих стен с одинаковым x попадают в одну «плоскость» x=const, но колонки
+//    у неё рваные (промежуток в несколько блоков) и yaw рамок смотрит в
+//    противоположные стороны. Именно так в v3.8.0 раунд 6 выбрал мусорную
+//    «стену» 2×3 вместо настоящей 4×3.
 function detectWalls(frames, minFrames) {
   const walls = []
   for (const axis of ['x', 'z']) {
@@ -868,14 +635,34 @@ function detectWalls(frames, minFrames) {
     for (const c of cl) {
       const members = frames.filter(f => Math.abs(f[axis] - c.value) <= 0.45)
       if (members.length < (minFrames || 4)) continue
-      const nH = clusterValues(members.map(f => f[horiz]), 0.45).length
-      const nY = clusterValues(members.map(f => f.y), 0.45).length
-      if (nH < 2 || nY < 2) continue
-      walls.push({ axis, value: c.value, frames: members, tag: axis + Math.round(c.value), span: nH + '×' + nY })
+      const hC = clusterValues(members.map(f => f[horiz]), 0.45).map(x => x.value)
+      const yC = clusterValues(members.map(f => f.y), 0.45).map(x => x.value)
+      if (hC.length < 2 || yC.length < 2) continue
+      const gap = Math.max(maxGridGap(hC), maxGridGap(yC))
+      const ys = yawSpread(members)
+      const contiguous = gap <= 1.3
+      // жёстко отбрасываем явные сквозные артефакты
+      if (gap > 2.5) continue
+      if (ys > 2.2) continue
+      walls.push({
+        axis, value: c.value, frames: members, tag: axis + Math.round(c.value),
+        span: hC.length + '×' + yC.length, gap, contiguous, yawSpread: ys
+      })
     }
   }
-  walls.sort((a, b) => b.frames.length - a.frames.length)
+  walls.sort((a, b) => (b.contiguous - a.contiguous) || (b.frames.length - a.frames.length))
   return walls
+}
+
+// расстояние от точки обзора до центра стены
+function wallDist(wall, view) {
+  if (!view || typeof view.x !== 'number') return null
+  let cx = 0, cy = 0, cz = 0
+  for (const f of wall.frames) { cx += f.x; cy += f.y; cz += f.z }
+  const n = wall.frames.length || 1
+  cx /= n; cy /= n; cz /= n
+  const dx = cx - view.x, dy = cy - (view.y + 1.6), dz = cz - view.z
+  return Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz) * 100) / 100
 }
 // минимальное число рамок, чтобы плоскость считалась стеной-кандидатом
 function wallMinFrames(linkedCount) {
@@ -1298,7 +1085,11 @@ function assembleWallSmart(wall, tiles, view, opts) {
   // минимум вдвое и сама по себе хорошая (PERM_ACCEPT_MAX).
   const PERM_TRIGGER = opts.permTrigger == null ? 12 : opts.permTrigger
   const PERM_ACCEPT_MAX = opts.permAcceptMax == null ? 8 : opts.permAcceptMax
-  if (cols >= 3 && cols <= 6 && opts.tryPerms !== false && natCost > PERM_TRIGGER) {
+  // По умолчанию ВЫКЛЮЧЕНО: координаты рамок — это истина, а перестановка
+  // может «улучшить» швы на удачном совпадении и испортить правильную картинку.
+  // Включается capture.tryColPerms=true / --perms, если раскладка реально едет.
+  const tryPerms = opts.tryPerms != null ? opts.tryPerms : TRY_COL_PERMS
+  if (cols >= 3 && cols <= 6 && tryPerms && natCost > PERM_TRIGGER) {
     let bp = null
     for (const p of perms(identity, 720)) {
       const c = permSeamCost(dispTiles, cols, rows, p, bg)
@@ -1504,50 +1295,86 @@ async function saveRecord(outDir, snap, label, roundNo) {
   fs.writeFileSync(path.join(outDir, 'chat.log'), (snap.chats || []).join('\n'))
   fs.writeFileSync(path.join(outDir, 'session_log.txt'), (snap.events || []).join('\n'))
   if (snap.view) fs.writeFileSync(path.join(outDir, 'view.json'), JSON.stringify(snap.view, null, 2))
-  if (snap.metaDump) { try { fs.writeFileSync(path.join(outDir, 'metadata_dump.json'), JSON.stringify(snap.metaDump, null, 2)) } catch (e) {} }
+  try { fs.writeFileSync(path.join(outDir, 'metadata_dump.json'), JSON.stringify(snap.metaDump || [], null, 2)) } catch (e) {}
 
   const linked = frames.filter(f => f.mapId !== null && f.mapId !== undefined && tiles.has(f.mapId))
   step(label + ': frames=' + frames.length + ' linked=' + linked.length + ' maps=' + tiles.size)
 
+  if (!linked.length) {
+    const d = [
+      'ДИАГНОСТИКА: нет ни одной рамки со ссылкой на карту (map_id).',
+      'frames всего: ' + frames.length + ', карт получено (map_data): ' + tiles.size,
+      'Смотрите metadata_dump.json — там сырые метаданные рамок.',
+      'Если файл пустой, значит метаданные item_frame не приходят вовсе.'
+    ]
+    fs.writeFileSync(path.join(outDir, 'DIAGNOSTICS.txt'), d.join('\n') + '\n')
+    step(label + ': ❌ нет linked-рамок (см. DIAGNOSTICS.txt)')
+    return null
+  }
+
   const minFrames = wallMinFrames(linked.length)
   const walls = detectWalls(linked, minFrames)
   if (!walls.length) {
-    step(label + ': ❌ стен не найдено (нужно ≥' + minFrames + ' рамок в одной плоскости)')
+    step(label + ': ❌ стен не найдено (нужно ≥' + minFrames + ' рамок в одной плоскости, без рваных сеток)')
     fs.writeFileSync(path.join(outDir, 'FAIL.txt'), 'no walls detected; linked=' + linked.length + '\n')
     return null
   }
-  step(label + ': плоскостей-кандидатов: ' + walls.map(w => w.tag + '(' + w.frames.length + ')').join(', '))
+  step(label + ': плоскостей-кандидатов: ' + walls.map(w => w.tag + '(' + w.frames.length + ',gap' + w.gap + ')').join(', '))
 
-  const rfDeadline = ROBOFLOW.enabled ? Date.now() + RF_TOTAL_BUDGET_MS : 0
+  // ---- база цифр (обучаемая) ----
+  let store = null, model = null, queue = null
+  try {
+    if (!DIG) throw new Error('digits.js не загружен')
+    store = new DIG.GlyphStore(LEARN_DIR)
+    model = DIG.MLP.load(LEARN_DIR)
+    queue = new DIG.LabelQueue(LEARN_DIR)
+    if (roundNo === 1 || DIG_LOG_ONCE.v !== store.size) {
+      DIG_LOG_ONCE.v = store.size
+      step('[digits] база: ' + store.size + ' размеченных глифов ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет (нужно --train)'))
+    }
+  } catch (e) { step('[digits] модуль недоступен: ' + e.message) }
+
   const stats = []
-  for (const w of walls.slice(0, 4)) {
+  for (const w of walls.slice(0, 6)) {
     let asm = null
     try { asm = assembleWallSmart(w, tiles, snap.view, {}) } catch (e) { step(label + ' ' + w.tag + ': assemble err ' + e.message) }
     if (!asm) continue
-    const like = captchaLikeness(asm)
+
+    const im = inkMaskWall(asm.data, asm.W, asm.H)
+    let rec = { text: '', textAll: '', items: [], needLabel: [], rowCount: 0, allCount: 0 }
+    let glyphs = []
+    if (store) {
+      try {
+        glyphs = DIG.extractGlyphs(im.ink, asm.W, asm.H, GLYPH_OPTS)
+        rec = DIG.recognize(glyphs, store, model, { confOk: DIG_CONF_OK })
+      } catch (e) { dbg('glyphs err ' + e.message) }
+    }
+
     const dot = wallDot(w, snap.view)
-    const dotBonus = (dot !== null && dot * VIEW_SIGN >= 0.8) ? 400 : 0
+    const dist = wallDist(w, snap.view)
     const fillRatio = asm.placed / Math.max(1, asm.grid.total)
 
-    let rf = { ok: false, status: 0, attempt: 'skipped', predictions: [], metrics: rfMetrics([]), error: 'not sent' }
-    if (ROBOFLOW.enabled && Date.now() < rfDeadline) {
-      try {
-        const png = colorPng(asm.data, asm.W, asm.H, ROBOFLOW.scale)
-        const fname = 'captcha_' + w.tag + '.png'
-        fs.writeFileSync(path.join(outDir, 'ROBOFLOW_input_' + w.tag + '.png'), png)
-        rf = await sendToRoboflow(png, fname, outDir, label + ' ' + w.tag, rfDeadline)
-        fs.writeFileSync(path.join(outDir, 'roboflow_' + w.tag + '.json'), JSON.stringify({
-          ok: rf.ok, status: rf.status, attempt: rf.attempt, error: rf.error || null, metrics: rf.metrics,
-          predictionsCount: (rf.predictions || []).length, predictions: (rf.predictions || []).slice(0, 60), modelId: rf.modelId || ROBOFLOW.modelId
-        }, null, 2))
-      } catch (e) {
-        rf = { ok: false, status: 0, attempt: 'exception', predictions: [], metrics: rfMetrics([]), error: e.message }
+    // ---- скоринг: геометрия важнее, локальное распознавание — вспомогательный сигнал ----
+    const seamPenalty = asm.seamCost <= 25 ? asm.seamCost * 12 : 300 + (asm.seamCost - 25) * 40
+    const sizeBonus = asm.placed * 90
+    const fillBonus = Math.round(fillRatio * 1500)
+    const dotBonus = dot === null ? 0 : (dot >= 0.9 ? 1800 : dot >= 0.7 ? 1100 : dot >= 0.4 ? 400 : dot >= 0.1 ? -300 : -1800)
+    const distBonus = dist === null ? 0 : (dist <= 10 ? 1000 : dist <= 18 ? 650 : dist <= 30 ? 250 : dist <= 50 ? 0 : -400)
+    const confident = rec.items.filter(i => i.conf >= DIG_CONF_OK).length
+    const digitBonus = Math.min(900, (rec.text.length >= 3 ? 500 : 0) + confident * 100)
+    const gapPenalty = w.contiguous ? 0 : 1200
+    const yawPenalty = w.yawSpread > 0.6 ? 1500 : 0
+    const score = Math.round(sizeBonus + fillBonus + dotBonus + distBonus + digitBonus - seamPenalty - gapPenalty - yawPenalty)
+
+    stats.push({
+      w, asm, im, glyphs, rec, dot, dist, fillRatio, score,
+      breakdown: {
+        sizeBonus, fillBonus, dotBonus, distBonus, digitBonus,
+        seamPenalty: Math.round(seamPenalty), gapPenalty, yawPenalty,
+        seamCost: asm.seamCost, contiguous: w.contiguous, gap: w.gap, yawSpread: w.yawSpread,
+        digitsText: rec.text, digitsAll: rec.textAll, glyphsRow: rec.rowCount, glyphsAll: rec.allCount
       }
-    }
-    const rfScore = rf.ok && rf.metrics ? rf.metrics.score : 0
-    const score = rfScore * 100000 + (like.ocr.plausible ? 1500 : 0) + Math.round(fillRatio * 1000) +
-      like.ocr.n * 60 + dotBonus - Math.round(asm.seamCost * 20)
-    stats.push({ w, asm, like, dot, dotBonus, fillRatio, rf, rfScore, score })
+    })
   }
 
   if (!stats.length) { step(label + ': ❌ ни одна стена не собралась'); fs.writeFileSync(path.join(outDir, 'FAIL.txt'), 'no wall assembled\n'); return null }
@@ -1555,19 +1382,32 @@ async function saveRecord(outDir, snap, label, roundNo) {
   const best = stats[0]
   const asm = best.asm
 
+  // ---- отладка выбора стены ----
+  try {
+    fs.writeFileSync(path.join(outDir, 'walls_debug.json'), JSON.stringify({
+      chosen: best.w.tag, view: snap.view || null,
+      candidates: stats.map(s => Object.assign({ wall: s.w.tag, axis: s.w.axis, value: s.w.value,
+        cols: s.asm.grid.cols, rows: s.asm.grid.rows, placed: s.asm.placed, total: s.asm.grid.total,
+        orientation: s.asm.ori.tag, rotationRule: s.asm.rotRule, permUsed: s.asm.permUsed,
+        score: s.score }, s.breakdown))
+    }, null, 2))
+  } catch (e) {}
+
   // ---- сохраняем лучшую ----
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA.png'), colorPng(asm.data, asm.W, asm.H, 2))
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_x1.png'), colorPng(asm.data, asm.W, asm.H, 1))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask.png'), bwPng(best.like.ink, asm.W, asm.H, 2))
+  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask.png'), bwPng(best.im.ink, asm.W, asm.H, 2))
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_raw.bin'), Buffer.from(asm.data))
   fs.writeFileSync(path.join(outDir, 'layout.json'), JSON.stringify(asm.layout, null, 2))
   fs.writeFileSync(path.join(outDir, 'assembly_debug.json'), JSON.stringify({
-    wall: best.w.tag, axis: best.w.axis, value: best.w.value,
+    wall: best.w.tag, axis: best.w.axis, value: best.w.value, gap: best.w.gap, contiguous: best.w.contiguous,
+    yawSpread: best.w.yawSpread,
     cols: asm.grid.cols, rows: asm.grid.rows, cells: asm.grid.total,
     placed: asm.placed, missing: asm.missing, holesFilled: asm.holesFilled, holeAssignments: asm.holeAssignments,
     orientation: asm.ori, rotationRule: asm.rotRule, permUsed: asm.permUsed, colPerm: asm.colPerm,
     seamCost: asm.seamCost, natSeamCost: asm.natSeamCost, permSeamCost: asm.permSeamCost,
-    view: snap.view || null, trials: asm.trials, ocr: best.like.ocr, inkDensity: best.like.density
+    view: snap.view || null, dot: best.dot, dist: best.dist, trials: asm.trials,
+    inkDensity: best.fillRatio, digits: { text: best.rec.text, all: best.rec.textAll }
   }, null, 2))
 
   fs.mkdirSync(path.join(outDir, 'tiles'), { recursive: true })
@@ -1576,20 +1416,49 @@ async function saveRecord(outDir, snap, label, roundNo) {
     const raw = tiles.get(f.mapId)
     if (raw) fs.writeFileSync(path.join(outDir, 'tiles', 'tile_' + String(ti++).padStart(2, '0') + '_map' + f.mapId + '_rot' + (f.rotation || 0) + '.bin'), Buffer.from(raw))
   }
+
+  // ---- варианты маски (для отладки) ----
   fs.mkdirSync(path.join(outDir, 'variants'), { recursive: true })
+  const vars = buildVariants(best.im.ink, asm.W, asm.H)
   const ocrLines = []
-  for (const v of best.like.variants) {
-    fs.writeFileSync(path.join(outDir, 'variants', v.name + '.png'), bwPng(v.mask, asm.W, asm.H, 2))
+  for (const v of vars) {
+    try { fs.writeFileSync(path.join(outDir, 'variants', v.name + '.png'), bwPng(v.mask, asm.W, asm.H, 2)) } catch (e) {}
     const r = ocr(v.mask, asm.W, asm.H)
-    ocrLines.push(v.name + ': "' + r.text + '" digits=' + r.digits.length)
+    ocrLines.push(v.name + ': legacy-ocr="' + r.text + '" digits=' + r.digits.length)
   }
   fs.writeFileSync(path.join(outDir, 'ocr_variants.txt'), ocrLines.join('\n'))
 
-  // ---- декаи (другие стены) ----
-  for (const s of stats.slice(1)) {
+  // ---- глиф-кандидаты и распознавание ----
+  const glyphDir = path.join(outDir, 'glyphs')
+  let queued = 0
+  if (store && best.glyphs.length) {
+    try { fs.mkdirSync(glyphDir, { recursive: true }) } catch (e) {}
+    best.rec.items.forEach((it, i) => {
+      try {
+        const g = it.glyph
+        fs.writeFileSync(path.join(glyphDir, 'g' + i + '_' + (it.digit === null ? 'none' : it.digit) + '_' + String(Math.round(it.conf * 100)) + '.png'),
+          DIG.pngFromMask(best.im.ink, asm.W, asm.H, g.bbox, 3))
+      } catch (e) {}
+    })
     try {
-      fs.writeFileSync(path.join(outDir, 'DECOY_NOT_ORIGINAL_' + s.w.tag + '.png'), colorPng(s.asm.data, s.asm.W, s.asm.H, 2))
-    } catch (e) {}
+      queued = DIG.enqueueGlyphs(queue, best.rec.needLabel, { src: path.basename(outDir), round: roundNo, wall: best.w.tag })
+    } catch (e) { dbg('queue err ' + e.message) }
+  }
+  try {
+    fs.writeFileSync(path.join(outDir, 'digits.json'), JSON.stringify({
+      text: best.rec.text, textAll: best.rec.textAll, rowCount: best.rec.rowCount, allGlyphs: best.rec.allCount,
+      needLabel: best.rec.needLabel.length, queued,
+      model: model ? 'mlp+knn' : (store && store.size ? 'knn' : 'нет (база пуста — запустите node label.js)'),
+      items: best.rec.items.map(it => ({
+        x: it.x, y: it.y, w: it.w, h: it.h, digit: it.digit, conf: it.conf, method: it.method,
+        knn: it.knn, mlp: it.mlp
+      }))
+    }, null, 2))
+  } catch (e) {}
+
+  // ---- декаи ----
+  for (const s of stats.slice(1)) {
+    try { fs.writeFileSync(path.join(outDir, 'DECOY_NOT_ORIGINAL_' + s.w.tag + '.png'), colorPng(s.asm.data, s.asm.W, s.asm.H, 2)) } catch (e) {}
   }
 
   // ---- плоская копия в records/captchas ----
@@ -1603,32 +1472,43 @@ async function saveRecord(outDir, snap, label, roundNo) {
         round: roundNo, wall: best.w.tag, cols: asm.grid.cols, rows: asm.grid.rows,
         placed: asm.placed, missing: asm.missing, holesFilled: asm.holesFilled,
         orientation: asm.ori, rotationRule: asm.rotRule, permUsed: asm.permUsed,
-        seamCost: asm.seamCost, ocr: best.like.ocr.text, ocrVia: best.like.ocr.name,
-        rf: { ok: best.rf.ok, status: best.rf.status, text: best.rf.metrics ? best.rf.metrics.text : '', n: best.rf.metrics ? best.rf.metrics.n : 0, error: best.rf.error || null },
+        seamCost: asm.seamCost, score: best.score, dot: best.dot, dist: best.dist,
+        digits: best.rec.text, digitsAll: best.rec.textAll, needLabel: best.rec.needLabel.length,
+        candidates: stats.map(s => ({ wall: s.w.tag, score: s.score, cols: s.asm.grid.cols, rows: s.asm.grid.rows })),
         dir: path.relative(REC_ROOT, outDir), view: snap.view || null
       }, null, 2))
     } catch (e) { step('captchas copy err: ' + e.message) }
   }
 
   step(label + ': ✅ ORIGINAL=' + best.w.tag + ' ' + asm.grid.cols + '×' + asm.grid.rows +
-    ' placed=' + asm.placed + '/' + asm.grid.total + (asm.missing ? ' holes+' + asm.holesFilled : '') +
-    ' ori=' + asm.ori.tag + '(hAsc=' + asm.ori.hAsc + ',yAsc=' + asm.ori.yAsc + ')' +
+    ' placed=' + asm.placed + '/' + asm.grid.total +
+    ' ori=' + asm.ori.tag + '(hAsc=' + asm.ori.hAsc + ')' +
     ' rot=' + asm.rotRule + (asm.permUsed ? ' PERM!' : '') +
-    ' seam=' + asm.seamCost +
-    ' ocr="' + best.like.ocr.text + '"' +
-    ' rf=' + (best.rf.ok ? '"' + (best.rf.metrics ? best.rf.metrics.text : '') + '"' : (best.rf.status || 'off')))
+    ' seam=' + asm.seamCost + ' dot=' + (best.dot === null ? '?' : best.dot.toFixed(2)) +
+    ' dist=' + (best.dist === null ? '?' : best.dist) +
+    ' score=' + best.score + ' / конкуренты: ' + stats.slice(1).map(s => s.w.tag + '=' + s.score).join(',') )
+  if (asm.seamCost > SEAM_WARN) {
+    step(label + ': ⚠️ ВНИМАНИЕ: швы плохие (seam=' + asm.seamCost + ' > ' + SEAM_WARN +
+      ') — картинка может быть собрана неверно. Проверьте ORIGINAL_CAPTCHA.png' +
+      (TRY_COL_PERMS ? '' : '; при необходимости запустите с --perms'))
+  }
+  step(label + ': 🔢 ЦИФРЫ="' + best.rec.text + '"' + (best.rec.textAll !== best.rec.text ? ' (сырое "' + best.rec.textAll + '")' : '') +
+    ' глифов=' + best.rec.rowCount + '/' + best.rec.allCount +
+    (queued ? ' | в очередь на разметку: +' + queued + ' (node label.js)' : ''))
 
   return {
     wall: best.w.tag, cols: asm.grid.cols, rows: asm.grid.rows,
     tilesCount: asm.placed, tilesExpected: asm.grid.total, missing: asm.missing, holesFilled: asm.holesFilled,
     ori: asm.ori.tag, hAsc: asm.ori.hAsc, yAsc: asm.ori.yAsc, rotRule: asm.rotRule, permUsed: asm.permUsed, colPerm: asm.colPerm,
-    seamCost: asm.seamCost, natSeamCost: asm.natSeamCost,
-    ocrText: best.like.ocr.text, ocrVia: best.like.ocr.name, ocrDigits: best.like.ocr.n, plausible: best.like.ocr.plausible,
-    rf: best.rf, rfScore: best.rfScore, rfMetrics: best.rf.metrics || rfMetrics([]),
-    inkDensity: best.like.density, layout: asm.layout, dir: outDir, capFile,
-    originalFile: 'ORIGINAL_CAPTCHA.png'
+    seamCost: asm.seamCost, natSeamCost: asm.natSeamCost, score: best.score, dot: best.dot, dist: best.dist,
+    digits: best.rec.text, digitsAll: best.rec.textAll, glyphCount: best.rec.rowCount, needLabel: best.rec.needLabel.length, queued,
+    candidates: stats.map(s => ({ wall: s.w.tag, score: s.score, breakdown: s.breakdown })),
+    inkDensity: Math.round(best.im.inkCount / (asm.W * asm.H) * 10000) / 10000,
+    layout: asm.layout, dir: outDir, capFile, originalFile: 'ORIGINAL_CAPTCHA.png'
   }
 }
+
+const DIG_LOG_ONCE = { v: -1 }
 
 // ========================= ЗАХВАТ =========================
 function connectAndCapture(tag) {
@@ -1745,7 +1625,7 @@ function connectAndCapture(tag) {
       const isFrameName = e => /item_frame/i.test(String((e && (e.name || e.displayName || e.type || e.entityType || e.kind)) || ''))
       function addFrame(id, pos, info) {
         if (col.framesById.has(id)) return col.framesById.get(id)
-        const f = { id, x: pos.x, y: pos.y, z: pos.z, mapId: null, rotation: 0, metaSeen: false }
+        const f = { id, x: pos.x, y: pos.y, z: pos.z, mapId: null, rotation: 0, metaSeen: false, yaw: (pos && typeof pos.yaw === 'number') ? pos.yaw : null }
         if (info) {
           if (info.mapId !== null && info.mapId !== undefined) { f.mapId = info.mapId; f.metaSeen = true }
           if (info.rotation !== null && info.rotation !== undefined) f.rotation = info.rotation
@@ -1783,7 +1663,10 @@ function connectAndCapture(tag) {
           if (!ent || !ent.position) return
           if (!isFrameName(ent)) return
           const info = ent.metadata ? extractFrameInfo(ent.metadata) : null
-          const f = addFrame(ent.id, ent.position, info)
+          // yaw у item_frame кодирует направление «лица» рамки — по его разбросу
+          // мы отличаем настоящую стену от сквозного артефакта из двух параллельных стен
+          const pos = { x: ent.position.x, y: ent.position.y, z: ent.position.z, yaw: (typeof ent.yaw === 'number' ? ent.yaw : null) }
+          const f = addFrame(ent.id, pos, info)
           if (f && !f.metaSeen && ent.metadata) applyMeta(f, ent.metadata)
           dbg('frame #' + ent.id + ' ' + String(ent.name || ent.displayName || '') + ' @' + ent.position.x.toFixed(2) + ',' + ent.position.y.toFixed(2) + ',' + ent.position.z.toFixed(2) + (f && f.mapId !== null ? ' map=' + f.mapId + ' rot=' + f.rotation : ''))
         } catch (e) { dbg('entitySpawn err ' + e.message) }
@@ -1822,9 +1705,10 @@ function connectAndCapture(tag) {
               adopt = !!(info && info.mapId !== null && info.mapId !== undefined)
             }
             if (!adopt) continue
-            f = addFrame(id, e.position, info)
+            f = addFrame(id, { x: e.position.x, y: e.position.y, z: e.position.z, yaw: (typeof e.yaw === 'number' ? e.yaw : null) }, info)
             if (adopt && !isFrameName(e)) ev('внимание: сущность #' + id + ' (' + String(e.name || e.type || '?') + ') не item_frame, но держит карту — считаю рамкой')
           }
+          if (f && typeof e.yaw === 'number' && f.yaw === null) f.yaw = e.yaw
           if (f && e.metadata && (f.mapId === null || f.mapId === undefined || !f.metaSeen)) applyMeta(f, e.metadata)
         }
       }
@@ -1934,10 +1818,87 @@ function makeSyntheticCaptcha(cols, rows, seed) {
   return img
 }
 
+// синтетическая капча с настоящими цифрами (для проверки цикла обучения)
+function makeSyntheticDigits(cols, rows, digits, seed) {
+  let s = seed || 1
+  const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff }
+  const W = cols * 128, H = rows * 128
+  const img = new Uint8Array(W * H)
+  for (let i = 0; i < img.length; i++) img[i] = 34          // белая шерсть (base 8, shade 2)
+  // шум только сверху/снизу, чтобы не мешать строке цифр
+  const NOISE = [122, 30, 46, 98, 74]
+  for (let k = 0; k < 24; k++) {
+    const cx = Math.floor(rnd() * W)
+    const cy = rnd() < 0.5 ? Math.floor(rnd() * H * 0.18) : Math.floor(H * 0.82 + rnd() * H * 0.18)
+    const r = 3 + Math.floor(rnd() * 7)
+    const v = NOISE[Math.floor(rnd() * NOISE.length)]
+    for (let y = -r; y <= r; y++) for (let x = -r; x <= r; x++) {
+      if (x * x + y * y > r * r) continue
+      const X = cx + x, Y = cy + y
+      if (X >= 0 && Y >= 0 && X < W && Y < H) img[Y * W + X] = v
+    }
+  }
+  // масштаб так, чтобы все цифры влезли по ширине И высоте (и не касались границ плиток)
+  const n = digits.length
+  const scH = Math.floor(H * 0.42 / 7)
+  const scW = Math.floor((W * 0.86) / (n * 5 + (n - 1) * 1.15))
+  const sc = Math.max(6, Math.min(scH, scW))
+  const gap = Math.max(sc, Math.floor(sc * 1.15))
+  const dw = 5 * sc
+  const x0 = Math.floor((W - (n * dw + (n - 1) * gap)) / 2)
+  const y0 = Math.floor((H - 7 * sc) / 2)
+  const centers = []
+  digits.split('').forEach((d, i) => {
+    const pat = DIGITS[d]
+    const ox = x0 + i * (dw + gap)
+    centers.push({ x: ox + dw / 2, digit: d })
+    if (!pat) return
+    for (let y = 0; y < 7; y++) for (let x = 0; x < 5; x++) {
+      if (!pat[y][x]) continue
+      for (let dy = 0; dy < sc; dy++) for (let dx = 0; dx < sc; dx++) {
+        const X = ox + x * sc + dx, Y = y0 + y * sc + dy
+        if (X >= 0 && Y >= 0 && X < W && Y < H) img[Y * W + X] = 118   // чёрная шерсть (base 29, shade 2)
+      }
+    }
+  })
+  return { img, W, H, centers }
+}
+
+// собрать из картинки «снапшот раунда»: плитки на стене + рамки + точка обзора
+function makeWallSnapshot(img, W, H, opts) {
+  opts = opts || {}
+  const cols = W / 128, rows = H / 128
+  const axis = opts.axis || 'z'
+  const viewSide = opts.viewSide || -1
+  const OX = opts.ox || 200, OY = opts.oy || 70, OZ = opts.oz || 300
+  const maps = new Map()
+  const frames = []
+  let id = opts.id0 || 700
+  const hAscExpected = axis === 'z' ? (viewSide > 0) : (viewSide < 0)
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const tile = new Uint8Array(16384)
+    for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) tile[y * 128 + x] = img[(r * 128 + y) * W + c * 128 + x]
+    const q = opts.rots ? ((r * 2 + c + id) % 4) : 0
+    maps.set(id, rotQ(tile, (4 - q) % 4))
+    const ni = hAscExpected ? c : cols - 1 - c
+    const pos = axis === 'z'
+      ? { x: OX + 0.5 + ni, y: OY + 0.5 - r, z: OZ + viewSide * 0.0625 }
+      : { x: OZ + viewSide * 0.0625, y: OY + 0.5 - r, z: OX + 0.5 + ni }
+    frames.push({ id, x: pos.x, y: pos.y, z: pos.z, mapId: id, rotation: q, yaw: axis === 'z' ? (viewSide < 0 ? 0 : Math.PI) : (viewSide < 0 ? -Math.PI / 2 : Math.PI / 2) })
+    id++
+  }
+  const plane = axis === 'z' ? frames[0].z : frames[0].x
+  const view = opts.view || (axis === 'z'
+    ? { x: OX + 2, y: OY, z: plane + viewSide * 5, yaw: viewSide < 0 ? 0 : Math.PI, pitch: 0 }
+    : { x: plane + viewSide * 5, y: OY, z: OX + 2, yaw: viewSide < 0 ? -Math.PI / 2 : Math.PI / 2, pitch: 0 })
+  return { maps, frames, chats: ['[chat] BotFilter >> Введите номер с картинки в чат'], events: ['selftest'], view, metaDump: [] }
+}
+
 async function selftest() {
-  const rfWas = ROBOFLOW.enabled
-  ROBOFLOW.enabled = false   // в самопроверке сеть не трогаем
-  console.log('=== SELFTEST v3.8.0: геометрия сборки ===')
+  const learnWas = LEARN_DIR
+  LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
+  try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
+  console.log('=== SELFTEST v3.9.0: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -2166,7 +2127,99 @@ async function selftest() {
     }
   }
 
-  ROBOFLOW.enabled = rfWas
+  // ---- ЦИКЛ ОБУЧЕНИЯ: разметили несколько раундов -> распознаём новый ----
+  console.log('--- цикл обучения цифр (разметка -> распознавание) ---')
+  {
+    const cols = 4, rows = 3
+    const train = ['4815', '1623', '9074']
+    const test = ['3706', '1590']
+    let labeledTotal = 0
+    const problems = []
+    // чистая база и очередь: тестируем именно цикл обучения
+    try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
+    for (let i = 0; i < train.length; i++) {
+      const d = train[i]
+      const g = makeSyntheticDigits(cols, rows, d, 1234 + i * 977)
+      const snap = makeWallSnapshot(g.img, g.W, g.H, { rots: true, id0: 700 + i * 100 })
+      const outDir = path.join(REC_ROOT || __dirname, 'selftest_learn', 'r' + (i + 1))
+      const rec = await saveRecord(outDir, snap, 'LEARN' + (i + 1), null)
+      if (!rec) { problems.push('раунд ' + d + ' не собрался'); continue }
+      // «размечаем» очередь так же, как это делает человек в label.js:
+      // сопоставляем каждый глиф с ближайшим центром настоящей цифры
+      const q = new DIG.LabelQueue(LEARN_DIR)
+      const store = new DIG.GlyphStore(LEARN_DIR)
+      const items = q.items.slice()
+      let done = 0
+      for (const it of items) {
+        const cx = it.bbox ? it.bbox.mnX + it.bbox.w / 2 : -1
+        let bc = null, bd = 1e9
+        for (const cn of g.centers) { const dd = Math.abs(cn.x - cx); if (dd < bd) { bd = dd; bc = cn } }
+        if (!bc || bd > 40) { problems.push('раунд ' + d + ': глиф x=' + Math.round(cx) + ' не сопоставлен ни с одной цифрой'); continue }
+        store.add(Number(bc.digit), DIG.b64ToF32(it.f), { src: 'selftest#' + it.id })
+        q.remove(it.id)
+        labeledTotal++; done++
+      }
+      q.save()
+      if (done !== d.length) problems.push('раунд ' + d + ': размечено ' + done + ' из ' + d.length)
+    }
+    let okTests = 0
+    for (let i = 0; i < test.length; i++) {
+      const d = test[i]
+      const g = makeSyntheticDigits(cols, rows, d, 909090 + i * 613)
+      const snap = makeWallSnapshot(g.img, g.W, g.H, { rots: true, viewSide: +1, id0: 1700 + i * 100 })
+      const outDir = path.join(REC_ROOT || __dirname, 'selftest_learn', 't' + (i + 1))
+      const rec = await saveRecord(outDir, snap, 'TEST' + (i + 1), null)
+      const got = rec ? rec.digits : '(нет)'
+      const ok = got === d
+      if (ok) okTests++
+      else problems.push('ожидали "' + d + '" получили "' + got + '"' + (rec ? ' сырое="' + rec.digitsAll + '"' : ''))
+      console.log('  ' + (ok ? '\u2705' : '\u274c') + ' тест "' + d + '" \u2192 распознано "' + got + '"' +
+        (rec ? ' (глифов ' + rec.glyphCount + ', неуверенных ' + rec.needLabel + ')' : ''))
+    }
+    const ok = okTests === test.length && !problems.length
+    if (!ok) fails++
+    console.log('  ' + (ok ? '\u2705' : '\u274c') + ' размечено вручную: ' + labeledTotal + ' глифов (по ' +
+      Math.round(labeledTotal / 10 * 10) / 10 + ' на цифру) \u2192 тестов: ' + okTests + '/' + test.length +
+      (problems.length ? ' | проблемы: ' + problems.join('; ') : ''))
+  }
+
+  // ---- СЦЕНАРИЙ РАУНДА 6: две стены рядом, надо выбрать ту, на которую смотрит бот ----
+  console.log('--- выбор настоящей стены среди соседей (регрессия раунда 6) ---')
+  {
+    const cols = 4, rows = 3
+    const trueDigits = '4271', decoyDigits = '9933'
+    const gA = makeSyntheticDigits(cols, rows, trueDigits, 5150)
+    const gB = makeSyntheticDigits(cols, rows, decoyDigits, 7777)
+    const view = { x: 202, y: 70, z: 294.9, yaw: 0, pitch: 0 }   // бот смотрит на юг (+z)
+    // настоящая стена: прямо перед ботом (z=299.94)
+    const A = makeWallSnapshot(gA.img, gA.W, gA.H, { axis: 'z', viewSide: -1, rots: true, id0: 2000, ox: 200, oy: 70, oz: 300, view })
+    // соседняя стена: сбоку и дальше (перпендикулярная, x=210)
+    const B = makeWallSnapshot(gB.img, gB.W, gB.H, { axis: 'x', viewSide: +1, rots: true, id0: 2100, ox: 300, oy: 70, oz: 210, view })
+    const maps = new Map([...A.maps, ...B.maps])
+    const frames = A.frames.concat(B.frames)
+    const snap = { maps, frames, chats: [], events: ['selftest'], view, metaDump: [] }
+    const cands = detectWalls(frames.filter(f => maps.has(f.mapId)), wallMinFrames(frames.length))
+    const outDir = path.join(REC_ROOT || __dirname, 'selftest_learn', 'walls')
+    const rec = await saveRecord(outDir, snap, 'WALLS', null)
+    const expectTag = 'z300'
+    const okWall = !!rec && rec.wall === expectTag
+    const okDigits = !!rec && rec.digits === trueDigits
+    const okNoArtifact = cands.every(w => w.frames.length === 12)     // никаких «сквозных» 6-рамочных псевдостен
+    const ok = okWall && okDigits && okNoArtifact
+    if (!ok) fails++
+    console.log('  ' + (ok ? '\u2705' : '\u274c') + ' кандидатов=' + cands.map(w => w.tag + '(' + w.frames.length + ')').join(',') +
+      ' | выбрана=' + (rec ? rec.wall : 'нет') + ' (ждали ' + expectTag + ')' +
+      ' | цифры="' + (rec ? rec.digits : '') + '" (ждали "' + trueDigits + '")' +
+      ' | сквозных артефактов: ' + (okNoArtifact ? 'нет' : 'ЕСТЬ') +
+      (rec ? ' | счёт: ' + rec.candidates.map(c => c.wall + '=' + c.score).join(', ') : ''))
+  }
+
+  LEARN_DIR = learnWas
+  if (!CLI.debug) {
+    for (const d of ['selftest_e2e', 'selftest_learn', 'selftest']) {
+      try { fs.rmSync(path.join(REC_ROOT || __dirname, d), { recursive: true, force: true }) } catch (e) {}
+    }
+  } else console.log('  (--debug: артефакты самопроверки оставлены в ' + path.join(REC_ROOT || __dirname, 'selftest_learn') + ')')
   console.log(fails ? '=== SELFTEST: ' + fails + ' ПРОВАЛОВ ===' : '=== SELFTEST: ВСЁ ОК ===')
   return fails === 0
 }
@@ -2198,19 +2251,105 @@ function replayDir(dir) {
   return { snap, out }
 }
 
+// ========================= ОБУЧЕНИЕ ЦИФР =========================
+function runLabelTool() {
+  try {
+    const tool = require('./label.js')
+    tool.run({ learnDir: LEARN_DIR })
+  } catch (e) {
+    console.error('Не удалось запустить label.js: ' + e.message)
+    console.error('Файл label.js должен лежать рядом с main.js')
+    process.exit(1)
+  }
+}
+
+function runTrain() {
+  if (!DIG) { console.error('digits.js не загружен'); process.exit(1) }
+  const store = new DIG.GlyphStore(LEARN_DIR)
+  const counts = store.counts()
+  console.log('=== Обучение MLP ===')
+  console.log('База: ' + store.size + ' глифов ' + JSON.stringify(counts))
+  if (store.size < 20) {
+    console.log('Мало данных. Сначала разметьте глифы: node label.js (нужно хотя бы 20, лучше 100+)')
+    process.exit(1)
+  }
+  const missing = []
+  for (let d = 0; d <= 9; d++) if (!counts[d]) missing.push(d)
+  if (missing.length) console.log('⚠️ нет примеров для цифр: ' + missing.join(','))
+
+  // перемешиваем и держим 20% на контроле
+  const idx = [...Array(store.size).keys()]
+  for (let i = idx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = idx[i]; idx[i] = idx[j]; idx[j] = t }
+  const nTest = Math.max(1, Math.floor(idx.length * 0.2))
+  const testIdx = idx.slice(0, nTest), trainIdx = idx.slice(nTest)
+  const X = a => a.map(i => Array.from(store.samples[i].feat))
+  const Y = a => a.map(i => store.samples[i].digit)
+
+  const t0 = Date.now()
+  const mlp = new DIG.MLP(DIG.FEAT_DIM, Number(cfgGet(CFG, 'digits.hidden', 20)) || 20, 10)
+  const hist = mlp.train(X(trainIdx), Y(trainIdx), {
+    epochs: Number(cfgGet(CFG, 'digits.epochs', 150)) || 150, batch: 8, lr: 0.03
+  })
+  const sec = ((Date.now() - t0) / 1000).toFixed(1)
+  const accTrain = mlp.accuracy(X(trainIdx), Y(trainIdx))
+  const accTest = mlp.accuracy(X(testIdx), Y(testIdx))
+  console.log('Обучение: ' + sec + 'с, loss ' + hist[0].loss + ' → ' + hist[hist.length - 1].loss)
+  console.log('Точность: train ' + accTrain + '% | holdout(' + nTest + ') ' + accTest + '%')
+
+  // сравнение с k-NN на той же контрольной выборке
+  const sub = new DIG.GlyphStore(LEARN_DIR)
+  sub.samples = trainIdx.map(i => store.samples[i])
+  let okKnn = 0
+  for (const i of testIdx) { const r = sub.classify(store.samples[i].feat, 5); if (r && r.digit === store.samples[i].digit) okKnn++ }
+  console.log('Для сравнения k-NN на holdout: ' + Math.round(1000 * okKnn / nTest) / 10 + '%')
+
+  if (mlp.save(LEARN_DIR)) console.log('✅ модель сохранена: ' + path.join(LEARN_DIR, 'model.json'))
+  else { console.log('❌ не удалось сохранить модель'); process.exit(1) }
+  if (accTest < accTrain - 20) console.log('⚠️ похоже на переобучение — добавьте примеров (node label.js)')
+}
+
+// пересобрать ВСЕ записи в каталоге (удобно для уже накопленных раундов:
+// заодно наполняет очередь глифов для разметки — без новых подключений к серверу)
+async function replayAll(root) {
+  if (!fs.existsSync(root)) { step('каталог не найден: ' + root); return 0 }
+  const dirs = fs.readdirSync(root, { withFileTypes: true })
+    .filter(d => d.isDirectory() && /^round\d+/.test(d.name))
+    .map(d => path.join(root, d.name))
+    .sort()
+  if (!dirs.length) { step('в ' + root + ' нет каталогов roundNN_*'); return 0 }
+  step('REPLAY-ALL: найдено записей: ' + dirs.length)
+  let ok = 0
+  const rows = []
+  for (const d of dirs) {
+    if (!fs.existsSync(path.join(d, 'frames.json'))) { step('  пропускаю (нет frames.json): ' + path.basename(d)); continue }
+    const rp = replayDir(d)
+    if (!rp) continue
+    const num = (path.basename(d).match(/^round(\d+)/) || [])[1]
+    const rec = await saveRecord(rp.out, rp.snap, 'REPLAY ' + path.basename(d), num ? Number(num) : null)
+    if (rec) { ok++; rows.push('  ' + path.basename(d) + ' → ' + rec.cols + '×' + rec.rows + ' стена=' + rec.wall + ' seam=' + rec.seamCost + ' ЦИФРЫ="' + rec.digits + '" (сырое "' + rec.digitsAll + '")') }
+    else rows.push('  ' + path.basename(d) + ' → НЕ СОБРАЛОСЬ')
+  }
+  step('REPLAY-ALL готово: ' + ok + '/' + dirs.length)
+  console.log(rows.join('\n'))
+  try {
+    const q = DIG ? new DIG.LabelQueue(LEARN_DIR) : null
+    if (q) step('В очереди на разметку: ' + q.size + ' глифов → node label.js')
+  } catch (e) {}
+  return ok
+}
+
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.8.0 ===')
+  step('=== СТАРТ v3.9.0 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
+  if (CLI.label) { runLabelTool(); return }
+  if (CLI.train) { runTrain(); return }
 
-  if (CLI.rfTest) {
-    const f = CLI.rfTest
-    if (!fs.existsSync(f)) { step('файл не найден: ' + f); process.exit(1) }
-    const buf = fs.readFileSync(f)
-    const r = await sendToRoboflow(buf, path.basename(f), path.dirname(f), 'rf-test', Date.now() + RF_TOTAL_BUDGET_MS)
-    step('RF test: ok=' + r.ok + ' status=' + r.status + ' text="' + (r.metrics ? r.metrics.text : '') + '" err=' + (r.error || '-'))
-    process.exit(r.ok ? 0 : 1)
+  if (CLI.replayAll) {
+    const n = await replayAll(CLI.replayAll)
+    setTimeout(() => process.exit(n ? 0 : 1), 300)
+    return
   }
 
   if (CLI.replay) {
@@ -2222,14 +2361,21 @@ async function main() {
     return
   }
 
-  if (!CFG_PATH) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
+  if (!CFG_PATH && !CLI.replay && !CLI.replayAll) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version + ' | прокси MC: ' + (PROXY.host || 'НЕТ') + ':' + PROXY.port)
-  step('RF SOCKS: ' + (RF_SOCKS ? RF_SOCKS.host + ':' + RF_SOCKS.port : 'нет (direct)'))
-  step('ROBOFLOW: ' + (ROBOFLOW.enabled ? ('ВКЛ model=' + ROBOFLOW.modelId + ' key=' + ROBOFLOW.apiKey.slice(0, 4) + '...') : 'ВЫКЛ (только сбор картинок)'))
+  step('ЦИФРЫ: локально (' + (DIG ? 'digits.js ok' : 'digits.js НЕ ЗАГРУЖЕН') + '), база ' + LEARN_DIR)
+  try {
+    const st = DIG ? new DIG.GlyphStore(LEARN_DIR) : null
+    const mdl = DIG ? DIG.MLP.load(LEARN_DIR) : null
+    const q = DIG ? new DIG.LabelQueue(LEARN_DIR) : null
+    step('  размечено глифов: ' + (st ? st.size : 0) + ' ' + JSON.stringify(st ? st.counts() : {}) +
+      ' | MLP: ' + (mdl ? 'есть' : 'нет (node main.js --train)') +
+      ' | в очереди на разметку: ' + (q ? q.size : 0))
+    if (st && !st.size) step('  ⚠️ база пуста — цифры не распознаются. Соберите раунды, затем: node label.js')
+  } catch (e) { step('  база цифр: ' + e.message) }
   step('capture: minTiles=' + CAP.minTiles + ' stableMs=' + CAP.stableMs + ' timeout=' + (CAP.timeoutMs / 1000) + 'с needPrompt=' + CAP.needPrompt)
 
-  await killPort9001()
   currentRunIp = await rotateIp()
   step('IP забега: ' + (currentRunIp || '?'))
 
@@ -2279,7 +2425,7 @@ async function main() {
     if (rec) {
       results.push({ n: r, ok: true, rec })
       step('РАУНД ' + r + ' ✅ ' + rec.cols + '×' + rec.rows + ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected +
-        ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ocr="' + rec.ocrText + '"' +
+        ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ЦИФРЫ="' + rec.digits + '"' +
         (rec.capFile ? ' → records/captchas/' + rec.capFile : ''))
     } else if (!aborted) {
       results.push({ n: r, ok: false, note: lastNote || 'fail' })
@@ -2295,13 +2441,19 @@ async function main() {
     L.push('  #' + x.n + ': ' + (x.rec
       ? 'OK ' + x.rec.cols + '×' + x.rec.rows + ' tiles=' + x.rec.tilesCount + '/' + x.rec.tilesExpected +
         ' ori=' + x.rec.ori + ' rot=' + x.rec.rotRule + (x.rec.permUsed ? ' PERM' : '') +
-        ' seam=' + x.rec.seamCost + ' ocr="' + x.rec.ocrText + '"' +
-        (x.rec.rf && x.rec.rf.ok ? ' rf="' + x.rec.rfMetrics.text + '"' : '') +
+        ' seam=' + x.rec.seamCost + ' ЦИФРЫ="' + x.rec.digits + '"' +
+        (x.rec.needLabel ? ' [на разметку:' + x.rec.needLabel + ']' : '') +
         (x.rec.capFile ? ' [captchas/' + x.rec.capFile + ']' : '')
       : 'FAIL (' + (x.note || '') + ')'))
   }
   L.push('')
   L.push('Картинки: ' + CAP_ROOT)
+  try {
+    const q = DIG ? new DIG.LabelQueue(LEARN_DIR) : null
+    const st = DIG ? new DIG.GlyphStore(LEARN_DIR) : null
+    if (q && q.size) L.push('В очереди на разметку: ' + q.size + ' глифов → запустите: node label.js')
+    if (st) L.push('База цифр: ' + st.size + ' глифов ' + JSON.stringify(st.counts()))
+  } catch (e) {}
   step('готово.')
   flushReport(L.join('\n'))
   try {
@@ -2312,8 +2464,9 @@ async function main() {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
         tiles: x.rec.tilesCount + '/' + x.rec.tilesExpected, holesFilled: x.rec.holesFilled,
         orientation: x.rec.ori, rotationRule: x.rec.rotRule, permUsed: x.rec.permUsed,
-        seamCost: x.rec.seamCost, ocr: x.rec.ocrText,
-        rf: { ok: x.rec.rf.ok, status: x.rec.rf.status, text: x.rec.rfMetrics ? x.rec.rfMetrics.text : null, error: x.rec.rf.error || null },
+        seamCost: x.rec.seamCost, score: x.rec.score, dot: x.rec.dot, dist: x.rec.dist,
+        digits: x.rec.digits, digitsAll: x.rec.digitsAll, needLabel: x.rec.needLabel,
+        candidates: (x.rec.candidates || []).map(c => ({ wall: c.wall, score: c.score })),
         file: x.rec.capFile, dir: x.rec.dir
       } : { round: x.n, ok: false, note: x.note })
     }, null, 2))
@@ -2337,5 +2490,6 @@ module.exports = {
   optimizeRotations, propagateRotations, solveRotations, fillHolesDisplay,
   assembleWallSmart, captchaLikeness,
   extractFrameInfo, findMapIdDeep, getMapIdFromPacket, inkMaskWall, ocr,
-  selftest, makeSyntheticCaptcha, saveRecord
+  yawSpread, maxGridGap, wallDist, wallDot, GLYPH_OPTS, LEARN_DIR, DIG,
+  selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord, runTrain, replayAll, replayDir
 }
