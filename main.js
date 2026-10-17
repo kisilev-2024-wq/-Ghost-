@@ -1,7 +1,31 @@
-// VERSION: 3.9.1
+// VERSION: 3.9.2
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
 //
-// ======================= ЧТО НОВОГО В v3.9.1 =======================
+// ======================= ЧТО НОВОГО В v3.9.2 =======================
+// T1. В КАПЧЕ ВСЕГДА РОВНО 5 ЦИФР (digits.expected=5). Вырезание глифов
+//     выбирает строку, где цифр ровно 5; лишнее (шум) отсеивается по
+//     «цифроподобности»; если нашлось не 5 — в лог и в чат идёт предупреждение.
+// T2. Вместе с фото бот ВСЕГДА присылает своё ПРЕДСКАЗАНИЕ (5 символов,
+//     неуверенные позиции помечаются) + среднюю уверенность + счётчик «N/10 подряд».
+// T3. Ответ человека = ИСТИНА: его цифры всегда идут в обучающую базу.
+//     Сессия идёт, пока предсказание бота не совпадёт с ответом 10 раз ПОДРЯД
+//     (telegram.targetStreak), после чего бот присылает 🎓 и останавливается.
+//     Раунды больше не ограничены десятком — лимит telegram.maxRounds (500).
+// T4. Предсказание ПЕРЕСЧИТЫВАЕТСЯ свежей базой в момент отправки: картинка
+//     готовится заранее (конвейер), а база к этому времени уже подросла.
+// T5. [ФИКС] Deadlock в очереди конвейера: shift() не будил ожидающий push() —
+//     после 3-й картинки всё вставало. Плюс потребитель теперь всегда закрывает
+//     очередь (иначе производитель вечно ждал места).
+// T6. [ФИКС] getUpdates: Telegram присылает несколько апдейтов пачкой, offset
+//     подтверждает их все — непрочитанные теперь буферизуются локально,
+//     иначе второе сообщение терялось и бот зависал.
+// T7. Прокси Telegram: читаются ключи apiProxy/socksUrl/proxy/socks (в вашем
+//     конфиге — telegram.apiProxy), поддержан socks5h://, спец-прокси пробуется
+//     ПЕРВЫМ, мобильный прокси MC — только как последний резерв.
+//     Диагностика: node main.js --tg-test
+// ====================================================================
+//
+// ======================= ЧТО БЫЛО НОВОГО В v3.9.1 =======================
 // A-1. [v3.9.1] TELEGRAM-БОТ РАЗМЕТКИ: main.js сам (без npm-пакетов, чистый
 //      https + SOCKS-файлбэк) шлёт картинку капчи в ваш чат, вы отвечаете
 //      цифрами — глифы сразу уходят в обучающую базу. Следующая картинка
@@ -255,7 +279,10 @@ const TG = {
   prefetch: Math.max(1, Number(cfgGet(CFG, 'telegram.prefetch', 2)) || 2),
   timeoutMs: Math.max(10000, Number(cfgGet(CFG, 'telegram.timeoutMs', 30000)) || 30000),
   probeTimeoutMs: Math.max(4000, Number(cfgGet(CFG, 'telegram.probeTimeoutMs', 12000)) || 12000),
-  autoTrainEvery: Math.max(0, Number(cfgGet(CFG, 'telegram.autoTrainEvery', 25)) || 0),
+  autoTrainEvery: Math.max(0, Number(cfgGet(CFG, 'telegram.autoTrainEvery', 20)) || 0),
+  // сессия обучения идёт, пока ответы бота и человека не совпадут N раз ПОДРЯД
+  targetStreak: Math.max(1, Number(cfgGet(CFG, 'telegram.targetStreak', 10)) || 10),
+  maxRounds: Math.max(1, Number(cfgGet(CFG, 'telegram.maxRounds', 500)) || 500),
   sendGlyphStrip: cfgGet(CFG, 'telegram.sendGlyphStrip', false) === true
 }
 TG.ready = !!(TG.enabled && TG.token && !/YOUR_|^$/.test(TG.token) && TG.chatId && !/YOUR_/.test(TG.chatId))
@@ -269,6 +296,8 @@ const GLYPH_OPTS = {
   maxParts: Number(cfgGet(CFG, 'digits.maxParts', 5)) || 5
 }
 const DIG_CONF_OK = Number(cfgGet(CFG, 'digits.confOk', 0.62)) || 0.62
+// СКОЛЬКО ЦИФР В КАПЧЕ. На funtime всегда ровно 5 — ни больше, ни меньше.
+const DIGITS_EXPECTED = Math.max(0, Number(cfgGet(CFG, 'digits.expected', 5)) || 0)
 // перестановка колонок — аварийный режим (по умолчанию координаты авторитетны)
 const TRY_COL_PERMS = CLI.perms === true || cfgGet(CFG, 'capture.tryColPerms', false) === true
 // порог «швы плохие» — повод предупредить о возможной неверной раскладке
@@ -627,17 +656,42 @@ function extractGlyphs(mask, W, H, opts) {
   return out
 }
 
-// строка цифр: самая населённая горизонтальная полоса, слева направо
-function dominantRow(glyphs) {
+// «цифроподобность» кандидата — чтобы отсечь шум, если найдено больше, чем нужно
+function digitScore(g, medH) {
+  const asp = g.bbox.w / Math.max(1, g.bbox.h)
+  let s = 0
+  s -= Math.abs(g.bbox.h - medH) / Math.max(1, medH) * 2.0   // высота как у остальных цифр
+  s -= Math.abs(asp - 0.55) * 1.5                            // пропорции цифры
+  s -= Math.abs(g.fill - 0.35) * 1.0                         // плотность заполнения
+  return s
+}
+
+// Строка цифр: горизонтальная полоса, где количество глифов ближе всего к expected.
+// Если в полосе лишнее (шум) — оставляем expected самых «цифроподобных».
+function dominantRow(glyphs, expected) {
   if (!glyphs.length) return []
   const hs = glyphs.map(g => g.bbox.h).sort((a, b) => a - b)
   const medH = hs[Math.floor(hs.length / 2)]
   const band = Math.max(12, medH * 0.6)
   const sorted = glyphs.slice().sort((a, b) => a.cy - b.cy)
-  let best = []
+  const rows = []
   for (let i = 0; i < sorted.length; i++) {
     const grp = sorted.filter(g => Math.abs(g.cy - sorted[i].cy) <= band)
-    if (grp.length > best.length) best = grp
+    if (!grp.length) continue
+    const key = grp.map(g => g.bbox.mnX + ':' + g.bbox.mnY).sort().join(',')
+    if (rows.some(r => r.key === key)) continue
+    rows.push({ key, grp })
+  }
+  if (!rows.length) return []
+  const want = expected > 0 ? expected : Infinity
+  for (const r of rows) {
+    r.score = (r.grp.length === want) ? 1000
+      : (r.grp.length > want ? 500 - (r.grp.length - want) * 10 : r.grp.length * 40)
+  }
+  rows.sort((a, b) => b.score - a.score)
+  let best = rows[0].grp.slice()
+  if (expected > 0 && best.length > expected) {
+    best = best.sort((a, b) => digitScore(b, medH) - digitScore(a, medH)).slice(0, expected)
   }
   return best.sort((a, b) => a.cx - b.cx)
 }
@@ -914,7 +968,8 @@ class MLP {
 // ------------------------- итоговое распознавание -------------------------
 function recognize(glyphs, store, model, opts) {
   opts = opts || {}
-  const row = dominantRow(glyphs)
+  const expected = Number(opts.expected) || 0
+  const row = dominantRow(glyphs, expected)
   const items = row.map((g, i) => {
     const knn = store ? store.classify(g.feat, opts.k || KNN_K) : null
     let mlp = null
@@ -937,8 +992,16 @@ function recognize(glyphs, store, model, opts) {
   const confOk = opts.confOk != null ? opts.confOk : CONF_OK
   const text = items.filter(it => it.conf >= confOk).map(it => String(it.digit)).join('')
   const textAll = items.map(it => it.digit === null ? '?' : (it.conf >= confOk ? String(it.digit) : String(it.digit).toLowerCase())).join('')
+  // ПРЕДСКАЗАНИЕ: по одному символу на каждый из expected глифов, даже при низкой уверенности
+  const prediction = items.map(it => (it.digit === null || it.digit === undefined) ? '?' : String(it.digit)).join('')
+  const complete = expected > 0 ? items.length === expected : true
+  const confident = items.length > 0 && items.every(it => it.conf >= confOk)
+  const avgConf = items.length ? Math.round(items.reduce((s, it) => s + (it.conf || 0), 0) / items.length * 100) / 100 : 0
   const needLabel = items.filter(it => it.conf < (opts.confQueue != null ? opts.confQueue : CONF_QUEUE))
-  return { text, textAll, items, needLabel, rowCount: row.length, allCount: glyphs.length }
+  return {
+    text, textAll, prediction, complete, confident, avgConf, expected,
+    items, needLabel, rowCount: row.length, allCount: glyphs.length
+  }
 }
 
 function enqueueGlyphs(queue, needLabel, meta) {
@@ -969,7 +1032,7 @@ function enqueueGlyphs(queue, needLabel, meta) {
   return {
     GW, GH, ZONES, FEAT_DIM, CONF_OK, CONF_QUEUE,
     components8, splitComponent, subComponent, normalizeGlyph, buildFeatures,
-    extractGlyphs, dominantRow, asciiArt,
+    extractGlyphs, dominantRow, digitScore, asciiArt,
     pngGray, pngRgba, pngFromNorm, pngFromMask,
     GlyphStore, LabelQueue, MLP, recognize, enqueueGlyphs, f32ToB64, b64ToF32
   }
@@ -1969,12 +2032,12 @@ async function saveRecord(outDir, snap, label, roundNo) {
     if (!asm) continue
 
     const im = inkMaskWall(asm.data, asm.W, asm.H)
-    let rec = { text: '', textAll: '', items: [], needLabel: [], rowCount: 0, allCount: 0 }
+    let rec = { text: '', textAll: '', prediction: '', complete: !DIGITS_EXPECTED, confident: false, avgConf: 0, expected: DIGITS_EXPECTED, items: [], needLabel: [], rowCount: 0, allCount: 0 }
     let glyphs = []
     if (store) {
       try {
         glyphs = DIG.extractGlyphs(im.ink, asm.W, asm.H, GLYPH_OPTS)
-        rec = DIG.recognize(glyphs, store, model, { confOk: DIG_CONF_OK })
+        rec = DIG.recognize(glyphs, store, model, { confOk: DIG_CONF_OK, expected: DIGITS_EXPECTED })
       } catch (e) { dbg('glyphs err ' + e.message) }
     }
 
@@ -2079,7 +2142,9 @@ async function saveRecord(outDir, snap, label, roundNo) {
   }
   try {
     fs.writeFileSync(path.join(outDir, 'digits.json'), JSON.stringify({
-      text: best.rec.text, textAll: best.rec.textAll, rowCount: best.rec.rowCount, allGlyphs: best.rec.allCount,
+      text: best.rec.text, textAll: best.rec.textAll, prediction: best.rec.prediction,
+      expected: DIGITS_EXPECTED, complete: best.rec.complete, confident: best.rec.confident, avgConf: best.rec.avgConf,
+      rowCount: best.rec.rowCount, allGlyphs: best.rec.allCount,
       needLabel: best.rec.needLabel.length, queued,
       model: model ? 'mlp+knn' : (store && store.size ? 'knn' : 'нет (база пуста — запустите node main.js --label)'),
       items: best.rec.items.map(it => ({
@@ -2106,7 +2171,8 @@ async function saveRecord(outDir, snap, label, roundNo) {
         placed: asm.placed, missing: asm.missing, holesFilled: asm.holesFilled,
         orientation: asm.ori, rotationRule: asm.rotRule, permUsed: asm.permUsed,
         seamCost: asm.seamCost, score: best.score, dot: best.dot, dist: best.dist,
-        digits: best.rec.text, digitsAll: best.rec.textAll, needLabel: best.rec.needLabel.length,
+        digits: best.rec.text, digitsAll: best.rec.textAll, prediction: best.rec.prediction,
+        glyphs: best.rec.rowCount + '/' + DIGITS_EXPECTED, avgConf: best.rec.avgConf, needLabel: best.rec.needLabel.length,
         candidates: stats.map(s => ({ wall: s.w.tag, score: s.score, cols: s.asm.grid.cols, rows: s.asm.grid.rows })),
         dir: path.relative(REC_ROOT, outDir), view: snap.view || null
       }, null, 2))
@@ -2125,16 +2191,20 @@ async function saveRecord(outDir, snap, label, roundNo) {
       ') — картинка может быть собрана неверно. Проверьте ORIGINAL_CAPTCHA.png' +
       (TRY_COL_PERMS ? '' : '; при необходимости запустите с --perms'))
   }
-  step(label + ': 🔢 ЦИФРЫ="' + best.rec.text + '"' + (best.rec.textAll !== best.rec.text ? ' (сырое "' + best.rec.textAll + '")' : '') +
-    ' глифов=' + best.rec.rowCount + '/' + best.rec.allCount +
-    (queued ? ' | в очередь на разметку: +' + queued + ' (node main.js --label)' : ''))
+  step(label + ': 🔢 ПРЕДСКАЗАНИЕ="' + best.rec.prediction + '" уверенных="' + best.rec.text +
+    '" ср.уверенность=' + best.rec.avgConf +
+    ' глифов=' + best.rec.rowCount + (DIGITS_EXPECTED ? '/' + DIGITS_EXPECTED : '') + ' кандидатов=' + best.rec.allCount +
+    (DIGITS_EXPECTED && !best.rec.complete ? ' ⚠️ НАШЛОСЬ НЕ ' + DIGITS_EXPECTED + ' ЦИФР' : '') +
+    (queued ? ' | в очередь: +' + queued : ''))
 
   return {
     wall: best.w.tag, cols: asm.grid.cols, rows: asm.grid.rows,
     tilesCount: asm.placed, tilesExpected: asm.grid.total, missing: asm.missing, holesFilled: asm.holesFilled,
     ori: asm.ori.tag, hAsc: asm.ori.hAsc, yAsc: asm.ori.yAsc, rotRule: asm.rotRule, permUsed: asm.permUsed, colPerm: asm.colPerm,
     seamCost: asm.seamCost, natSeamCost: asm.natSeamCost, score: best.score, dot: best.dot, dist: best.dist,
-    digits: best.rec.text, digitsAll: best.rec.textAll, glyphCount: best.rec.rowCount, needLabel: best.rec.needLabel.length, queued,
+    digits: best.rec.text, digitsAll: best.rec.textAll, prediction: best.rec.prediction,
+    glyphCount: best.rec.rowCount, glyphsExpected: DIGITS_EXPECTED, glyphsComplete: best.rec.complete,
+    avgConf: best.rec.avgConf, needLabel: best.rec.needLabel.length, queued,
     // признаки глифов — нужны, чтобы разметить ответом из Telegram
     digitItems: (best.rec.items || []).map(it => ({
       x: it.x, y: it.y, w: it.w, h: it.h,
@@ -2540,7 +2610,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.9.1: геометрия сборки ===')
+  console.log('=== SELFTEST v3.9.2: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -2773,8 +2843,8 @@ async function selftest() {
   console.log('--- цикл обучения цифр (разметка -> распознавание) ---')
   {
     const cols = 4, rows = 3
-    const train = ['4815', '1623', '9074']
-    const test = ['3706', '1590']
+    const train = ['48152', '16237', '90745']
+    const test = ['37061', '15902']
     let labeledTotal = 0
     const problems = []
     // чистая база и очередь: тестируем именно цикл обучения
@@ -2811,7 +2881,7 @@ async function selftest() {
       const snap = makeWallSnapshot(g.img, g.W, g.H, { rots: true, viewSide: +1, id0: 1700 + i * 100 })
       const outDir = path.join(REC_ROOT || __dirname, 'selftest_learn', 't' + (i + 1))
       const rec = await saveRecord(outDir, snap, 'TEST' + (i + 1), null)
-      const got = rec ? rec.digits : '(нет)'
+      const got = rec ? rec.prediction : '(нет)'
       const ok = got === d
       if (ok) okTests++
       else problems.push('ожидали "' + d + '" получили "' + got + '"' + (rec ? ' сырое="' + rec.digitsAll + '"' : ''))
@@ -2829,7 +2899,7 @@ async function selftest() {
   console.log('--- выбор настоящей стены среди соседей (регрессия раунда 6) ---')
   {
     const cols = 4, rows = 3
-    const trueDigits = '4271', decoyDigits = '9933'
+    const trueDigits = '42715', decoyDigits = '99331'
     const gA = makeSyntheticDigits(cols, rows, trueDigits, 5150)
     const gB = makeSyntheticDigits(cols, rows, decoyDigits, 7777)
     const view = { x: 202, y: 70, z: 294.9, yaw: 0, pitch: 0 }   // бот смотрит на юг (+z)
@@ -2845,7 +2915,7 @@ async function selftest() {
     const rec = await saveRecord(outDir, snap, 'WALLS', null)
     const expectTag = 'z300'
     const okWall = !!rec && rec.wall === expectTag
-    const okDigits = !!rec && rec.digits === trueDigits
+    const okDigits = !!rec && rec.prediction === trueDigits
     const okNoArtifact = cands.every(w => w.frames.length === 12)     // никаких «сквозных» 6-рамочных псевдостен
     const ok = okWall && okDigits && okNoArtifact
     if (!ok) fails++
@@ -2860,7 +2930,7 @@ async function selftest() {
   console.log('--- ближайшая стена выигрывает, даже если бот смотрит не на неё ---')
   {
     const cols = 4, rows = 3
-    const gA = makeSyntheticDigits(cols, rows, '5309', 2468)
+    const gA = makeSyntheticDigits(cols, rows, '53091', 2468)
     const gB = makeSyntheticDigits(cols, rows, '1111', 1357)
     // капча вплотную сзади (dist≈2.5, dot≈-1), конкурент — далеко впереди (dist≈60, dot≈+1)
     const view = { x: 202, y: 70, z: 305, yaw: 0, pitch: 0 }   // бот смотрит на +z (на юг)
@@ -2871,12 +2941,82 @@ async function selftest() {
     const snap = { maps, frames: A.frames.concat(B.frames), chats: [], events: ['selftest'], view, metaDump: [] }
     const outDir = path.join(REC_ROOT || __dirname, 'selftest_learn', 'behind')
     const rec = await saveRecord(outDir, snap, 'BEHIND', null)
-    const ok = !!rec && rec.wall === 'z302' && rec.digits === '5309' && rec.dot < 0
+    const ok = !!rec && rec.wall === 'z302' && rec.prediction === '53091' && rec.dot < 0
     if (!ok) fails++
     console.log('  ' + (ok ? '\u2705' : '\u274c') + ' выбрана=' + (rec ? rec.wall : 'нет') + ' (ждали z302, dot<0)' +
       ' dot=' + (rec ? rec.dot.toFixed(2) : '?') + ' dist=' + (rec ? rec.dist : '?') +
-      ' цифры="' + (rec ? rec.digits : '') + '" (ждали "5309")' +
+      ' предсказание="' + (rec ? rec.prediction : '') + '" (ждали "53091")' +
       (rec ? ' | счёт: ' + rec.candidates.map(c => c.wall + '=' + c.score).join(', ') : ''))
+  }
+
+  // ---- TELEGRAM-СЕССИЯ: обучение до N совпадений подряд (локальный мок, без интернета) ----
+  console.log('--- Telegram-сессия: предсказание + обучение до N совпадений подряд ---')
+  {
+    const http = require('http')
+    const truth = ['12345', '54321', '11223', '45454', '33221', '51423', '22334', '44551']
+    let pending = [], photos = 0, replyNo = 0, msgId = 500
+    const texts = []
+    const srv = http.createServer((rq, rs) => {
+      const b = []
+      rq.on('data', c => b.push(c))
+      rq.on('end', () => {
+        const buf = Buffer.concat(b), s = buf.toString('latin1')
+        const m = rq.url.split('/').pop().split('?')[0]
+        const j = o => { rs.writeHead(200, { 'Content-Type': 'application/json' }); rs.end(JSON.stringify(o)) }
+        if (m === 'getMe') return j({ ok: true, result: { id: 1, username: 'selftest_bot' } })
+        if (m === 'sendMessage') { let p = {}; try { p = JSON.parse(buf.toString('utf8')) } catch (e) {}; texts.push(p.text || ''); return j({ ok: true, result: { message_id: ++msgId } }) }
+        if (m === 'sendPhoto') {
+          photos++
+          const i = s.indexOf('name="caption"')
+          let cap = ''
+          if (i >= 0) { const a = s.indexOf('\r\n\r\n', i) + 4, e2 = s.indexOf('\r\n--', a); cap = buf.slice(a, e2).toString('utf8') }
+          j({ ok: true, result: { message_id: ++msgId } })
+          const rm = cap.match(/Раунд (\d+)/)
+          const rnd = rm ? Number(rm[1]) : photos
+          pending.push({ update_id: 5000 + (++replyNo), message: { message_id: ++msgId, chat: { id: 1 }, text: truth[(rnd - 1) % truth.length], date: 0 } })
+          return
+        }
+        if (m === 'getUpdates') {
+          let p = {}; try { p = JSON.parse(buf.toString('utf8')) } catch (e) {}
+          if (typeof p.offset === 'number' && p.offset > 0) pending = pending.filter(u => u.update_id >= p.offset)
+          const out = pending.splice(0, pending.length)
+          const send = () => { rs.writeHead(200, { 'Content-Type': 'application/json' }); rs.end(JSON.stringify({ ok: true, result: out })) }
+          if (out.length || p.timeout === 0) send(); else setTimeout(send, 60)
+          return
+        }
+        j({ ok: true, result: {} })
+      })
+    })
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    const port = srv.address().port
+    const saved = { apiUrl: TG.apiUrl, token: TG.token, chatId: TG.chatId, target: TG.targetStreak, max: TG.maxRounds, ready: TG.ready }
+    TG.apiUrl = 'http://127.0.0.1:' + port; TG.token = 'SELFTEST'; TG.chatId = '1'
+    TG.targetStreak = 3; TG.maxRounds = 8; TG.ready = true
+    tgTransport = null
+    const ctx2 = { results: [], rotationsUsed: 0, consecutiveNetFails: 0, proxyFails: 0, proxyDead: false, aborted: false, tGlobal: Date.now() }
+    const fake = async r => {
+      const d = truth[(r - 1) % truth.length]
+      const g = makeSyntheticDigits(4, 3, d, 31337 + r * 71)
+      const snap = makeWallSnapshot(g.img, g.W, g.H, { rots: true, id0: 8000 + r * 100 })
+      const rec = await saveRecord(path.join(REC_ROOT || __dirname, 'selftest_learn', 'tg' + r), snap, 'TGR' + r, r)
+      ctx2.results.push({ n: r, ok: !!rec, rec })
+      return rec
+    }
+    let res = null, err = null
+    const t0 = Date.now()
+    try { res = await runTelegramSession(ctx2, fake) } catch (e) { err = e }
+    srv.close()
+    Object.assign(TG, { apiUrl: saved.apiUrl, token: saved.token, chatId: saved.chatId, targetStreak: saved.target, maxRounds: saved.max, ready: saved.ready })
+    const st = res && res.st
+    const ok = !err && res && res.ok && st && st.doneByStreak === true && st.bestStreak >= 3 && st.labeled >= 3 * 5 &&
+      texts.some(t => t.indexOf('\u{1F393}') === 0) && photos >= 3
+    if (!ok) fails++
+    console.log('  ' + (ok ? '\u2705' : '\u274c') + ' сессия: ' + (err ? 'ошибка ' + err.message : (st
+      ? 'раундов=' + st.rounds + ' фото=' + photos + ' совпало=' + st.matches + '/' + (st.matches + st.mismatches) +
+        ' рекорд подряд=' + st.bestStreak + ' (цель ' + saved.target + ') размечено=' + st.labeled +
+        ' завершено по цели=' + st.doneByStreak + ' за ' + ((Date.now() - t0) / 1000).toFixed(1) + 'с'
+      : 'нет статистики')))
+    if (!ok && st) console.log('     ⚠️ ожидали: doneByStreak=true, bestStreak>=' + 3 + ', размечено>=' + 15 + ', финальное сообщение 🎓')
   }
 
   LEARN_DIR = learnWas
@@ -3114,13 +3254,20 @@ class AsyncQueue {
   constructor(cap) { this.cap = Math.max(1, cap); this.items = []; this.closed = false; this.pushWait = []; this.shiftWait = [] }
   async push(x) {
     while (this.items.length >= this.cap && !this.closed) await new Promise(r => this.pushWait.push(r))
+    if (this.closed) return false
     this.items.push(x)
-    const w = this.shiftWait.shift(); if (w) w()
+    const w = this.shiftWait.shift()
+    if (w) w()
+    return true
   }
   async shift() {
     while (!this.items.length && !this.closed) await new Promise(r => this.shiftWait.push(r))
-    if (this.items.length) return this.items.shift()
-    return null
+    if (!this.items.length) return null
+    const x = this.items.shift()
+    // обязательно будим того, кто ждёт места в очереди, иначе deadlock
+    const w = this.pushWait.shift()
+    if (w) w()
+    return x
   }
   close() { this.closed = true; while (this.pushWait.length) this.pushWait.shift()(); while (this.shiftWait.length) this.shiftWait.shift()() }
   get size() { return this.items.length }
@@ -3190,216 +3337,321 @@ function trainModel(store, opts) {
   return res
 }
 
-// ========================= TELEGRAM: СЕССИЯ РАЗМЕТКИ =========================
+// Картинки готовятся ЗАРАНЕЕ (конвейер), поэтому к моменту отправки база уже
+// могла вырасти. Признаки глифов не меняются — меняем только классификатор:
+// пересчитываем предсказание по текущей базе и модели.
+function refreshPrediction(rec, store, model) {
+  try {
+    const items = (rec.digitItems || []).filter(it => it.feat).map(it => {
+      const knn = store ? store.classify(it.feat) : null
+      let mlp = null
+      if (model) { try { mlp = model.predict(it.feat) } catch (e) {} }
+      let pick = null
+      if (knn && mlp) pick = (mlp.conf >= (knn.trust || 0)) ? mlp : knn
+      else pick = knn || mlp
+      const conf = pick ? Math.round(((pick.trust != null ? pick.trust : pick.conf) || 0) * 1000) / 1000 : 0
+      return {
+        x: it.x, y: it.y, w: it.w, h: it.h, bbox: it.bbox, feat: it.feat,
+        digit: pick ? pick.digit : null, conf, method: pick ? pick.method : 'none',
+        guess: pick ? pick.digit : null, knn: knn, mlp: mlp ? { digit: mlp.digit, conf: Math.round(mlp.conf * 1000) / 1000 } : null
+      }
+    })
+    const prediction = items.map(it => (it.digit === null || it.digit === undefined) ? '?' : String(it.digit)).join('')
+    const avgConf = items.length ? Math.round(items.reduce((s, it) => s + (it.conf || 0), 0) / items.length * 100) / 100 : 0
+    return {
+      items, prediction, avgConf,
+      text: items.filter(it => it.conf >= DIG_CONF_OK).map(it => String(it.digit)).join(''),
+      complete: DIGITS_EXPECTED > 0
+        ? (items.length === DIGITS_EXPECTED && prediction.length === DIGITS_EXPECTED && prediction.indexOf('?') < 0)
+        : items.length > 0
+    }
+  } catch (e) { return null }
+}
+
+// ========================= TELEGRAM: СЕССИЯ ОБУЧЕНИЯ =========================
+// Правила (как договорились):
+//  • в капче ВСЕГДА ровно DIGITS_EXPECTED (5) цифр;
+//  • вместе с фото бот ВСЕГДА присылает своё предсказание;
+//  • ответ человека = истина: эти цифры уходят в обучающую базу;
+//  • сессия идёт, пока предсказание бота не совпадёт с ответом 10 раз ПОДРЯД.
 async function runTelegramSession(ctx, captureFn) {
   const doCapture = captureFn || captureRound
   const store = new DIG.GlyphStore(LEARN_DIR)
   let model = DIG.MLP.load(LEARN_DIR)
   const q = new AsyncQueue(TG.prefetch)
-  const st = { offset: 0, stop: false, labeled: 0, newLabels: 0, rounds: 0, skipped: 0, lastModelInfo: null }
+  const st = {
+    offset: 0, pending: [], stop: false, rounds: 0, labeled: 0, newLabels: 0, skipped: 0,
+    streak: 0, bestStreak: 0, matches: 0, mismatches: 0, incomplete: 0,
+    lastModelInfo: null, doneByStreak: false, me: null
+  }
 
-  tgLog('порядок транспортов: ' + tgTransports().map(t => t === 'direct' ? 'direct' : t.name).join(' → ') +
-    (TG.socksUrl ? ' | прокси из ' + TG.socksKey : ''))
   const me = await tgApi('getMe', null, null, TG.probeTimeoutMs)
   if (!me.ok) {
     tgLog('❌ getMe не прошёл: ' + (me.description || me.error_code) + ' — работаю БЕЗ Telegram')
-    tgLog('   что сделать: проверьте telegram.apiProxy/socksUrl (формат socks5://логин:пароль@хост:порт),')
-    tgLog('   либо diagnosis: node main.js --tg-test')
-    return false
+    tgLog('   диагностика: node main.js --tg-test')
+    return { ok: false, st }
   }
+  st.me = me.result
   tgLog('бот @' + (me.result && me.result.username) + ' (id ' + (me.result && me.result.id) + ') | chat_id=' + TG.chatId +
     ' | транспорт=' + (tgTransport === 'direct' ? 'direct' : (tgTransport && tgTransport.name)))
   tgLog('база цифр: ' + store.size + ' ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет'))
+  tgLog('цифр в капче: ' + DIGITS_EXPECTED + ' | цель: ' + TG.targetStreak + ' совпадений подряд | лимит раундов: ' + TG.maxRounds)
 
-  // сбрасываем старые апдейты, чтобы не отвечать на вчерашние сообщения
-  await tgApi('getUpdates', { offset: -1, timeout: 0 })
+  await tgApi('getUpdates', { offset: -1, timeout: 0 })   // сброс старых апдейтов
 
-  await tgSendText('🟢 Бот запущен (v3.9.1)\n' +
-    'Раундов: ' + TARGET_ROUNDS + ' | предзагрузка: ' + TG.prefetch + ' картинки\n' +
-    'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её и создадут)') + '\n\n' +
-    'Как отвечать:\n' +
-    '• пришли цифры с картинки, например 4815\n' +
-    '• «+» — подтвердить мою догадку\n' +
-    '• /skip — пропустить картинку\n' +
-    '• /glyphs — показать, что я вырезал как цифры\n' +
-    '• /status — состояние базы\n' +
-    '• /train — обучить нейросеть сейчас\n' +
-    '• /stop — остановить всё')
+  await tgSendText('🟢 Бот запущен (v3.9.2)\n' +
+    'В капче всегда ' + DIGITS_EXPECTED + ' цифр. Цель обучения: ' + TG.targetStreak + ' совпадений подряд.\n' +
+    'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её создадут)') + '\n\n' +
+    'Я присылаю картинку и СВОЁ ПРЕДСКАЗАНИЕ. Вы отвечаете правильными цифрами:\n' +
+    '• ' + '4'.repeat(DIGITS_EXPECTED) + ' — свои цифры (они и есть истина, идут в обучение)\n' +
+    '• «+» — моё предсказание верное\n' +
+    '• /skip — пропустить · /glyphs — что я вырезал · /status · /train · /stop')
 
-  // ---------- производитель: ловит раунды вперёд ----------
+  // ---------- производитель: снимает раунды вперёд ----------
   const producer = (async () => {
     try {
-      for (let r = 1; r <= TARGET_ROUNDS && !st.stop && !ctx.aborted; r++) {
+      for (let r = 1; r <= TG.maxRounds && !st.stop && !ctx.aborted; r++) {
         const t0 = Date.now()
         let rec = null
         try { rec = await doCapture(r, ctx) }
         catch (e) { tgLog('❌ раунд ' + r + ': исключение при сборе: ' + ((e && e.message) || e)) }
         st.rounds++
         await q.push({ round: r, rec, ms: Date.now() - t0 })
-        if (!st.stop) tgLog('раунд ' + r + ' подготовлен за ' + Math.round((Date.now() - t0) / 1000) + 'с → в очереди (готово заранее: ' + q.size + ')')
+        if (!st.stop) tgLog('раунд ' + r + ' подготовлен за ' + Math.round((Date.now() - t0) / 1000) + 'с (в очереди заранее: ' + q.size + ')')
       }
     } catch (e) {
       tgLog('❌ производитель упал: ' + ((e && e.message) || e))
     } finally {
       q.close()
-      tgLog('сбор завершён: раундов ' + st.rounds)
+      tgLog('сбор остановлен: раундов ' + st.rounds)
     }
   })()
 
-  // ---------- потребитель: шлёт картинку и ждёт ответ ----------
+  // ---------- потребитель: шлёт картинку + предсказание, ждёт ответ, учится ----------
   const consumer = (async () => {
     try {
-    while (!st.stop) {
-      const item = await q.shift()
-      if (!item) break
-      const { round, rec } = item
-      if (!rec) {
-        await tgSendText('⚠️ Раунд ' + round + '/' + TARGET_ROUNDS + ' не собрался (стена не найдена или мало плиток). Еду дальше.')
-        continue
-      }
-      const items = (rec.digitItems || []).filter(it => it.feat)
-      const guess = rec.digits || ''
-      const guessFull = guess.length === items.length && items.length > 0 && items.every(it => it.conf >= DIG_CONF_OK)
-      let png = null
-      try { png = fs.readFileSync(rec.pngFile) } catch (e) { try { png = fs.readFileSync(rec.pngFile2x) } catch (e2) {} }
-      if (!png) { await tgSendText('⚠️ Раунд ' + round + ': картинка не прочиталась с диска'); continue }
+      while (!st.stop) {
+        const item = await q.shift()
+        if (!item) break
+        const { round, rec } = item
 
-      const cap = '🖼 Раунд ' + round + '/' + TARGET_ROUNDS + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows +
-        ' · seam ' + rec.seamCost + '\n' +
-        'Глифов найдено: ' + items.length + '\n' +
-        (items.length
-          ? (guessFull ? 'Моя догадка: ' + guess + ' — ответь «+» если верно, либо пришли правильные цифры'
-            : (guess ? 'Черновик (неуверенно): ' + rec.digitsAll + ' — пришли ' + items.length + ' цифр'
-              : 'Пришли ' + items.length + ' цифр слева направо'))
-          : '❗ глифы не нашлись — пришли /skip и я сообщу в лог (нужна настройка порогов)')
-      const sent = await tgSendPhoto(png, cap)
-      if (!sent.ok) { tgLog('не отправил фото раунда ' + round + ': ' + (sent.description || '')); continue }
-      tgLog('раунд ' + round + ': фото отправлено (message_id=' + (sent.result && sent.result.message_id) +
-        ') глифов=' + items.length + ' догадка="' + guess + '" уверен=' + guessFull)
-
-      if (TG.sendGlyphStrip && items.length) {
-        const strip = glyphStripPng(items)
-        if (strip) await tgSendPhoto(strip, 'Что я вырезал как цифры (раунд ' + round + ')')
-      }
-
-      // ---------- ждём ответ ----------
-      let answered = false
-      while (!answered && !st.stop) {
-        const msg = await tgWaitMessage(st)
-        if (!msg) continue
-        const text = String((msg.text || '')).trim()
-        const low = text.toLowerCase()
-        tgLog('раунд ' + round + ': ответ «' + text.slice(0, 60) + '» (update_id=' + msg.update_id + ')')
-
-        if (low === '/stop' || low === '/stop@' + ((me.result && me.result.username) || '').toLowerCase()) {
-          st.stop = true; ctx.aborted = true
-          await tgSendText('⏹ Остановлено по команде. Собрано раундов: ' + st.rounds + ', размечено глифов: ' + st.labeled)
-          break
-        }
-        if (low === '/help') {
-          await tgSendText('цифры — разметить картинку\n«+» — подтвердить догадку\n/skip — пропустить\n/glyphs — показать вырезанные глифы\n/status — состояние\n/train — обучить MLP\n/stop — остановить')
+        if (!rec) {
+          await tgSendText('⚠️ Раунд ' + round + ': картинка не собралась (стена не найдена или мало плиток). Еду дальше.')
           continue
         }
-        if (low === '/status') {
-          await tgSendText('📊 База: ' + store.size + ' глифов ' + JSON.stringify(store.counts()) +
-            '\nMLP: ' + (model ? 'есть' : 'нет') + (st.lastModelInfo ? '\nПоследнее обучение: ' + st.lastModelInfo : '') +
-            '\nРазмечено в этой сессии: ' + st.labeled + ' | раундов собрано: ' + st.rounds + ' | пропущено: ' + st.skipped +
-            '\nВ очереди ручной разметки: ' + (new DIG.LabelQueue(LEARN_DIR)).size)
-          continue
-        }
-        if (low === '/glyphs') {
+
+        // пересчитываем предсказание ТЕКУЩЕЙ базой (картинка готовилась заранее)
+        const fresh = refreshPrediction(rec, store, model)
+        const items = fresh ? fresh.items : (rec.digitItems || []).filter(it => it.feat)
+        const pred = fresh ? fresh.prediction : (rec.prediction || '')
+        const avgConf = fresh ? fresh.avgConf : (rec.avgConf || 0)
+        const complete = !!(fresh ? fresh.complete : (items.length === DIGITS_EXPECTED && pred.length === DIGITS_EXPECTED && pred.indexOf('?') < 0))
+        if (pred !== (rec.prediction || '')) tgLog('раунд ' + round + ': предсказание обновлено базой "' + (rec.prediction || '') + '" → "' + pred + '"')
+        let png = null
+        try { png = fs.readFileSync(rec.pngFile) } catch (e) { try { png = fs.readFileSync(rec.pngFile2x) } catch (e2) {} }
+        if (!png) { await tgSendText('⚠️ Раунд ' + round + ': не удалось прочитать картинку с диска'); continue }
+
+        const cap = '🖼 Раунд ' + round + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows + ' · seam ' + rec.seamCost + '\n' +
+          '🤖 Предсказание: ' + (pred || '—') + '  (уверенность ' + avgConf + ')\n' +
+          '🔤 Вырезано цифр: ' + items.length + ' из ' + DIGITS_EXPECTED +
+          (complete ? '' : '  ⚠️ не хватает — пришлите /glyphs, посмотрим вместе') + '\n' +
+          '🎯 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + '\n\n' +
+          'Ответьте ' + DIGITS_EXPECTED + ' цифрами (или «+», если предсказание верное)'
+        const sent = await tgSendPhoto(png, cap)
+        if (!sent.ok) { tgLog('не отправил фото раунда ' + round + ': ' + (sent.description || '')); continue }
+        tgLog('раунд ' + round + ': фото + предсказание "' + pred + '" отправлены (message_id=' +
+          (sent.result && sent.result.message_id) + ') цифр=' + items.length + '/' + DIGITS_EXPECTED +
+          ' уверенность=' + avgConf + ' streak=' + st.streak + ' база=' + store.size)
+        if (TG.sendGlyphStrip && items.length) {
           const strip = glyphStripPng(items)
-          if (strip) await tgSendPhoto(strip, 'Глифы раунда ' + round + ' (слева направо). Догадки: ' +
-            items.map((it, i) => (i + 1) + ') ' + (it.guess === null || it.guess === undefined ? '?' : it.guess) + '·' + it.conf).join('  '))
-          else await tgSendText('Глифов нет — вырезать нечего')
-          continue
-        }
-        if (low === '/train') {
-          const r = trainModel(store)
-          if (!r.ok) { await tgSendText('⚠️ ' + r.reason + '. Нужно ≥20 примеров.'); continue }
-          model = r.mlp
-          st.lastModelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.ms + 'мс)'
-          await tgSendText('🧠 MLP обучена: ' + st.lastModelInfo + '\nБаза: ' + r.samples + ' ' + JSON.stringify(r.counts))
-          continue
-        }
-        if (low === '/skip') {
-          st.skipped++
-          await tgSendText('⏭ Раунд ' + round + ' пропущен (глифы остались в очереди: node main.js --label)')
-          answered = true
-          break
+          if (strip) await tgSendPhoto(strip, 'Что я вырезал (раунд ' + round + ', слева направо)')
         }
 
-        let digits = ''
-        if (text === '+' || low === '+' || low === 'да' || low === 'ok' || low === 'верно') {
-          if (guess.length === items.length && items.length) digits = guess
-          else { await tgSendText('⚠️ У меня нет уверенной догадки (' + items.length + ' глифов, черновик «' + (rec.digitsAll || '') + '»). Пришли цифры явно.'); continue }
-        } else {
-          digits = text.replace(/[^0-9]/g, '')
-        }
+        // ---------- ждём ответ ----------
+        let answered = false
+        while (!answered && !st.stop) {
+          const msg = await tgWaitMessage(st)
+          if (!msg) continue
+          const text = String((msg.text || '')).trim()
+          const low = text.toLowerCase()
+          const botName = ((st.me && st.me.username) || '').toLowerCase()
+          tgLog('раунд ' + round + ': ответ «' + text.slice(0, 60) + '» (update_id=' + msg.update_id + ')')
 
-        if (!digits) { await tgSendText('Не понял. Пришли только цифры (например 4815), «+», /skip или /help'); continue }
-
-        const res = labelRoundWithDigits(store, rec, round, digits)
-        if (!res.ok) {
-          await tgSendText('⚠️ ' + (res.reason === 'не совпало количество'
-            ? ('я нашёл ' + res.found + ' глифов, а цифр ' + res.got + '. Пришли ровно ' + res.found + ' цифр или /skip')
-            : res.reason) + '\n/glyphs — посмотреть, что я вырезал')
-          continue
-        }
-        st.labeled += res.n
-        st.newLabels += res.n
-        const dropped = dropQueueRound(round)
-        let reply = '✅ Раунд ' + round + ': ' + digits + ' → размечено ' + res.n + ' глифов\n' +
-          'База: ' + store.size + ' примеров ' + JSON.stringify(store.counts()) +
-          (dropped ? '\n(из очереди ручной разметки убрано ' + dropped + ')' : '')
-        // автообучение
-        if (TG.autoTrainEvery && st.newLabels >= TG.autoTrainEvery && store.size >= 30) {
-          const r = trainModel(store)
-          st.newLabels = 0
-          if (r.ok) {
+          if (low === '/stop' || low === '/stop@' + botName) {
+            st.stop = true; ctx.aborted = true
+            await finishSession(st, store, '⏹ Остановлено по команде')
+            break
+          }
+          if (low === '/help' || low === '/help@' + botName) {
+            await tgSendText('Пришлите ' + DIGITS_EXPECTED + ' цифр — это истина, она идёт в обучение.\n' +
+              '«+» — моё предсказание верное\n/skip — пропустить картинку\n/glyphs — показать вырезанные глифы\n' +
+              '/status — база, точность, счётчик совпадений\n/train — обучить MLP сейчас\n/stop — остановить')
+            continue
+          }
+          if (low === '/status' || low === '/status@' + botName) {
+            await tgSendText('📊 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + ' (рекорд ' + st.bestStreak + ')\n' +
+              'Совпало: ' + st.matches + ' | не совпало: ' + st.mismatches + ' | неполных картинок: ' + st.incomplete + '\n' +
+              'Раундов: ' + st.rounds + ' | размечено глифов: ' + st.labeled + ' | пропущено: ' + st.skipped + '\n' +
+              'База: ' + store.size + ' ' + JSON.stringify(store.counts()) + '\n' +
+              'MLP: ' + (model ? 'есть' : 'нет') + (st.lastModelInfo ? ' — ' + st.lastModelInfo : '') + '\n' +
+              'Очередь ручной разметки: ' + (new DIG.LabelQueue(LEARN_DIR)).size)
+            continue
+          }
+          if (low === '/glyphs' || low === '/glyphs@' + botName) {
+            const strip = glyphStripPng(items)
+            if (strip) await tgSendPhoto(strip, 'Глифы раунда ' + round + ' (слева направо). Предсказание: ' +
+              items.map((it, i) => (i + 1) + ') ' + (it.guess === null || it.guess === undefined ? '?' : it.guess) + '·' + it.conf).join('  '))
+            else await tgSendText('Глифов нет — вырезать нечего. Похоже, нужно поправить пороги (digits.minGlyphH / maxGlyphH)')
+            continue
+          }
+          if (low === '/train' || low === '/train@' + botName) {
+            const r = trainModel(store)
+            if (!r.ok) { await tgSendText('⚠️ ' + r.reason + '. Нужно ≥20 примеров.'); continue }
             model = r.mlp
-            st.lastModelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.ms + 'мс)'
-            reply += '\n🧠 автообучение MLP: ' + st.lastModelInfo
-            tgLog('автообучение MLP: ' + st.lastModelInfo + ' | база ' + r.samples)
-          } else { tgLog('автообучение пропущено: ' + r.reason); st.newLabels = 0 }
+            st.lastModelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.ms + 'мс, ' + r.samples + ' примеров)'
+            await tgSendText('🧠 MLP обучена: ' + st.lastModelInfo + '\n' + JSON.stringify(r.counts))
+            tgLog('/train: ' + st.lastModelInfo)
+            continue
+          }
+          if (low === '/skip' || low === '/skip@' + botName) {
+            st.skipped++
+            await tgSendText('⏭ Раунд ' + round + ' пропущен. Счётчик совпадений сброшен (' + st.streak + ' → 0)')
+            st.streak = 0
+            answered = true
+            break
+          }
+
+          // ---------- цифры ----------
+          let digits = ''
+          if (text === '+' || low === 'да' || low === 'ok' || low === 'верно' || low === 'y') {
+            if (!complete) {
+              await tgSendText('⚠️ Не могу подтвердить: предсказание неполное («' + (pred || 'нет') + '», вырезано ' +
+                items.length + ' из ' + DIGITS_EXPECTED + ').\nПришлите ' + DIGITS_EXPECTED + ' цифр вручную или /glyphs')
+              continue
+            }
+            digits = pred
+          } else {
+            digits = text.replace(/[^0-9]/g, '')
+          }
+          if (!digits) { await tgSendText('Не понял. Пришлите ровно ' + DIGITS_EXPECTED + ' цифр (например 48152), «+», /skip или /help'); continue }
+          if (digits.length !== DIGITS_EXPECTED) {
+            await tgSendText('⚠️ Нужно ровно ' + DIGITS_EXPECTED + ' цифр, а пришло ' + digits.length + ' («' + digits + '»). Повторите или /skip')
+            continue
+          }
+
+          // ---------- сравнение с предсказанием + обучение ----------
+          const match = complete && pred === digits
+          if (match) { st.streak++; st.matches++ } else { st.mismatches++; st.streak = 0 }
+          if (!complete) st.incomplete++
+          st.bestStreak = Math.max(st.bestStreak, st.streak)
+
+          // ответ человека = истина → в базу (даже если бот угадал)
+          const recFresh = Object.assign({}, rec, { digitItems: items })
+          const res = labelRoundWithDigits(store, recFresh, round, digits)
+          let rep
+          if (res.ok) {
+            st.labeled += res.n
+            st.newLabels += res.n
+            const dropped = dropQueueRound(round)
+            rep = (match
+              ? '✅ СОВПАЛО! Я: ' + pred + ' = Вы: ' + digits
+              : '❌ Я сказал «' + pred + '», верно «' + digits + '»' + (complete ? '' : ' (предсказание неполное)')) +
+              '\n🎯 Подряд: ' + st.streak + '/' + TG.targetStreak + (st.bestStreak > st.streak ? ' (рекорд ' + st.bestStreak + ')' : '') +
+              '\n📚 Размечено ' + res.n + ' глифов → база ' + store.size + (dropped ? ' (из очереди убрано ' + dropped + ')' : '')
+            tgLog('раунд ' + round + ': ' + (match ? 'СОВПАЛО' : 'НЕ СОВПАЛО') + ' бот="' + pred + '" человек="' + digits +
+              '" streak=' + st.streak + '/' + TG.targetStreak + ' размечено=' + res.n + ' база=' + store.size)
+          } else {
+            st.streak = 0
+            rep = '⚠️ Разметить не удалось: ' + res.reason + ' (вырезано ' + items.length + ' из ' + DIGITS_EXPECTED +
+              '). Пришлите /glyphs — посмотрим, что я режу не так. Счётчик сброшен.'
+            tgLog('раунд ' + round + ': разметка не удалась (' + res.reason + '), вырезано ' + items.length + ' из ' + DIGITS_EXPECTED)
+          }
+
+          // ---------- автообучение ----------
+          if (TG.autoTrainEvery && st.newLabels >= TG.autoTrainEvery && store.size >= 30) {
+            const r = trainModel(store)
+            st.newLabels = 0
+            if (r.ok) {
+              model = r.mlp
+              st.lastModelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.ms + 'мс, ' + r.samples + ')'
+              rep += '\n🧠 автообучение MLP: ' + st.lastModelInfo
+              tgLog('автообучение MLP: ' + st.lastModelInfo)
+            } else tgLog('автообучение пропущено: ' + r.reason)
+          }
+
+          // ---------- цель достигнута? ----------
+          if (st.streak >= TG.targetStreak) {
+            st.stop = true
+            st.doneByStreak = true
+            await finishSession(st, store, '🎓 ОБУЧЕНИЕ ЗАВЕРШЕНО — ' + st.streak + ' совпадений подряд!')
+            break
+          }
+
+          const nxt = q.size
+          rep += '\n' + (nxt ? '⏩ Следующая картинка уже готова (' + nxt + ' в очереди)' : '⏳ готовлю следующую…')
+          await tgSendText(rep)
+          answered = true
         }
-        const nxt = q.size
-        reply += '\n' + (nxt ? '⏩ Следующая картинка уже готова (' + nxt + ' в очереди)' : '⏳ готовлю следующую…')
-        await tgSendText(reply)
-        tgLog('раунд ' + round + ': размечено ' + res.n + ' глифов как «' + digits + '», база=' + store.size + ', в очереди дальше=' + nxt)
-        answered = true
       }
-    }
     } catch (e) {
       st.stop = true
-      try { q.close() } catch (e2) {}
       tgLog('❌ потребитель упал: ' + ((e && e.stack) || (e && e.message) || e))
       try { await tgSendText('❌ Внутренняя ошибка сессии: ' + ((e && e.message) || e) + '\nПодробности: ' + tgLogFile()) } catch (e2) {}
+    } finally {
+      // обязательно освобождаем производителя, иначе он останется ждать места в очереди
+      st.stop = true
+      try { q.close() } catch (e2) {}
     }
   })()
 
   await Promise.all([producer, consumer])
   q.close()
-
-  const fin = '🏁 Готово.\nРаундов собрано: ' + st.rounds + '\nРазмечено глифов: ' + st.labeled +
-    '\nПропущено картинок: ' + st.skipped + '\nБаза: ' + store.size + ' ' + JSON.stringify(store.counts()) +
-    (st.lastModelInfo ? '\nMLP: ' + st.lastModelInfo : '')
-  if (!st.stop) await tgSendText(fin)
-  tgLog('сессия завершена: раундов=' + st.rounds + ' размечено=' + st.labeled + ' пропущено=' + st.skipped + ' база=' + store.size)
-  return true
+  if (!st.doneByStreak && !st.stop) await finishSession(st, store, '🏁 Раунды закончились')
+  else if (st.stop && !st.doneByStreak) tgLog('сессия остановлена (не по цели): раундов=' + st.rounds + ' streak=' + st.streak)
+  return { ok: true, st }
 }
 
-// долгое ожидание сообщения (long polling); команды обрабатывает вызывающий
+// итоговое сообщение + финальное обучение модели
+async function finishSession(st, store, headline) {
+  let modelInfo = st.lastModelInfo || ''
+  try {
+    const r = trainModel(store)
+    if (r.ok) {
+      modelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.samples + ' примеров, ' + r.ms + 'мс)'
+      st.lastModelInfo = modelInfo
+      tgLog('финальное обучение MLP: ' + modelInfo)
+    } else tgLog('финальное обучение пропущено: ' + r.reason)
+  } catch (e) { tgLog('finishSession train err: ' + e.message) }
+  const txt = headline + '\n' +
+    'Раундов: ' + st.rounds + ' | размечено глифов: ' + st.labeled + ' | пропущено: ' + st.skipped + '\n' +
+    'Совпало: ' + st.matches + ' | не совпало: ' + st.mismatches + ' | рекорд подряд: ' + st.bestStreak + '\n' +
+    'База: ' + store.size + ' ' + JSON.stringify(store.counts()) +
+    (modelInfo ? '\n🧠 MLP: ' + modelInfo : '') + '\n' +
+    'Лог: ' + tgLogFile()
+  await tgSendText(txt)
+  tgLog('сессия завершена: раундов=' + st.rounds + ' размечено=' + st.labeled + ' совпало=' + st.matches +
+    ' не совпало=' + st.mismatches + ' рекорд=' + st.bestStreak + ' база=' + store.size)
+  step('=== TELEGRAM-СЕССИЯ: ' + headline.replace(/\n/g, ' ') + ' | раундов ' + st.rounds +
+    ' | размечено ' + st.labeled + ' | совпало ' + st.matches + '/' + (st.matches + st.mismatches) +
+    ' | рекорд подряд ' + st.bestStreak + ' | база ' + store.size + ' ===')
+}
+
+// Долгое ожидание сообщения (long polling).
+// ВАЖНО: Telegram вместе с ответом может прислать несколько апдейтов сразу.
+// offset подтверждает ВСЕ полученные, поэтому непрочитанные обязательно
+// складываем в локальный буфер st.pending — иначе сообщение теряется и бот зависает.
 async function tgWaitMessage(st) {
+  if (!st.pending) st.pending = []
   while (!st.stop) {
+    if (st.pending.length) return st.pending.shift()
     const r = await tgApi('getUpdates', { offset: st.offset, timeout: 25, allowed_updates: ['message'] }, null, 45000)
     if (!r.ok) {
       tgLog('getUpdates ошибка: ' + (r.description || r.error_code) + ' — повтор через 3с')
       await sleep(3000)
       continue
     }
-    const list = r.result || []
-    for (const u of list) {
+    let got = 0
+    for (const u of (r.result || [])) {
       st.offset = Math.max(st.offset, u.update_id + 1)
       const msg = u.message
       if (!msg) continue
@@ -3408,8 +3660,10 @@ async function tgWaitMessage(st) {
         continue
       }
       msg.update_id = u.update_id
-      return msg
+      st.pending.push(msg)
+      got++
     }
+    if (got > 1) tgLog('получено сразу ' + got + ' сообщений — ' + (got - 1) + ' в буфере')
   }
   return null
 }
@@ -3617,7 +3871,7 @@ async function replayAll(root) {
     if (!rp) continue
     const num = (path.basename(d).match(/^round(\d+)/) || [])[1]
     const rec = await saveRecord(rp.out, rp.snap, 'REPLAY ' + path.basename(d), num ? Number(num) : null)
-    if (rec) { ok++; rows.push('  ' + path.basename(d) + ' → ' + rec.cols + '×' + rec.rows + ' стена=' + rec.wall + ' seam=' + rec.seamCost + ' ЦИФРЫ="' + rec.digits + '" (сырое "' + rec.digitsAll + '")') }
+    if (rec) { ok++; rows.push('  ' + path.basename(d) + ' → ' + rec.cols + '×' + rec.rows + ' стена=' + rec.wall + ' seam=' + rec.seamCost + ' ПРЕДСКАЗАНИЕ="' + (rec.prediction || '') + '" (уверенные "' + rec.digits + '")') }
     else rows.push('  ' + path.basename(d) + ' → НЕ СОБРАЛОСЬ')
   }
   step('REPLAY-ALL готово: ' + ok + '/' + dirs.length)
@@ -3672,7 +3926,7 @@ async function captureRound(r, ctx) {
   if (rec) {
     ctx.results.push({ n: r, ok: true, rec })
     step('РАУНД ' + r + ' ✅ ' + rec.cols + '×' + rec.rows + ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected +
-      ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ЦИФРЫ="' + rec.digits + '"' +
+      ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ПРЕДСКАЗАНИЕ="' + (rec.prediction || '') + '"' +
       (rec.capFile ? ' → records/captchas/' + rec.capFile : ''))
   } else if (!ctx.aborted) {
     ctx.results.push({ n: r, ok: false, note: lastNote || 'fail' })
@@ -3689,7 +3943,7 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.9.1 ===')
+  step('=== СТАРТ v3.9.2 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
@@ -3738,8 +3992,9 @@ async function main() {
     step('  трафик Telegram: ' + (sp ? ('СОКС-прокси ' + sp.host + ':' + sp.port + ' (из ' + TG.socksKey + '), тип socks' + sp.type + (sp.username ? ', логин ' + sp.username : '') + ' → затем direct → затем мобильный прокси') :
       'напрямую (спец-прокси не задан: добавьте telegram.apiProxy) → затем мобильный прокси ' + (PROXY.host || 'НЕТ')) +
       (TG.preferSocks && sp ? '' : ''))
-    const okTg = await runTelegramSession(ctx)
-    if (!okTg) { step('Telegram недоступен — переключаюсь в обычный режим (только сбор картинок)'); await runClassic(ctx) }
+    const tgRes = await runTelegramSession(ctx)
+    if (!tgRes || !tgRes.ok) { step('Telegram недоступен — переключаюсь в обычный режим (только сбор картинок)'); await runClassic(ctx) }
+    else if (tgRes.st) { ctx.tg = tgRes.st }
   } else {
     if (!TG.enabled) step('TELEGRAM: отключён конфигом (telegram.enabled=false) — обычный режим')
     else if (!TG.token || /YOUR_/.test(TG.token)) step('TELEGRAM: не задан telegram.token — обычный режим (разметка через node main.js --label)')
@@ -3753,13 +4008,13 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.9.1) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.9.2) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
       ? 'OK ' + x.rec.cols + '×' + x.rec.rows + ' tiles=' + x.rec.tilesCount + '/' + x.rec.tilesExpected +
         ' ori=' + x.rec.ori + ' rot=' + x.rec.rotRule + (x.rec.permUsed ? ' PERM' : '') +
-        ' seam=' + x.rec.seamCost + ' ЦИФРЫ="' + x.rec.digits + '"' +
+        ' seam=' + x.rec.seamCost + ' ПРЕДСКАЗАНИЕ="' + (x.rec.prediction || '') + '"' +
         (x.rec.needLabel ? ' [на разметку:' + x.rec.needLabel + ']' : '') +
         (x.rec.capFile ? ' [captchas/' + x.rec.capFile + ']' : '')
       : 'FAIL (' + (x.note || '') + ')'))
@@ -3776,14 +4031,14 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.9.1', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.9.2', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
         tiles: x.rec.tilesCount + '/' + x.rec.tilesExpected, holesFilled: x.rec.holesFilled,
         orientation: x.rec.ori, rotationRule: x.rec.rotRule, permUsed: x.rec.permUsed,
         seamCost: x.rec.seamCost, score: x.rec.score, dot: x.rec.dot, dist: x.rec.dist,
-        digits: x.rec.digits, digitsAll: x.rec.digitsAll, needLabel: x.rec.needLabel,
+        digits: x.rec.digits, digitsAll: x.rec.digitsAll, prediction: x.rec.prediction, needLabel: x.rec.needLabel,
         candidates: (x.rec.candidates || []).map(c => ({ wall: c.wall, score: c.score })),
         file: x.rec.capFile, dir: x.rec.dir
       } : { round: x.n, ok: false, note: x.note })
@@ -3811,6 +4066,7 @@ module.exports = {
   yawSpread, maxGridGap, wallDist, wallDot, GLYPH_OPTS, LEARN_DIR, DIG,
   selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord,
   runTrain, runLabel: runLabelTool, replayAll, replayDir, captureRound, runClassic, trainModel,
+  DIGITS_EXPECTED, finishSession, refreshPrediction,
   TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, runTgTest, parseSocksUrl, tgTransports, AsyncQueue, glyphStripPng,
   labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary
 }
