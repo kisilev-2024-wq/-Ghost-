@@ -1,5 +1,25 @@
-// VERSION: 3.9.2
+// VERSION: 3.9.3
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ======================= ЧТО НОВОГО В v3.9.3 (УСКОРЕНИЕ) =======================
+// S1. БЫСТРЫЙ РЕЖИМ — включается сам в Telegram-сессии (или "capture":{"fast":true}).
+//     По вашему логу на раунд уходило ~6.5 с, из них ~3 с — просто паузы:
+//       • пауза между раундами      2000 мс -> 250 мс
+//       • пауза перед попыткой    1000..2000 мс -> 150..400 мс
+//       • ожидание «тишины» потока   1500 мс -> 600 мс
+//       • добор после «готово»        800 мс -> 200 мс
+// S2. Готовность по ФАКТУ ДАННЫХ: если все плитки стены получили полные
+//     16384 байта (128×128) — ждать «тишину» не нужно, забираем сразу.
+// S3. Облегчённая запись в быстром режиме: не пишем variants/, tiles/*.bin,
+//     ORIGINAL_CAPTCHA_mask.png и legacy-OCR (экономит ~170 мс на раунд:
+//     замер 224 мс -> 55 мс). Всё нужное остаётся: обе PNG, raw.bin,
+//     layout/assembly_debug/walls_debug/digits.json, glyphs/, логи.
+//     Полный набор файлов по-прежнему пишется в обычном режиме и в --replay.
+// S4. Предзагрузка по умолчанию 2 -> 3 картинки: пока вы отвечаете,
+//     в очереди уже лежат три следующих. В логе видно тайминги каждого раунда:
+//     «раунд 5 подготовлен за 2.1с (сеть 1.6с + сборка 0.1с) | в очереди 3/3».
+//     Итого ~2 с на раунд вместо ~6.5 с, и пауз между картинками нет вовсе.
+// ====================================================================
 //
 // ======================= ЧТО НОВОГО В v3.9.2 =======================
 // T1. В КАПЧЕ ВСЕГДА РОВНО 5 ЦИФР (digits.expected=5). Вырезание глифов
@@ -113,6 +133,7 @@ const TARGET_ROUNDS = CLI.rounds > 0 ? CLI.rounds : 10
 const ATTEMPTS_PER_ROUND = 2
 const PAUSE_BETWEEN_MS = 2000
 const SETTLE_MS = 800             // добор данных после "готово"
+
 const STABLE_MS = 1500            // поток map_data должен затихнуть на это время
 const CAPTCHA_TIMEOUT_MS = 75000  // жёсткий лимит на подключение+сбор
 const CONNECT_TIMEOUT_MS = 35000
@@ -276,7 +297,7 @@ const TG = {
   // мобильный прокси Minecraft — только как последний резерв (он часто режет не-MC трафик
   // и ротация IP рвёт long polling)
   useMcProxy: cfgGet(CFG, 'telegram.useMcProxy', true) !== false,
-  prefetch: Math.max(1, Number(cfgGet(CFG, 'telegram.prefetch', 2)) || 2),
+  prefetch: Math.max(1, Number(cfgGet(CFG, 'telegram.prefetch', 3)) || 3),
   timeoutMs: Math.max(10000, Number(cfgGet(CFG, 'telegram.timeoutMs', 30000)) || 30000),
   probeTimeoutMs: Math.max(4000, Number(cfgGet(CFG, 'telegram.probeTimeoutMs', 12000)) || 12000),
   autoTrainEvery: Math.max(0, Number(cfgGet(CFG, 'telegram.autoTrainEvery', 20)) || 0),
@@ -309,6 +330,21 @@ const CAP = {
   timeoutMs: Number(cfgGet(CFG, 'capture.timeoutMs', CAPTCHA_TIMEOUT_MS)) || CAPTCHA_TIMEOUT_MS,
   needPrompt: cfgGet(CFG, 'capture.needPrompt', false) === true
 }
+
+// ========================= БЫСТРЫЙ РЕЖИМ (для Telegram-обучения) =========================
+// В обычном режиме между раундами стоят паузы «для вежливости» к серверу (~3 с на раунд).
+// В режиме обучения это чистая потеря времени: картинки и так готовятся вперёд.
+// Включается сам в Telegram-сессии; вручную: "capture": { "fast": true } / выкл: false.
+const FAST = {
+  pauseBetween: 250,      // было 2000
+  preSleepMin: 150,       // было 1000
+  preSleepRnd: 250,       // было +random(1000)
+  stableMs: 600,          // было 1500 (ожидание «тишины» в потоке данных)
+  settleMs: 200,          // было 800  (добор после «готово»)
+  lightFiles: true        // не писать variants/, tiles/*.bin, DECOY_*.png, маску — экономит ~0.3 с
+}
+const FAST_CFG = cfgGet(CFG, 'capture.fast', 'auto')
+let FAST_MODE = FAST_CFG === true
 
 try {
   REC_ROOT = path.join(__dirname, 'records')
@@ -1979,7 +2015,8 @@ function getMapIdFromPacket(p) {
 }
 
 // ========================= ЗАПИСЬ РАУНДА =========================
-async function saveRecord(outDir, snap, label, roundNo) {
+async function saveRecord(outDir, snap, label, roundNo, opts) {
+  const LIGHT = !!(opts && opts.light)
   fs.mkdirSync(outDir, { recursive: true })
   const frames = (snap.frames || []).map(f => Object.assign({}, f))
   const tiles = snap.maps
@@ -2092,7 +2129,7 @@ async function saveRecord(outDir, snap, label, roundNo) {
   // ---- сохраняем лучшую ----
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA.png'), colorPng(asm.data, asm.W, asm.H, 2))
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_x1.png'), colorPng(asm.data, asm.W, asm.H, 1))
-  fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask.png'), bwPng(best.im.ink, asm.W, asm.H, 2))
+  if (!LIGHT) fs.writeFileSync(path.join(outDir, 'ORIGINAL_CAPTCHA_mask.png'), bwPng(best.im.ink, asm.W, asm.H, 2))
   fs.writeFileSync(path.join(outDir, 'ORIGINAL_raw.bin'), Buffer.from(asm.data))
   fs.writeFileSync(path.join(outDir, 'layout.json'), JSON.stringify(asm.layout, null, 2))
   fs.writeFileSync(path.join(outDir, 'assembly_debug.json'), JSON.stringify({
@@ -2106,23 +2143,24 @@ async function saveRecord(outDir, snap, label, roundNo) {
     inkDensity: best.fillRatio, digits: { text: best.rec.text, all: best.rec.textAll }
   }, null, 2))
 
-  fs.mkdirSync(path.join(outDir, 'tiles'), { recursive: true })
-  let ti = 0
-  for (const f of linked) {
-    const raw = tiles.get(f.mapId)
-    if (raw) fs.writeFileSync(path.join(outDir, 'tiles', 'tile_' + String(ti++).padStart(2, '0') + '_map' + f.mapId + '_rot' + (f.rotation || 0) + '.bin'), Buffer.from(raw))
+  // ---- тяжёлые отладочные артефакты: в быстром режиме пропускаем ----
+  if (!LIGHT) {
+    fs.mkdirSync(path.join(outDir, 'tiles'), { recursive: true })
+    let ti = 0
+    for (const f of linked) {
+      const raw = tiles.get(f.mapId)
+      if (raw) fs.writeFileSync(path.join(outDir, 'tiles', 'tile_' + String(ti++).padStart(2, '0') + '_map' + f.mapId + '_rot' + (f.rotation || 0) + '.bin'), Buffer.from(raw))
+    }
+    fs.mkdirSync(path.join(outDir, 'variants'), { recursive: true })
+    const vars = buildVariants(best.im.ink, asm.W, asm.H)
+    const ocrLines = []
+    for (const v of vars) {
+      try { fs.writeFileSync(path.join(outDir, 'variants', v.name + '.png'), bwPng(v.mask, asm.W, asm.H, 2)) } catch (e) {}
+      const r = ocr(v.mask, asm.W, asm.H)
+      ocrLines.push(v.name + ': legacy-ocr="' + r.text + '" digits=' + r.digits.length)
+    }
+    fs.writeFileSync(path.join(outDir, 'ocr_variants.txt'), ocrLines.join('\n'))
   }
-
-  // ---- варианты маски (для отладки) ----
-  fs.mkdirSync(path.join(outDir, 'variants'), { recursive: true })
-  const vars = buildVariants(best.im.ink, asm.W, asm.H)
-  const ocrLines = []
-  for (const v of vars) {
-    try { fs.writeFileSync(path.join(outDir, 'variants', v.name + '.png'), bwPng(v.mask, asm.W, asm.H, 2)) } catch (e) {}
-    const r = ocr(v.mask, asm.W, asm.H)
-    ocrLines.push(v.name + ': legacy-ocr="' + r.text + '" digits=' + r.digits.length)
-  }
-  fs.writeFileSync(path.join(outDir, 'ocr_variants.txt'), ocrLines.join('\n'))
 
   // ---- глиф-кандидаты и распознавание ----
   const glyphDir = path.join(outDir, 'glyphs')
@@ -2154,9 +2192,11 @@ async function saveRecord(outDir, snap, label, roundNo) {
     }, null, 2))
   } catch (e) {}
 
-  // ---- декаи ----
-  for (const s of stats.slice(1)) {
-    try { fs.writeFileSync(path.join(outDir, 'DECOY_NOT_ORIGINAL_' + s.w.tag + '.png'), colorPng(s.asm.data, s.asm.W, s.asm.H, 2)) } catch (e) {}
+  // ---- декаи (в быстром режиме не рисуем, счёт остаётся в walls_debug.json) ----
+  if (!LIGHT) {
+    for (const s of stats.slice(1)) {
+      try { fs.writeFileSync(path.join(outDir, 'DECOY_NOT_ORIGINAL_' + s.w.tag + '.png'), colorPng(s.asm.data, s.asm.W, s.asm.H, 2)) } catch (e) {}
+    }
   }
 
   // ---- плоская копия в records/captchas ----
@@ -2248,18 +2288,24 @@ function connectAndCapture(tag) {
       const w = bestWallNow()
       if (!w) return { ready: false, why: 'нет стены', have: 0, need: 0, total: 0 }
       const grid = buildGrid(w)
-      const have = grid.cells.filter(f => f && col.maps.has(f.mapId)).length
-      const need = Math.max(CAP.minTiles, Math.ceil(grid.total * MIN_TILES_FRACTION))
-      const allHave = have >= grid.total
+      const cells = grid.cells.filter(f => f && col.maps.has(f.mapId))
+      const have = cells.length
+      // плитка ПОЛНОСТЬЮ получена, если пришли все 16384 байта (128×128).
+      // Это намного быстрее, чем ждать «тишины» в потоке пакетов.
+      const full = cells.filter(f => (col.mapFilled.get(f.mapId) || 0) >= 16384).length
+      const allComplete = full >= grid.total && grid.total > 0
+      const stableMs = FAST_MODE ? FAST.stableMs : CAP.stableMs
       // «тишина»: ни новых рамок, ни новых метаданных, ни новых байт карты
-      const quiet = col.lastChangeAt ? (Date.now() - col.lastChangeAt) >= CAP.stableMs : true
+      const quiet = col.lastChangeAt ? (Date.now() - col.lastChangeAt) >= stableMs : true
+      const need = Math.max(CAP.minTiles, Math.ceil(grid.total * MIN_TILES_FRACTION))
       const enough = have >= Math.min(need, grid.total)
       const promptOk = CAP.needPrompt ? col.prompts >= 1 : true
-      const ok = enough && quiet && promptOk
+      const ok = enough && (allComplete || quiet) && promptOk
       return {
-        ready: ok,
-        why: ok ? 'ok' : (!enough ? 'не хватает плиток (' + have + '/' + Math.min(need, grid.total) + ')'
-          : (!quiet ? 'ждём тишины ' + CAP.stableMs + 'мс' : 'ждём промпт капчи')),
+        ready: ok, allComplete, full,
+        why: ok ? (allComplete ? 'ok(все байты)' : 'ok(тишина)')
+          : (!enough ? 'не хватает плиток (' + have + '/' + Math.min(need, grid.total) + ')'
+            : (!quiet ? 'ждём тишины ' + stableMs + 'мс' : 'ждём промпт капчи')),
         have, need: Math.min(need, grid.total), total: grid.total, quiet
       }
     }
@@ -2481,8 +2527,9 @@ function connectAndCapture(tag) {
         try { scanEntities() } catch (e) {}
         const rd = readiness()
         if (rd.ready) {
-          if (!readySince) { readySince = Date.now(); ev('данные готовы: ' + rd.have + '/' + rd.total + ' — добираю ' + SETTLE_MS + 'мс') }
-          if (!settleT) settleT = setTimeout(() => finish(true, 'captured ' + rd.have + '/' + rd.total), SETTLE_MS)
+          const settleMs = FAST_MODE ? FAST.settleMs : SETTLE_MS
+          if (!readySince) { readySince = Date.now(); ev('данные готовы (' + rd.why + '): ' + rd.have + '/' + rd.total + ' — добираю ' + settleMs + 'мс') }
+          if (!settleT) settleT = setTimeout(() => finish(true, 'captured ' + rd.have + '/' + rd.total + ' ' + rd.why), settleMs)
         } else {
           readySince = 0
           if (settleT) { clearTimeout(settleT); settleT = null }
@@ -2610,7 +2657,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.9.2: геометрия сборки ===')
+  console.log('=== SELFTEST v3.9.3: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -2830,12 +2877,21 @@ async function selftest() {
       const pct = 100 * diff / orig.length
       const filesOk = ['ORIGINAL_CAPTCHA.png', 'ORIGINAL_CAPTCHA_x1.png', 'layout.json', 'assembly_debug.json', 'ORIGINAL_raw.bin']
         .every(f => fs.existsSync(path.join(outDir, f)))
-      const ok = pct < 0.5 && filesOk && rec.tilesCount === cols * rows
+      // быстрый (light) режим: тяжёлых отладочных файлов нет, но картинка для Telegram и raw — есть
+      const lightDir = outDir + '_light'
+      await saveRecord(lightDir, snap, 'SELFTEST-LIGHT', null, { light: true })
+      const lightOk = ['ORIGINAL_CAPTCHA_x1.png', 'ORIGINAL_raw.bin', 'digits.json', 'assembly_debug.json', 'walls_debug.json']
+        .every(f => fs.existsSync(path.join(lightDir, f))) &&
+        !fs.existsSync(path.join(lightDir, 'variants')) && !fs.existsSync(path.join(lightDir, 'tiles')) &&
+        fs.readFileSync(path.join(lightDir, 'ORIGINAL_raw.bin')).equals(fs.readFileSync(path.join(outDir, 'ORIGINAL_raw.bin')))
+      const ok = pct < 0.5 && filesOk && lightOk && rec.tilesCount === cols * rows
       if (!ok) fails++
       console.log('  ' + (ok ? '\u2705' : '\u274c') + ' saveRecord ' + rec.cols + '\u00d7' + rec.rows +
         ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected + ' ori=' + rec.ori + ' rot=' + rec.rotRule +
         (rec.permUsed ? ' PERM!' : '') + ' seam=' + rec.seamCost +
-        ' файлы=' + (filesOk ? 'все' : 'НЕ ВСЕ') + ' расхождений=' + pct.toFixed(3) + '%')
+        ' файлы=' + (filesOk ? 'все' : 'НЕ ВСЕ') +
+        ' light-режим=' + (lightOk ? 'ок (raw совпадает, тяжёлое не пишем)' : 'СБОЙ') +
+        ' расхождений=' + pct.toFixed(3) + '%')
     }
   }
 
@@ -3021,7 +3077,7 @@ async function selftest() {
 
   LEARN_DIR = learnWas
   if (!CLI.debug) {
-    for (const d of ['selftest_e2e', 'selftest_learn', 'selftest']) {
+    for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest']) {
       try { fs.rmSync(path.join(REC_ROOT || __dirname, d), { recursive: true, force: true }) } catch (e) {}
     }
   } else console.log('  (--debug: артефакты самопроверки оставлены в ' + path.join(REC_ROOT || __dirname, 'selftest_learn') + ')')
@@ -3392,6 +3448,16 @@ async function runTelegramSession(ctx, captureFn) {
     return { ok: false, st }
   }
   st.me = me.result
+  if (FAST_CFG !== false && !FAST_MODE) {
+    FAST_MODE = true
+    tgLog('⚡ быстрый режим ВКЛ: пауза между раундами ' + FAST.pauseBetween + 'мс (вместо ' + PAUSE_BETWEEN_MS +
+      '), ожидание тишины ' + FAST.stableMs + 'мс (вместо ' + CAP.stableMs + '), добор ' + FAST.settleMs + 'мс (вместо ' + SETTLE_MS +
+      '), облегчённые файлы=' + FAST.lightFiles)
+  } else if (FAST_MODE) {
+    tgLog('⚡ быстрый режим ВКЛ (через config capture.fast=true)')
+  } else {
+    tgLog('быстрый режим ВЫКЛ (capture.fast=false) — паузы как в обычном прогоне')
+  }
   tgLog('бот @' + (me.result && me.result.username) + ' (id ' + (me.result && me.result.id) + ') | chat_id=' + TG.chatId +
     ' | транспорт=' + (tgTransport === 'direct' ? 'direct' : (tgTransport && tgTransport.name)))
   tgLog('база цифр: ' + store.size + ' ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет'))
@@ -3399,7 +3465,7 @@ async function runTelegramSession(ctx, captureFn) {
 
   await tgApi('getUpdates', { offset: -1, timeout: 0 })   // сброс старых апдейтов
 
-  await tgSendText('🟢 Бот запущен (v3.9.2)\n' +
+  await tgSendText('🟢 Бот запущен (v3.9.3)\n' +
     'В капче всегда ' + DIGITS_EXPECTED + ' цифр. Цель обучения: ' + TG.targetStreak + ' совпадений подряд.\n' +
     'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её создадут)') + '\n\n' +
     'Я присылаю картинку и СВОЁ ПРЕДСКАЗАНИЕ. Вы отвечаете правильными цифрами:\n' +
@@ -3417,7 +3483,12 @@ async function runTelegramSession(ctx, captureFn) {
         catch (e) { tgLog('❌ раунд ' + r + ': исключение при сборе: ' + ((e && e.message) || e)) }
         st.rounds++
         await q.push({ round: r, rec, ms: Date.now() - t0 })
-        if (!st.stop) tgLog('раунд ' + r + ' подготовлен за ' + Math.round((Date.now() - t0) / 1000) + 'с (в очереди заранее: ' + q.size + ')')
+        if (!st.stop) {
+          const tm = ctx.lastTimings || {}
+          tgLog('раунд ' + r + ' подготовлен за ' + ((Date.now() - t0) / 1000).toFixed(1) + 'с' +
+            ' (сеть ' + ((tm.net || 0) / 1000).toFixed(1) + 'с + сборка ' + ((tm.save || 0) / 1000).toFixed(1) + 'с)' +
+            ' | в очереди заранее: ' + q.size + '/' + TG.prefetch)
+        }
       }
     } catch (e) {
       tgLog('❌ производитель упал: ' + ((e && e.message) || e))
@@ -3891,18 +3962,23 @@ async function captureRound(r, ctx) {
       ctx.rotationsUsed++
       step('🔄 ротация IP (' + ctx.rotationsUsed + '/' + MAX_ROTATIONS_ON_FAIL + ')')
       await rotateIp(); await sleep(2500)
-    } else if (attempt > 1) await sleep(1500)
-    else await sleep(1000 + Math.floor(Math.random() * 1000))
+    } else if (attempt > 1) await sleep(FAST_MODE ? 300 : 1500)
+    else await sleep(FAST_MODE ? (FAST.preSleepMin + Math.floor(Math.random() * FAST.preSleepRnd)) : (1000 + Math.floor(Math.random() * 1000)))
 
-    step('--- РАУНД ' + r + '/' + TARGET_ROUNDS + ' (попытка ' + attempt + ', IP ' + (currentRunIp || '?') + ') ---')
+    step('--- РАУНД ' + r + (TG.ready ? '' : '/' + TARGET_ROUNDS) + ' (попытка ' + attempt + ', IP ' + (currentRunIp || '?') +
+      (FAST_MODE ? ', FAST' : '') + ') ---')
+    const tNet = Date.now()
     const res = await connectAndCapture('r' + r + 'a' + attempt)
+    const netMs = Date.now() - tNet
     lastNetFail = !!(res && !res.ok && NET_FAIL_RE.test(res.note || ''))
     lastNote = res ? res.note : '?'
 
     if (res && res.ok) {
       ctx.consecutiveNetFails = 0; ctx.proxyFails = 0
       const dir = path.join(REC_ROOT, 'round' + String(r).padStart(2, '0') + '_a' + attempt + '_' + STAMP)
-      const candidate = await saveRecord(dir, res.snap, 'РАУНД' + r, r)
+      const tSave = Date.now()
+      const candidate = await saveRecord(dir, res.snap, 'РАУНД' + r, r, { light: FAST_MODE && FAST.lightFiles })
+      ctx.lastTimings = { net: netMs, save: Date.now() - tSave }
       if (candidate) {
         const need = Math.max(CAP.minTiles, Math.ceil(candidate.tilesExpected * MIN_TILES_FRACTION))
         if (candidate.tilesCount >= Math.min(need, candidate.tilesExpected)) rec = candidate
@@ -3932,7 +4008,7 @@ async function captureRound(r, ctx) {
     ctx.results.push({ n: r, ok: false, note: lastNote || 'fail' })
     step('РАУНД ' + r + ' ❌ провален (' + (lastNote || 'fail') + ')')
   }
-  if (r < TARGET_ROUNDS && !ctx.aborted) await sleep(PAUSE_BETWEEN_MS)
+  if (!ctx.aborted) await sleep(FAST_MODE ? FAST.pauseBetween : PAUSE_BETWEEN_MS)
   return rec
 }
 
@@ -3943,7 +4019,7 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.9.2 ===')
+  step('=== СТАРТ v3.9.3 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
@@ -4008,7 +4084,7 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.9.2) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.9.3) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
@@ -4031,7 +4107,7 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.9.2', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.9.3', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
