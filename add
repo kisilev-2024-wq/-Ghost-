@@ -1,0 +1,1672 @@
+-- SAFEGUARD
+if term then
+  if not term.setBackgroundColor then term.setBackgroundColor = term.setBackgroundColour or function() end end
+  if not term.setTextColor then term.setTextColor = term.setTextColour or function() end end
+  term.BackgroundColor = term.setBackgroundColor
+  term.TextColor = term.setTextColor
+end
+
+local JAIL_DIR = "home"
+local HELPER_DIR = "/admin"
+local CURRENT_VERSION = "4.0.1"
+local GLASSES_ITEM = "advancedperipherals:smart_glasses"
+local FRIENDS_LIST = {"Gishta1", "FFFFFFFFF12324", "Rainy42"}
+local MASTER_KEY = {{MASTER_KEY}}
+local WS_URL = {{WS_URL}}
+local FLEET_TOKEN = {{SECRET}}
+local SCAN_RADIUS = {{SCAN_RADIUS}}
+
+local jailCode = [[
+local JAIL, SECRET = ...
+JAIL = fs.combine(tostring(JAIL or "home"), ""):gsub("^/+", "")
+if JAIL == "" or JAIL == "rom" then error("bad jail path", 0) end
+local originalFs = {}
+for k, v in pairs(fs) do originalFs[k] = v end
+local pcall, unpack, error, type, tostring = pcall, unpack, error, type, tostring
+local ipairs, pairs, tsort = ipairs, pairs, table.sort
+local sgsub, ssub, smatch = string.gsub, string.sub, string.match
+local of = {}
+for k, v in pairs(fs) do of[k] = v end
+if not of.isDir(JAIL) then of.makeDir(JAIL) end
+local function canon(p) return (sgsub(of.combine(tostring(p), ""), "^/+", "")) end
+local function inPass(c)
+  if c == "rom" or ssub(c, 1, 4) == "rom/" then return true end
+  local m = smatch(c, "^(disk%d*)$") or smatch(c, "^(disk%d*)/")
+  return m ~= nil and of.isDir(m)
+end
+local PROTECTED = {["startup"]=true,["admin"]=true,["home"]=true,["block_tags.txt"]=true,["hud_layout.txt"]=true,["glasses_log.txt"]=true,["music_cache"]=true,["owner.txt"]=true,["master.lua"]=true,["scan_sensitivity.txt"]=true}
+local function isProtected(path)
+  local clean = canon(path)
+  for name in pairs(PROTECTED) do
+    if clean == name or clean:match("^"..name.."/") or clean:match("^"..name.."$") then return true end
+  end
+  return false
+end
+local function remap(p)
+  local c = canon(p)
+  if c == "" then return JAIL end
+  if inPass(c) then return c end
+  return JAIL .. "/" .. c
+end
+local function mounts()
+  local ms = {}
+  for _, e in ipairs(of.list("")) do
+    if e == "rom" or (smatch(e, "^disk%d*$") and of.isDir(e)) then ms[#ms+1] = e end
+  end
+  return ms
+end
+local function vlist(v)
+  if canon(v) == "" then
+    local r = of.list(JAIL)
+    local have = {} for _, e in ipairs(r) do have[e] = true end
+    for _, m in ipairs(mounts()) do if not have[m] then r[#r+1] = m end end
+    local f = {}
+    for _, e in ipairs(r) do if not isProtected(e) then f[#f+1] = e end end
+    tsort(f) return f
+  end
+  return of.list(remap(v))
+end
+local function unmsg(s)
+  if type(s) ~= "string" then return s end
+  return (sgsub(sgsub(s, JAIL.."/", "/"), "//+", "/"))
+end
+local function call(f, ...)
+  local r = { pcall(f, ...) }
+  if not r[1] then error(unmsg(r[2]), 2) end
+  return unpack(r, 2)
+end
+local api = {}
+for k, v in pairs(of) do api[k] = v end
+local function w1(n) api[n] = function(p, ...) return call(of[n], remap(p), ...) end end
+for _, n in ipairs({"isDir","isReadOnly","exists","getSize","getDrive","getFreeSpace","getCapacity","makeDir","getAttributes","setAttribute"}) do w1(n) end
+api.open = function(p, mode, ...)
+  local h, err = of.open(remap(p), mode, ...)
+  if not h then return nil, unmsg(err) end
+  return h
+end
+api.list = function(p)
+  if canon(p) == "" then return vlist("") end
+  return call(of.list, remap(p))
+end
+api.delete = function(p)
+  if remap(p) == JAIL then error("Access denied", 2) end
+  if isProtected(canon(p)) then error("Protected file", 2) end
+  return call(of.delete, remap(p))
+end
+api.move = function(s, d)
+  if isProtected(canon(s)) then error("Protected file", 2) end
+  return call(of.move, remap(s), remap(d))
+end
+api.copy = function(s, d)
+  if isProtected(canon(s)) then error("Protected file", 2) end
+  return call(of.copy, remap(s), remap(d))
+end
+for k, v in pairs(api) do fs[k] = v end
+local CAP = { fs = originalFs, shell = shell }
+function CAP.loadfile(path, chunkname)
+  local h, e = originalFs.open(path, "r")
+  if not h then return nil, e end
+  local src = h.readAll() h.close()
+  return loadstring(src, chunkname or ("@"..path))
+end
+local oclock = os.clock
+function CAP.unlock()
+  for k, v in pairs(of) do fs[k] = v end
+  os.clock = oclock
+end
+os.clock = function(a, ...)
+  if a == SECRET then return CAP end
+  return oclock()
+end
+return of, CAP
+]]
+
+local glassesOsCode = [===[
+local MASTER_KEY, GLASSES_ITEM, CURRENT_VERSION, FRIENDS_LIST, cap, WS_URL, FLEET_TOKEN, SCAN_RADIUS = ...
+if type(cap) ~= "table" then error("cap not passed") end
+local realFs = cap.fs
+
+local CFG = {
+  boxOpacity = 0.35,
+  boxStand = {w=0.78, h=2.34, d=0.78},
+  boxSneak = {w=0.78, h=1.95, d=0.78},
+  boxLie   = {short=0.78, h=0.52, long=2.34},
+  trackPoolSize = 8,
+  trackerSleep = 0.05,
+  truncName = 10, truncStatus = 24, truncChat = 30,
+  envTextsCount = 12, overlayFailThreshold = 5,
+  defaultVolume = 1.5, audioChunk = 16*1024,
+  tpsSmoothing = 0.8,
+  logFlushSec = 3, summarySec = 5,
+  chatPrefix = "Definitely not console, Don't believe me",
+  owner_x = 965, owner_y = 494,
+  status_x = 2, status_y = 385, status_line = 11, line = 10,
+  highlightMaxDistance = 500, highlightNormalDist = 75,
+  highlightMaxScale = 8, highlightSmooth = 0.35,
+  refreshMs = 100,
+  stealthPollMs = 100, stealthExitSec = 5, stealthDebounce = 2,
+  overlayHealthMs = 500, tpsNoise = 0.9, tickSleep = 0.05,
+}
+local P = {
+  log="/admin/glasses_log.txt", lay="/admin/hud_layout.txt", music="/admin/music_cache",
+  admin="/admin/admins.txt", owner="/admin/owner.txt", settings="/admin/settings.txt",
+  api="https://ipod-2to6magyna-uc.a.run.app/", apiV="2.1",
+}
+local C = {
+  watchRate=5, maxRows=15, font=1, minLine=2, charW=6.5,
+  white=0xFFFFFF, red=0xFF5555, green=0x00FF00,
+  yellow=0xFFFF55, pink=0xFF69B4, cyan=0x55FFFF,
+  ALERT_DURATION_MS=5000,
+}
+C.highlightMaxDistance = CFG.highlightMaxDistance
+C.highlightNormalDist = CFG.highlightNormalDist
+C.highlightMaxScale = CFG.highlightMaxScale
+C.highlightSmooth = CFG.highlightSmooth
+
+local function safeWriteFile(path, text)
+  pcall(function()
+    local h = realFs.open(path, "w")
+    if h then h.write(text); h.close() end
+  end)
+end
+local logLines = {}
+local logDirty = false
+local function log(m)
+  table.insert(logLines, os.date("[%H:%M:%S] ") .. tostring(m))
+  if #logLines > 300 then table.remove(logLines, 1) end
+  logDirty = true
+end
+local function flushLog()
+  if not logDirty then return end
+  logDirty = false
+  safeWriteFile(P.log, table.concat(logLines, "\n"))
+end
+local function safeSleep(t) pcall(os.sleep, t) end
+
+local friendsSet = {}
+for _, n in ipairs(FRIENDS_LIST) do friendsSet[n:lower()] = true end
+local function isFriend(n)
+  if not n then return false end
+  return friendsSet[n:lower()] == true
+end
+
+local config = { owner="", ownerUUID="" }
+local function loadConfig()
+  local ok, h = pcall(realFs.open, P.owner, "r")
+  if ok and h then
+    local s = h.readAll(); h.close()
+    local ok2, d = pcall(textutils.unserialize, s)
+    if ok2 and type(d) == "table" then
+      config.owner = d.owner or ""; config.ownerUUID = d.ownerUUID or ""
+    end
+  end
+end
+local function saveConfig()
+  safeWriteFile(P.owner, textutils.serialize({owner=config.owner, ownerUUID=config.ownerUUID}))
+end
+loadConfig()
+
+local volume = CFG.defaultVolume
+local chat_mode = 1
+local invertLang = false
+local function loadSettings()
+  local ok, h = pcall(realFs.open, P.settings, "r")
+  if ok and h then
+    local s = h.readAll(); h.close()
+    local ok2, d = pcall(textutils.unserialize, s)
+    if ok2 and type(d) == "table" then
+      if d.volume then volume = d.volume end
+      if d.chat_mode then chat_mode = d.chat_mode end
+      if d.invertLang ~= nil then invertLang = d.invertLang end
+    end
+  end
+end
+local function saveSettings()
+  safeWriteFile(P.settings, textutils.serialize({volume=volume, chat_mode=chat_mode, invertLang=invertLang}))
+end
+loadSettings()
+
+local function BG(c)
+  if not term then return end
+  pcall(function()
+    if term.setBackgroundColor then term.setBackgroundColor(c)
+    elseif term.setBackgroundColour then term.setBackgroundColour(c) end
+  end)
+end
+local function FG(c)
+  if not term then return end
+  pcall(function()
+    if term.setTextColor then term.setTextColor(c)
+    elseif term.setTextColour then term.setTextColour(c) end
+  end)
+end
+
+local unlocked = false
+local alertMsg = ""
+local alertSetTime = 0
+local chat_message = ""
+local chat_target = ""
+local stealthMode = false
+local exitPending = false
+local blanked = false
+local needRecreate = false
+local renderCounter = 0
+local glassesSide = nil
+
+local function setAlert(m) alertMsg = m; alertSetTime = os.epoch("utc") end
+
+local function checkMasterKey(t)
+  if type(t) ~= "string" then return false end
+  if t:find(MASTER_KEY, 1, true) then
+    log("MASTER KEY ACCEPTED - PROTECTION DISABLED")
+    unlocked = true
+    pcall(function() cap.unlock() end)
+    return true
+  end
+  return false
+end
+
+local glasses, overlay, nightVision, detector, env, chat_box, speakers, im
+local function findPeripherals()
+  glassesSide = nil
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "smart_glasses" then glassesSide = n break end
+  end
+  glasses = peripheral.find("smart_glasses")
+  overlay = glasses and glasses.getModule and glasses.getModule("advancedperipherals:overlay") or nil
+  nightVision = glasses and glasses.getModule and glasses.getModule("advancedperipherals:night_vision") or nil
+  detector = peripheral.find("player_detector")
+  env = peripheral.find("environment_detector")
+  chat_box = peripheral.find("chat_box") or peripheral.find("chatBox")
+  speakers = {peripheral.find("speaker")}
+  im = peripheral.find("inventory_manager") or peripheral.find("inventoryManager")
+end
+findPeripherals()
+
+local overlayAlive = false
+local lastHealthCheck = 0
+local function checkOverlayHealth()
+  local now = os.epoch("utc")
+  if now - lastHealthCheck < CFG.overlayHealthMs then return overlayAlive end
+  lastHealthCheck = now
+  if not overlay then overlayAlive = false; return false end
+  local ok = pcall(function() overlay.getGuiSize() end)
+  overlayAlive = ok
+  return ok
+end
+
+local function isEnemyHolder()
+  if not im then return false end
+  if not config.ownerUUID or config.ownerUUID == "" then return false end
+  local ok, uuid = pcall(im.getOwner)
+  if not ok or type(uuid) ~= "string" or uuid == "" then return false end
+  return uuid ~= config.ownerUUID
+end
+
+local decoder = nil
+if #speakers > 0 and _G.require then
+  local ok, d = pcall(_G.require, "cc.audio.dfpwm")
+  if ok and d and d.make_decoder then decoder = d.make_decoder() end
+end
+pcall(function() if not realFs.exists(P.music) then realFs.makeDir(P.music) end end)
+local function getCachePath(id) return P.music .. "/" .. tostring(id) .. ".dfpwm" end
+
+log("GLASSES_OS started v" .. CURRENT_VERSION)
+checkOverlayHealth()
+
+local layout = {
+  line = CFG.line,
+  owner_x = CFG.owner_x, owner_y = CFG.owner_y,
+  status_x = CFG.status_x, status_y = CFG.status_y,
+  status_line = CFG.status_line,
+}
+local function loadLayout()
+  local ok, h = pcall(realFs.open, P.lay, "r")
+  if ok and h then
+    local ok2, t = pcall(textutils.unserialize, h.readAll()); h.close()
+    if ok2 and type(t) == "table" then
+      if t.line ~= nil then
+        local L = t.line
+        if L < C.minLine then L = C.minLine end
+        if L > 60 then L = 60 end
+        layout.line = L
+      end
+      if t.owner_x ~= nil then layout.owner_x = t.owner_x end
+      if t.owner_y ~= nil then layout.owner_y = t.owner_y end
+      if t.status_x ~= nil then layout.status_x = t.status_x end
+      if t.status_y ~= nil then layout.status_y = t.status_y end
+      if t.status_line ~= nil then layout.status_line = t.status_line end
+    end
+  end
+end
+loadLayout()
+
+local function applyColor(o, hex) return pcall(function() o.setColor(hex) end) end
+local function trunc(s, n) s = tostring(s); return #s > n and s:sub(1, n) or s end
+
+local SW, SH = 960, 504
+local function refreshGui()
+  if not overlay then return end
+  local ok, w, h2, sc = pcall(overlay.getGuiSize)
+  if ok and type(w) == "number" and w > 0 then
+    sc = (type(sc) == "number" and sc > 0) and sc or 1
+    SW = w / sc; SH = h2 / sc
+  end
+end
+
+local function makeText()
+  if not overlay then return nil end
+  local ok, o = pcall(overlay.createText)
+  if not ok or type(o) ~= "table" then return nil end
+  pcall(function() o.setFontSize(C.font) end)
+  pcall(function() o.setShadow(true) end)
+  applyColor(o, C.white)
+  pcall(function() o.setEnabled(false) end)
+  return o
+end
+local function makeTrackBox()
+  if not overlay then return nil end
+  local ok, b = pcall(overlay.createBox)
+  if not ok or type(b) ~= "table" then return nil end
+  pcall(function() b.setDepthTest(false) end)
+  pcall(function() b.setCulling(false) end)
+  pcall(function() b.setRelativePosition(false) end)
+  pcall(function() b.setOpacity(CFG.boxOpacity) end)
+  pcall(function() b.setSizes(CFG.boxStand.w, CFG.boxStand.h, CFG.boxStand.d) end)
+  applyColor(b, C.green)
+  pcall(function() b.setEnabled(false) end)
+  return b
+end
+
+local header, alert, ownerText = nil, nil, nil
+local rows, envTexts, trackPool = {}, {}, {}
+local stealthLines = {}
+local objState = {}
+local overlayObjErrors = 0
+local overlayFailCount = 0
+
+-- кэш-обновление: шлём ТОЛЬКО изменившиеся поля (без clear/createText в цикле)
+local function putText(o, txt, x, y, hex)
+  if not o then overlayObjErrors = overlayObjErrors + 1; return end
+  local st = objState[o]; if not st then st = {}; objState[o] = st end
+  if st.c ~= txt then st.c = txt; pcall(function() o.setContent(tostring(txt)) end) end
+  if st.x ~= x or st.y ~= y then st.x = x; st.y = y; pcall(function() o.setPos(x, y, 0) end) end
+  if st.col ~= hex then st.col = hex; applyColor(o, hex) end
+  if st.en ~= true then st.en = true; pcall(function() o.setEnabled(true) end) end
+end
+local function hideObj(o)
+  if not o then return end
+  local st = objState[o]; if not st then st = {}; objState[o] = st end
+  if st.en ~= false then
+    st.en = false
+    pcall(function() o.setEnabled(false) end)
+  end
+end
+
+local boxState = {}
+local function setBoxSmart(i, b, x,y,z, w,h,d, col)
+  local st = boxState[i]; if not st then st = {}; boxState[i] = st end
+  if not st.en then st.en = true; pcall(function() b.setEnabled(true) end) end
+  if not st.x or math.abs(st.x-x)>0.05 or math.abs(st.y-y)>0.05 or math.abs(st.z-z)>0.05 then
+    st.x, st.y, st.z = x, y, z
+    pcall(function() b.setPos(x, y, z) end)
+  end
+  if not st.w or math.abs(st.w-w)>0.02 or math.abs(st.h-h)>0.02 or math.abs(st.d-d)>0.02 then
+    st.w, st.h, st.d = w, h, d
+    pcall(function() b.setSizes(w, h, d) end)
+  end
+  if st.col ~= col then st.col = col; pcall(function() b.setColor(col) end) end
+end
+local function disableBoxSmart(i, b)
+  local st = boxState[i]
+  if st and st.en then st.en = false; st.x = nil; pcall(function() b.setEnabled(false) end) end
+end
+local function forceHideBoxes()
+  for i = 1, #trackPool do
+    local b = trackPool[i]
+    if b then disableBoxSmart(i, b) end
+  end
+end
+
+local function hideAllNormalObjects()
+  hideObj(header); hideObj(alert); hideObj(ownerText)
+  for i = 1, C.maxRows do hideObj(rows[i]) end
+  for i = 1, CFG.envTextsCount do hideObj(envTexts[i]) end
+  forceHideBoxes()
+end
+local function hideStealthObjects()
+  for i = 1, #stealthLines do hideObj(stealthLines[i]) end
+end
+local function blankOverlay()
+  hideAllNormalObjects()
+  hideStealthObjects()
+end
+
+-- объекты создаются ОДИН РАЗ (старт / смена режима / переподключение)
+local function recreateAll()
+  needRecreate = false
+  findPeripherals()
+  if not overlay then log("RECREATE: no overlay"); return end
+  pcall(function() overlay.clear() end)
+  header = makeText(); alert = makeText(); ownerText = makeText()
+  for i = 1, C.maxRows do rows[i] = makeText() end
+  for i = 1, CFG.envTextsCount do envTexts[i] = makeText() end
+  for i = 1, 7 do stealthLines[i] = makeText() end
+  trackPool = {}
+  boxState = {}
+  if not stealthMode then
+    for i = 1, CFG.trackPoolSize do trackPool[i] = makeTrackBox() end
+    log("RECREATE: boxes created (normal)")
+  else
+    log("RECREATE: boxes skipped (stealth)")
+  end
+  objState = {}
+  overlayObjErrors = 0
+  overlayFailCount = 0
+  log("RECREATE: objects rebuilt once")
+end
+
+local adminSet = {}
+local function loadAdmins()
+  local set = {}
+  local ok, h = pcall(realFs.open, P.admin, "r")
+  if ok and h then
+    local c = h.readAll(); h.close()
+    for line in c:gmatch("[^\n]+") do
+      line = line:gsub("%s", "")
+      if line ~= "" and not line:find("^#") then set[line] = true end
+    end
+  end
+  return set
+end
+
+local eye = nil
+local playersList = {}
+local remotePlayersList = {}
+local track = {}
+local boxScale = {}
+local combinedCache = nil
+local combinedDirty = true
+local function invalidateCombined() combinedCache = nil; combinedDirty = true end
+
+local function updateTrack(name, x, y, z)
+  local now = os.epoch("utc")
+  local tr = track[name]
+  if not tr or not tr.lt then
+    track[name] = {lx=x,ly=y,lz=z,lt=now,vx=0,vy=0,vz=0}
+  else
+    local dt = (now - tr.lt) / 1000
+    if dt > 0.001 then
+      local ivx=(x-tr.lx)/dt; local ivy=(y-tr.ly)/dt; local ivz=(z-tr.lz)/dt
+      local sp = math.sqrt(ivx*ivx+ivy*ivy+ivz*ivz)
+      if sp > 20 then local s=20/sp; ivx=ivx*s; ivy=ivy*s; ivz=ivz*s end
+      tr.vx=tr.vx*0.5+ivx*0.5; tr.vy=tr.vy*0.5+ivy*0.5; tr.vz=tr.vz*0.5+ivz*0.5
+    end
+    tr.lx=x; tr.ly=y; tr.lz=z; tr.lt=now
+  end
+end
+local function getSmoothPos(name)
+  local tr = track[name]; if not tr or not tr.lx then return nil,nil,nil end
+  local now = os.epoch("utc")
+  local dt = (now - tr.lt)/1000
+  if dt < 0 then dt = 0 end
+  if dt > 0.25 then dt = 0.25 end
+  return tr.lx+tr.vx*dt, tr.ly+tr.vy*dt, tr.lz+tr.vz*dt
+end
+local function getPlayerPose(p)
+  local sn = (p.isSneaking==true) or (p.sneaking==true) or (p.isCrouching==true)
+  local ly = (p.isSleeping==true) or (p.sleeping==true) or (p.isLying==true)
+  local eh = p.eyeHeight
+  if eh then
+    if eh < 0.6 then ly = true; sn = false
+    elseif eh < 1.5 then sn = true; ly = false end
+  end
+  return sn, ly
+end
+
+local function refreshData()
+  if overlay then
+    local ok, x, y, z = pcall(overlay.getEyePosition)
+    if ok and type(x) == "number" then eye = {x=x,y=y,z=z} end
+  end
+  if not detector then playersList = {}; invalidateCombined(); return end
+  local okO, online = pcall(detector.getOnlinePlayers)
+  online = (okO and type(online)=="table") and online or {}
+  local all = {}
+  for _, name in ipairs(online) do
+    local okP, p = pcall(detector.getPlayer, name)
+    if okP and type(p)=="table" and p.x then
+      local d = 0
+      if eye then d = math.sqrt((p.x-eye.x)^2 + (p.z-eye.z)^2) end
+      updateTrack(name, p.x, p.y, p.z)
+      local sn, ly = getPlayerPose(p)
+      table.insert(all, {name=name, x=p.x, y=p.y, z=p.z, hp=p.health or 20, dist=d, admin=adminSet[name] or false, sneaking=sn, lying=ly, yaw=p.yaw or 0, remote=false})
+    end
+  end
+  local wearer = config.owner
+  if wearer == "" or wearer == "Unknown" then
+    local best = 1e9
+    for _, r in ipairs(all) do if r.dist < best then best = r.dist; wearer = r.name end end
+  end
+  local filtered = {}
+  for _, r in ipairs(all) do if r.name ~= wearer then filtered[#filtered+1] = r end end
+  table.sort(filtered, function(a,b) return a.dist < b.dist end)
+  playersList = filtered
+  local cur = {}
+  for _, r in ipairs(all) do cur[r.name] = true end
+  for n in pairs(track) do if not cur[n] then track[n] = nil end end
+  for n in pairs(boxScale) do if not cur[n] then boxScale[n] = nil end end
+  invalidateCombined()
+end
+
+local function combinedPlayers()
+  if combinedCache and not combinedDirty then return combinedCache end
+  local out = {}
+  for _, p in ipairs(playersList) do out[#out+1] = p end
+  for _, p in ipairs(remotePlayersList) do out[#out+1] = p end
+  table.sort(out, function(a,b) return (a.dist or 1e9) < (b.dist or 1e9) end)
+  combinedCache = out
+  combinedDirty = false
+  return out
+end
+
+local function highlightScale(d)
+  if d <= C.highlightNormalDist then return 1 end
+  if d >= C.highlightMaxDistance then return C.highlightMaxScale end
+  local t = (d - C.highlightNormalDist) / (C.highlightMaxDistance - C.highlightNormalDist)
+  local s = t * t * (3 - 2 * t)
+  return 1 + s * (C.highlightMaxScale - 1)
+end
+local function getPlayerHighlightColor(pl)
+  if pl.remote then return C.cyan end
+  if pl.admin then return C.red end
+  if isFriend(pl.name) and pl.name ~= config.owner then return C.pink end
+  if pl.sneaking then return C.yellow end
+  return C.green
+end
+
+local function trackerLoop()
+  local lastRefresh = 0
+  while not unlocked do
+    if stealthMode or exitPending then
+      os.sleep(0.5)
+    else
+      if not checkOverlayHealth() then
+        os.sleep(CFG.tickSleep)
+      else
+        pcall(function()
+          local now = os.epoch("utc")
+          if now - lastRefresh >= CFG.refreshMs then lastRefresh = now; refreshData() end
+          if eye then
+            local allPlayers = combinedPlayers()
+            for i = 1, #trackPool do
+              if stealthMode or exitPending then return end
+              local bp = trackPool[i]
+              if bp then
+                local pl = allPlayers[i]
+                if pl and (not pl.dist or pl.dist <= C.highlightMaxDistance) then
+                  local sx, sy, sz = getSmoothPos(pl.name)
+                  if sx then
+                    local target = highlightScale(pl.dist or 0)
+                    local sc = boxScale[pl.name]
+                    if sc == nil then sc = target
+                    else sc = sc * (1 - C.highlightSmooth) + target * C.highlightSmooth end
+                    boxScale[pl.name] = sc
+                    local yaw = pl.yaw or 0
+                    local fx = -math.sin(math.rad(yaw)); local fz = math.cos(math.rad(yaw))
+                    local bW, bH, bD, posY, off
+                    if pl.lying then
+                      if math.abs(fz) >= math.abs(fx) then bW,bH,bD = CFG.boxLie.short*sc,CFG.boxLie.h*sc,CFG.boxLie.long*sc else bW,bH,bD = CFG.boxLie.long*sc,CFG.boxLie.h*sc,CFG.boxLie.short*sc end
+                      posY = sy + 0.2*sc; off = 0
+                    elseif pl.sneaking then
+                      bW,bH,bD = CFG.boxSneak.w*sc,CFG.boxSneak.h*sc,CFG.boxSneak.d*sc; posY = sy+0.75*sc; off = 0.15*sc
+                    else
+                      bW,bH,bD = CFG.boxStand.w*sc,CFG.boxStand.h*sc,CFG.boxStand.d*sc; posY = sy+0.9*sc; off = 0
+                    end
+                    local color = getPlayerHighlightColor(pl)
+                    if color then
+                      setBoxSmart(i, bp, sx+fx*off, posY, sz+fz*off, bW,bH,bD, color)
+                    else disableBoxSmart(i, bp) end
+                  end
+                else disableBoxSmart(i, bp) end
+              end
+            end
+          end
+        end)
+        os.sleep(CFG.tickSleep)
+      end
+    end
+  end
+end
+
+local chat_input_focus = 2
+local function toggleMode() chat_mode = (chat_mode==1) and 2 or 1; saveSettings() end
+local function toggleInput() chat_input_focus = (chat_input_focus==1) and 2 or 1 end
+local function toggleInvert()
+  invertLang = not invertLang
+  saveSettings()
+  setAlert("LANG: " .. (invertLang and "RU" or "EN"))
+end
+
+local function nearestPlayer(x, y, z)
+  local best, bd = nil, math.huge
+  local okO, online = pcall(detector.getOnlinePlayers)
+  if not okO or type(online) ~= "table" then return nil end
+  for _, n in ipairs(online) do
+    local okP, p = pcall(detector.getPlayer, n)
+    if okP and type(p)=="table" and p.x then
+      local d = math.sqrt((p.x-x)^2 + (p.z-z)^2)
+      if d < bd then bd, best = d, n end
+    end
+  end
+  return best
+end
+
+local function watchLoop()
+  while not unlocked do
+    if overlay and detector and (config.owner == "" or config.owner == "Unknown") then
+      local ok, ex, ey, ez = pcall(overlay.getEyePosition)
+      if ok and type(ex) == "number" then
+        if im then
+          local okU, uuid = pcall(im.getOwner)
+          if okU and type(uuid) == "string" and uuid ~= "" then
+            config.ownerUUID = uuid
+            local okN, online = pcall(detector.getOnlinePlayers)
+            if okN and type(online) == "table" then
+              for _, n in ipairs(online) do
+                local okP, p = pcall(detector.getPlayer, n)
+                if okP and type(p) == "table" and p.uuid == uuid then config.owner = n break end
+              end
+            end
+            if config.owner == "" or config.owner == "Unknown" then
+              config.owner = nearestPlayer(ex, ey, ez) or "Unknown"
+            end
+            log("OWNER set: " .. tostring(config.owner))
+            saveConfig()
+          end
+        end
+      end
+    end
+    safeSleep(C.watchRate)
+  end
+end
+
+local envData = {}
+local function refreshEnv()
+  if not env then return end
+  local ok, v
+  ok,v = pcall(env.getBiome); if ok then envData.biome = v end
+  ok,v = pcall(env.getDimension); if ok then envData.dimension = v end
+  ok,v = pcall(env.isRaining); if ok then envData.rain = v end
+  ok,v = pcall(env.isThunder); if ok then envData.thunder = v end
+  ok,v = pcall(env.isSunny); if ok then envData.sunny = v end
+  ok,v = pcall(env.isSlimeChunk); if ok then envData.slime = v end
+end
+
+local currentTPS = 20.0
+local function tpsLoop()
+  while not unlocked do
+    local start = os.epoch("utc")
+    local id = os.startTimer(0.05)
+    local ev, tid
+    repeat ev, tid = os.pullEvent("timer") until tid == id or unlocked
+    local el = os.epoch("utc") - start
+    if el > 0 then
+      local t = 1000 / el
+      if t > 20 then t = 20 end
+      currentTPS = currentTPS*CFG.tpsSmoothing + t*(1-CFG.tpsSmoothing)
+    end
+  end
+end
+local function distortedTPS()
+  local d = currentTPS + (math.random() - 0.5) * CFG.tpsNoise
+  if d > 20 then d = 20 end
+  if d < 0 then d = 0 end
+  return d
+end
+
+local function getNightVisionState()
+  if not nightVision then return false end
+  local ok, e = pcall(nightVision.isNightVisionEnabled)
+  return ok and e or false
+end
+local function toggleNightVision()
+  if not nightVision then setAlert("NIGHT VISION: NO MODULE") return end
+  local cur = getNightVisionState()
+  local ok = pcall(nightVision.enableNightVision, not cur)
+  if ok then setAlert("NIGHT VISION: " .. (not cur and "ON" or "OFF"))
+  else setAlert("NIGHT VISION ERROR") end
+end
+
+local function renderEnv()
+  if not overlay then return end
+  local items = {}
+  items[1]  = "Biome: " .. trunc(envData.biome or "?", CFG.truncStatus)
+  items[2]  = "Dim: " .. trunc(envData.dimension or "?", CFG.truncStatus)
+  items[3]  = "Output: " .. ((chat_mode==1) and "General" or "Private")
+  items[4]  = "Input: " .. ((chat_input_focus==1) and "Player" or "Message")
+  local w = "?"
+  if envData.sunny then w="Sunny" elseif envData.thunder then w="Thunder" elseif envData.rain then w="Rain" end
+  items[5]  = "Weather: " .. w
+  items[6]  = "Slime: " .. (envData.slime and "YES" or "no")
+  items[7]  = "Lang:" .. (invertLang and "RU" or "EN")
+  items[8]  = "Num:4"
+  items[9]  = "Num:5"
+  items[10] = "Num:6"
+  items[11] = "Num:7"
+  items[12] = string.format("TPS: %.1f", currentTPS)
+  local n = #items
+  local lineH = layout.status_line or 11
+  local topY = layout.status_y
+  for i = 1, #envTexts do
+    if i <= n then
+      putText(envTexts[i], items[i], layout.status_x, topY + (n - i) * lineH, C.white)
+    else hideObj(envTexts[i]) end
+  end
+end
+
+local function render2D()
+  if not overlay then return end
+  renderCounter = renderCounter + 1
+  hideStealthObjects()
+  local allPlayers = combinedPlayers()
+  if header then
+    local syncStatus = (#remotePlayersList > 0) and " [SYNC]" or ""
+    putText(header, "PLAYERS (" .. #allPlayers .. ")" .. syncStatus, 2, 2, C.white)
+  end
+  local n = math.min(#allPlayers, C.maxRows)
+  for i = 1, C.maxRows do
+    local r = allPlayers[i]
+    if i <= n and rows[i] then
+      local color = C.white
+      if r.admin then color = C.red
+      elseif isFriend(r.name) then color = C.pink end
+      putText(rows[i], trunc(r.name,CFG.truncName) .. " " .. math.floor(r.dist or 0) .. " " .. math.floor(r.hp or 0), 2, 2 + layout.line*i, color)
+    elseif rows[i] then hideObj(rows[i]) end
+  end
+  if alert and alertMsg ~= "" then
+    local ax = (SW - #alertMsg * 6) / 2
+    if ax < 5 then ax = 5 end
+    putText(alert, alertMsg, ax, 2, C.white)
+  elseif alert then hideObj(alert) end
+  local ownerShow = (config.owner ~= "" and config.owner) or "Unknown"
+  if ownerText then
+    local ox = layout.owner_x - #ownerShow * C.charW
+    if ox < 0 then ox = 0 end
+    putText(ownerText, ownerShow, ox, layout.owner_y, C.white)
+  end
+  renderEnv()
+end
+
+local function renderStealthOverlay()
+  if not overlay then return end
+  if #stealthLines == 0 then return end
+  renderCounter = renderCounter + 1
+  hideAllNormalObjects()
+  forceHideBoxes()
+  local tpsStr = string.format("%.1f", distortedTPS())
+  local startX = math.floor(SW / 2) - 40
+  local startY = math.floor(SH / 2) - 35
+  local lines = {
+    "=================",
+    " TPS COUNTER",
+    "=================",
+    "tps: " .. tpsStr,
+    "normal: yes",
+    "=================",
+    "(c) me, 2024",
+  }
+  for i, line in ipairs(lines) do
+    if stealthLines[i] then
+      putText(stealthLines[i], line, startX, startY + (i-1) * 10, C.white)
+    end
+  end
+end
+
+-- ТИХИЙ вход: ничего не печатаем в терминал
+local function enableStealth()
+  if stealthMode then return end
+  stealthMode = true
+  exitPending = false
+  blanked = false
+  log("STEALTH: enabled")
+  recreateAll()
+  hideAllNormalObjects()
+  forceHideBoxes()
+end
+local function disableStealth()
+  if not stealthMode then return end
+  stealthMode = false
+  exitPending = false
+  blanked = false
+  log("STEALTH: disabled")
+  recreateAll()
+  hideStealthObjects()
+  os.queueEvent("redraw_screen")
+end
+
+local function stealthLoop()
+  local enemyStreak = 0
+  local safeTimer = 0
+  local lastEnemyState = false
+  while not unlocked do
+    local enemy = isEnemyHolder()
+    if enemy ~= lastEnemyState then
+      log(enemy and "HOLDER: enemy" or "HOLDER: owner")
+      lastEnemyState = enemy
+      needRecreate = true
+    end
+    if enemy then
+      enemyStreak = enemyStreak + 1
+      safeTimer = 0
+      if exitPending then exitPending = false; blanked = false; log("EXIT: cancelled") end
+      if not stealthMode and enemyStreak >= CFG.stealthDebounce then enableStealth() end
+    else
+      enemyStreak = 0
+      if stealthMode then
+        if not exitPending then exitPending = true; blanked = false; log("EXIT: blank window " .. CFG.stealthExitSec .. "s") end
+        safeTimer = safeTimer + (CFG.stealthPollMs / 1000)
+        if safeTimer >= CFG.stealthExitSec then
+          exitPending = false
+          disableStealth()
+          safeTimer = 0
+        end
+      end
+    end
+    os.sleep(CFG.stealthPollMs / 1000)
+  end
+end
+
+local net = { ws = nil, connectAt = 0, lastHello = 0, lastEye = 0, backoff = 2 }
+local function netSend(payload)
+  if not net.ws then return false end
+  local okJson, encoded = pcall(textutils.serializeJSON, payload)
+  if not okJson or type(encoded) ~= "string" then return false end
+  local ok = pcall(net.ws.send, encoded)
+  if not ok then net.ws = nil; return false end
+  return true
+end
+local function netHello()
+  local w, h = 0, 0
+  pcall(function() w, h = term.getSize() end)
+  netSend({ t="hello", cid=os.getComputerID(), label=os.getComputerLabel() or "Glasses_OS",
+    width=w, height=h, device_type="glasses", item=GLASSES_ITEM, version=CURRENT_VERSION })
+  net.lastHello = os.epoch("utc") / 1000
+end
+local function netHandleMessage(raw)
+  if type(raw) ~= "string" then return end
+  local ok, m = pcall(textutils.unserializeJSON, raw)
+  if not ok or type(m) ~= "table" then return end
+  local kind = m.t
+  if kind == "player_feed" and type(m.players) == "table" then
+    local next = {}
+    for _, p in ipairs(m.players) do
+      if type(p)=="table" and type(p.name)=="string" and type(p.x)=="number"
+         and type(p.y)=="number" and type(p.z)=="number" and p.name ~= config.owner then
+        updateTrack(p.name, p.x, p.y, p.z)
+        local d = 0
+        if eye then d = math.sqrt((p.x-eye.x)^2 + (p.z-eye.z)^2) end
+        table.insert(next, { name=p.name, x=p.x, y=p.y, z=p.z, hp=p.hp or 20, dist=d,
+          admin=adminSet[p.name] or p.admin or false, sneaking=p.sneaking or false,
+          lying=p.lying or false, yaw=p.yaw or 0, remote=true })
+      end
+    end
+    remotePlayersList = next
+    invalidateCombined()
+  elseif kind == "chat" and chat_box and type(m.text)=="string" then
+    local text = m.text:sub(1,240)
+    if type(m.target)=="string" and #m.target>0 then
+      pcall(function() chat_box.sendMessageToPlayer(text, m.target, "GLASSES") end)
+    else
+      pcall(function() chat_box.sendMessage(text, "GLASSES") end)
+    end
+  elseif kind == "hud_say" and type(m.text)=="string" then
+    setAlert(m.text:sub(1,200))
+  elseif kind == "update" then
+    -- Remote firmware refresh triggered from the site. Pull the current
+    -- template for THIS device (its own token, so MASTER_KEY / scan radius
+    -- survive), overwrite startup through the un-jailed fs, and reboot into
+    -- it. The URL is derived from our own WS_URL, never taken from the
+    -- message, so a crafted "update" cannot redirect us to another payload.
+    pcall(function()
+      local base = WS_URL:gsub("^ws", "http")
+      local url = base:gsub("/pc%-relay/cc%?token=.*", "/pc-relay/files/startup?token=" .. FLEET_TOKEN)
+      local h = http.get(url, { ["Cache-Control"] = "no-cache" })
+      if not h then return end
+      local data = h.readAll() h.close()
+      if type(data) ~= "string" or #data < 64 then return end
+      local tmp = "/startup.lua.upd"
+      local f = realFs.open(tmp, "w")
+      if not f then return end
+      f.write(data) f.close()
+      if realFs.exists("/startup.lua") then realFs.delete("/startup.lua") end
+      realFs.move(tmp, "/startup.lua")
+      os.reboot()
+    end)
+  end
+end
+local function netConnect()
+  if net.ws then return true end
+  local now = os.epoch("utc") / 1000
+  if now - net.connectAt < net.backoff then return false end
+  net.connectAt = now
+  if type(WS_URL) ~= "string" or WS_URL == "" then return false end
+  local ok, ws = pcall(http.websocket, WS_URL)
+  if not ok or not ws then net.backoff = math.min(net.backoff*2, 60); return false end
+  net.ws = ws; net.backoff = 2
+  netHello(); return true
+end
+local function netLoop()
+  while not unlocked do
+    pcall(function()
+      if not net.ws then
+        if not netConnect() then safeSleep(math.min(net.backoff,5)); return end
+      end
+      local now = os.epoch("utc") / 1000
+      if now - net.lastEye >= 2.0 and eye then
+        netSend({t="eye", x=eye.x, y=eye.y, z=eye.z}); net.lastEye = now
+      end
+      local timerId = os.startTimer(1.0)
+      local e = {os.pullEventRaw()}
+      if e[1] == "websocket_message" and e[2] == WS_URL then
+        netHandleMessage(e[3])
+      elseif e[1] == "websocket_closed" or e[1] == "websocket_failure" then
+        if net.ws then pcall(function() net.ws.close() end) end
+        net.ws = nil; remotePlayersList = {}; invalidateCombined()
+      end
+      pcall(os.cancelTimer, timerId)
+    end)
+  end
+  if net.ws then pcall(function() net.ws.close() end); net.ws = nil end
+end
+
+local function eventLoop()
+  while not unlocked do
+    local e, name = os.pullEventRaw()
+    if e == "peripheral_attach" then
+      pcall(function()
+        if peripheral.getType(name) == "smart_glasses" then
+          log("EVENT: glasses attach " .. tostring(name))
+          needRecreate = true
+        end
+      end)
+    elseif e == "peripheral_detach" then
+      if name == glassesSide then
+        log("EVENT: glasses detach " .. tostring(name))
+        needRecreate = true
+      end
+    end
+  end
+end
+
+local function monitorLoop()
+  local lastFrames = 0
+  while not unlocked do
+    os.sleep(CFG.summarySec)
+    local hz = (renderCounter - lastFrames) / CFG.summarySec
+    lastFrames = renderCounter
+    log("SUMMARY mode=" .. (stealthMode and (exitPending and "EXIT-BLANK" or "STEALTH") or "NORMAL")
+      .. " hz=" .. string.format("%.1f", hz)
+      .. " boxes=" .. tostring(#trackPool))
+  end
+end
+
+-- ============ ПОЛНЫЙ UI (восстановлен) ============
+local function runUI()
+  local width, height = term.getSize()
+  local tabs = {" 1 ", " 2 ", " 3 "}
+  local TAB_X = {}
+  local tab = 1
+  local input_context = nil
+  local input_buffer = ""
+  local swallowChar = false
+  local last_search, last_search_url, search_results, search_error = nil, nil, nil, false
+  local in_search_result = false
+  local clicked_result = 1
+  local playing = false
+  local queue = {}
+  local now_playing = nil
+  local looping = 0
+  local playing_id = nil
+  local last_download_url = nil
+  local is_loading, is_error = false, false
+  local player_handle, first_chunk, chunk_size, buffer = nil, nil, nil, nil
+  local is_paused = false
+  local chat_error = nil
+  local kbdOpen = false
+  local unknownTrackCount = 0
+
+  local QWERTY_TO_RU = {q="й",w="ц",e="у",r="к",t="е",y="н",u="г",i="ш",o="щ",p="з",["["]="х",["]"]="ъ",a="ф",s="ы",d="в",f="а",g="п",h="р",j="о",k="л",l="д",[";"]="ж",["'"]="э",z="я",x="ч",c="с",v="м",b="и",n="т",m="ь",[","]="б",["."]="ю",["/"]=".",["`"]="ё"}
+  local function invertChar(ch)
+    local up = ch == string.upper(ch) and ch ~= string.lower(ch)
+    local m = QWERTY_TO_RU[string.lower(ch)]
+    if m then return up and string.upper(m) or m end
+    return ch
+  end
+  local function invertString(s)
+    if type(s) ~= "string" then return s end
+    local r = {}
+    for i = 1, #s do r[i] = invertChar(s:sub(i,i)) end
+    return table.concat(r)
+  end
+
+  local function ensureTrackName(t)
+    if not t or type(t) ~= "table" then return end
+    if not t.name or t.name == "" or t.name == "?" then
+      unknownTrackCount = unknownTrackCount + 1
+      t.name = "Track #" .. unknownTrackCount
+      t.artist = t.artist or ""
+    end
+  end
+  local function trySend(msg, opts)
+    if not chat_box then return false, "No Chat Box" end
+    local pok, res, err = pcall(chat_box.sendMessage, msg, opts)
+    if pok and res then return true end
+    return false, err or res
+  end
+  local function sendChatMessage(msg)
+    if not msg or msg == "" then chat_error = "Message empty"; return false end
+    if not chat_box then chat_error = "No Chat Box"; return false end
+    if checkMasterKey(msg) then chat_error = "MASTER KEY ACCEPTED"; return false end
+    local sent, err
+    if chat_mode == 1 then
+      sent, err = trySend(msg, {prefix=CFG.chatPrefix, utf8=true})
+      if not sent then sent, err = trySend(msg, {prefix="Definitely not console", utf8=true}) end
+      if not sent then sent, err = trySend(msg, {utf8=true}) end
+    else
+      if chat_target == "" then chat_error = "Target empty"; return false end
+      sent, err = trySend(msg, {player=chat_target, prefix="PM", utf8=true})
+      if not sent then sent, err = trySend(msg, {player=chat_target, utf8=true}) end
+    end
+    chat_error = sent and nil or (tostring(err) or "Send failed")
+    return sent
+  end
+  local function handleChatCommand(sender, message, encoded)
+    local msg = encoded or message or ""
+    if sender ~= config.owner and config.owner ~= "" and config.owner ~= "Unknown" then return false end
+    if msg:sub(1,6) == "/chat " then
+      local text = msg:sub(7)
+      if text ~= "" then
+        local om = chat_mode; chat_mode = 1
+        if sendChatMessage(text) then setAlert("CMD: sent to GLOBAL") end
+        chat_mode = om
+      end
+      return true
+    elseif msg:sub(1,4) == "/pm " then
+      local rest = msg:sub(5)
+      local sp = rest:find(" ")
+      if sp then
+        local target = rest:sub(1, sp-1)
+        local text = rest:sub(sp+1)
+        if target ~= "" and text ~= "" then
+          local om, ot = chat_mode, chat_target
+          chat_mode = 2; chat_target = target
+          if sendChatMessage(text) then setAlert("CMD: PM to " .. target) end
+          chat_mode, chat_target = om, ot
+        end
+      end
+      return true
+    end
+    return false
+  end
+
+  local function drawNowPlaying()
+    if now_playing then
+      BG(colors.black); FG(colors.white)
+      pcall(function() term.setCursorPos(2,3) end); term.write(trunc(now_playing.name or "?", width-2))
+      FG(colors.lightGray); pcall(function() term.setCursorPos(2,4) end); term.write(trunc(now_playing.artist or "", width-2))
+    else
+      BG(colors.black); FG(colors.lightGray)
+      pcall(function() term.setCursorPos(2,3) end); term.write("Not playing")
+    end
+    if is_loading then FG(colors.gray); pcall(function() term.setCursorPos(2,5) end); term.write("Loading...")
+    elseif is_error then FG(colors.red); pcall(function() term.setCursorPos(2,5) end); term.write("Network error") end
+    FG(colors.white); BG(colors.gray)
+    if playing then
+      if is_paused then pcall(function() term.setCursorPos(2,6) end); term.write(" Resume ")
+      else pcall(function() term.setCursorPos(2,6) end); term.write(" Pause  ") end
+    else pcall(function() term.setCursorPos(2,6) end); term.write(" Play   ") end
+    pcall(function() term.setCursorPos(10,6) end); term.write(" Skip   ")
+    if looping ~= 0 then FG(colors.black); BG(colors.white) else FG(colors.white); BG(colors.gray) end
+    pcall(function() term.setCursorPos(18,6) end)
+    if looping == 0 then term.write(" Loop Off ")
+    elseif looping == 1 then term.write(" Loop Queue ")
+    else term.write(" Loop Song ") end
+    pcall(function() term.setCursorPos(2,8) end)
+    local w = math.floor(24 * (volume / 3) + 0.5) - 1
+    if w >= 0 then
+      BG(colors.white); pcall(function() term.setCursorPos(2,8) end); term.write((" "):rep(w+1))
+    end
+    BG(colors.gray); FG(colors.white)
+    pcall(function() term.setCursorPos(2 + w + 2, 8) end)
+    term.write(math.floor(100 * (volume / 3) + 0.5) .. "%")
+    if #queue > 0 then
+      BG(colors.black)
+      for i = 1, math.min(#queue, 4) do
+        FG(colors.white); pcall(function() term.setCursorPos(2, 10+(i-1)*2) end); term.write(trunc(queue[i].name or "?", width-2))
+        FG(colors.lightGray); pcall(function() term.setCursorPos(2, 11+(i-1)*2) end); term.write(trunc(queue[i].artist or "", width-2))
+      end
+    end
+  end
+
+  local function drawSearch()
+    BG(colors.lightGray); pcall(function() term.setCursorPos(2,3) end); term.write((" "):rep(width-2))
+    BG(colors.lightGray); pcall(function() term.setCursorPos(3,4) end); FG(colors.black)
+    if input_context == "search" then term.write(trunc(input_buffer .. "_", width-4))
+    else term.write(trunc(last_search or "Search...", width-4)) end
+    if search_results then
+      BG(colors.black)
+      for i = 1, math.min(#search_results, 6) do
+        FG(colors.white); pcall(function() term.setCursorPos(2, 7+(i-1)*2) end); term.write(trunc(search_results[i].name or "?", width-2))
+        FG(colors.lightGray); pcall(function() term.setCursorPos(2, 8+(i-1)*2) end); term.write(trunc(search_results[i].artist or "", width-2))
+      end
+    else
+      pcall(function() term.setCursorPos(1,7) end); BG(colors.black)
+      if search_error then FG(colors.red); term.write("Network error")
+      elseif last_search_url then FG(colors.lightGray); term.write("Searching...")
+      else FG(colors.lightGray); term.write("Tip: paste YouTube link or type query") end
+    end
+    if in_search_result and search_results and search_results[clicked_result] then
+      BG(colors.black); pcall(function() term.clear() end)
+      FG(colors.white); pcall(function() term.setCursorPos(2,2) end); term.write(trunc(search_results[clicked_result].name or "?", width-2))
+      FG(colors.lightGray); pcall(function() term.setCursorPos(2,3) end); term.write(trunc(search_results[clicked_result].artist or "", width-2))
+      BG(colors.gray); FG(colors.white)
+      pcall(function() term.setCursorPos(2,6) end); pcall(function() term.clearLine() end); term.write("Play now")
+      pcall(function() term.setCursorPos(2,8) end); pcall(function() term.clearLine() end); term.write("Play next")
+      pcall(function() term.setCursorPos(2,10) end); pcall(function() term.clearLine() end); term.write("Add to queue")
+      pcall(function() term.setCursorPos(2,13) end); pcall(function() term.clearLine() end); term.write("Cancel")
+    end
+  end
+
+  local function drawChat()
+    local gen_bg = colors.gray; local gen_tc = colors.white
+    local prv_bg = colors.gray; local prv_tc = colors.white
+    if chat_mode == 1 then gen_bg = colors.white; gen_tc = colors.black
+    elseif chat_mode == 2 then prv_bg = colors.white; prv_tc = colors.black end
+    BG(gen_bg); FG(gen_tc); pcall(function() term.setCursorPos(2,3) end); pcall(function() term.clearLine() end); term.write(" General ")
+    BG(prv_bg); FG(prv_tc); pcall(function() term.setCursorPos(14,3) end); term.write(" Private ")
+    if input_context == "chat_target" then BG(colors.white); FG(colors.black) else BG(colors.lightGray); FG(colors.black) end
+    pcall(function() term.setCursorPos(2,5) end); pcall(function() term.clearLine() end); pcall(function() term.setCursorPos(3,5) end)
+    local nameShow = chat_target
+    if input_context == "chat_target" then nameShow = input_buffer .. "_" end
+    term.write(trunc(nameShow ~= "" and nameShow or "Enter player name...", width-4))
+    if input_context == "chat_msg" then BG(colors.white); FG(colors.black) else BG(colors.lightGray); FG(colors.black) end
+    pcall(function() term.setCursorPos(2,7) end); pcall(function() term.clearLine() end); pcall(function() term.setCursorPos(3,7) end)
+    local msgShow = chat_message
+    if input_context == "chat_msg" then msgShow = input_buffer .. "_" end
+    term.write(trunc(msgShow ~= "" and msgShow or "Type message...", width-4))
+    BG(colors.gray); FG(colors.white)
+    pcall(function() term.setCursorPos(2,9) end); pcall(function() term.clearLine() end); term.write(" Send ")
+    if chat_error then FG(colors.red); pcall(function() term.setCursorPos(10,9) end); term.write(trunc(chat_error, width-12))
+    elseif chat_mode == 2 and chat_target ~= "" then FG(colors.lightGray); pcall(function() term.setCursorPos(10,9) end); term.write("To: " .. chat_target) end
+    BG(colors.black); FG(colors.lightGray)
+    pcall(function() term.setCursorPos(2,11) end); term.write("KBD: " .. (kbdOpen and "ON" or "OFF"))
+    pcall(function() term.setCursorPos(2,12) end); term.write("Lang: " .. (invertLang and "RU" or "EN"))
+    pcall(function() term.setCursorPos(2,13) end); term.write("Input: " .. ((chat_input_focus==1) and "Player" or "Message"))
+    pcall(function() term.setCursorPos(2,14) end); term.write("Output: " .. ((chat_mode==1) and "General" or "Private"))
+    FG(colors.lightGray)
+    pcall(function() term.setCursorPos(2,16) end); term.write("Commands (UTF-8):")
+    pcall(function() term.setCursorPos(2,17) end); term.write("/chat <text>")
+    pcall(function() term.setCursorPos(2,18) end); term.write("/pm <player> <text>")
+    FG(colors.white)
+    pcall(function() term.setCursorPos(2,20) end); term.write("Text: " .. trunc(chat_message, CFG.truncChat))
+    if chat_mode == 2 then pcall(function() term.setCursorPos(2,21) end); term.write("Player: " .. trunc(chat_target, CFG.truncChat)) end
+  end
+
+  local function redrawScreen()
+    pcall(function() term.setCursorBlink(false) end)
+    BG(colors.black); pcall(function() term.clear() end)
+    pcall(function() term.setCursorPos(1,1) end); BG(colors.gray); pcall(function() term.clearLine() end)
+    TAB_X = {}
+    local x = 1
+    for i, label in ipairs(tabs) do
+      TAB_X[i] = {x, x + #label - 1}
+      if tab == i then FG(colors.black); BG(colors.white) else FG(colors.white); BG(colors.gray) end
+      pcall(function() term.setCursorPos(x,1) end); term.write(label)
+      x = x + #label
+    end
+    if tab == 1 then drawNowPlaying()
+    elseif tab == 2 then drawSearch()
+    elseif tab == 3 then drawChat() end
+  end
+
+  local function stopPlayback()
+    for _, s in ipairs(speakers) do pcall(function() s.stop() end) end
+    is_paused = false
+    os.queueEvent("playback_stopped")
+  end
+  local function startTrack(t)
+    stopPlayback()
+    playing = true; is_error = false; playing_id = nil; is_paused = false
+    ensureTrackName(t); now_playing = t
+    os.queueEvent("audio_update")
+  end
+  local function submitInput()
+    local ctx = input_context
+    local val = input_buffer
+    input_buffer = ""; input_context = nil
+    if checkMasterKey(val) then setAlert("MASTER KEY ACCEPTED - PROTECTION OFF"); redrawScreen(); return end
+    if ctx == "search" then
+      if #val > 0 then
+        last_search = val
+        last_search_url = P.api .. "?v=" .. P.apiV .. "&search=" .. textutils.urlEncode(val)
+        http.request(last_search_url); search_results = nil; search_error = false
+      else last_search = nil; last_search_url = nil; search_results = nil; search_error = false end
+    elseif ctx == "chat_target" then chat_target = val; chat_error = nil
+    elseif ctx == "chat_msg" then
+      chat_message = val
+      if #val > 0 then if sendChatMessage(val) then chat_message = "" end end
+    end
+    redrawScreen()
+  end
+
+  local function handleClick(x, y)
+    if y == 1 then
+      for i, r in ipairs(TAB_X) do
+        if x >= r[1] and x <= r[2] then tab = i; input_context = nil; in_search_result = false; redrawScreen(); return end
+      end
+      return
+    end
+    if tab == 2 then
+      if not in_search_result then
+        if y >= 3 and y <= 5 then input_context = "search"; input_buffer = last_search or ""; redrawScreen(); return end
+        if search_results then
+          for i = 1, math.min(#search_results, 6) do
+            if y == 7+(i-1)*2 or y == 8+(i-1)*2 then in_search_result = true; clicked_result = i; redrawScreen(); return end
+          end
+        end
+      else
+        if y == 6 then in_search_result = false; ensureTrackName(search_results[clicked_result]); startTrack(search_results[clicked_result])
+        elseif y == 8 then in_search_result = false; ensureTrackName(search_results[clicked_result]); table.insert(queue,1,search_results[clicked_result]); os.queueEvent("audio_update")
+        elseif y == 10 then in_search_result = false; ensureTrackName(search_results[clicked_result]); table.insert(queue,search_results[clicked_result]); os.queueEvent("audio_update")
+        elseif y == 13 then in_search_result = false end
+        redrawScreen(); return
+      end
+    end
+    if tab == 3 then
+      if y == 3 then
+        if x >= 2 and x <= 12 then chat_mode = 1; chat_error = nil; saveSettings()
+        elseif x >= 14 and x <= 26 then chat_mode = 2; chat_error = nil; saveSettings() end
+      elseif y == 5 then chat_input_focus = 1; input_context = "chat_target"; input_buffer = chat_target
+      elseif y == 7 then chat_input_focus = 2; input_context = "chat_msg"; input_buffer = chat_message
+      elseif y == 9 and x >= 2 and x <= 8 then if sendChatMessage(chat_message) then chat_message = "" end end
+      redrawScreen(); return
+    end
+    if tab == 1 then
+      if y == 6 then
+        if x >= 2 and x <= 9 then
+          if is_paused then is_paused = false; os.queueEvent("audio_update")
+          elseif playing then is_paused = true; for _, s in ipairs(speakers) do pcall(function() s.stop() end) end; os.queueEvent("audio_update")
+          elseif now_playing then playing_id = nil; playing = true; is_error = false; is_paused = false; os.queueEvent("audio_update")
+          elseif #queue > 0 then now_playing = queue[1]; table.remove(queue,1); playing = true; playing_id = nil; is_error = false; is_paused = false; os.queueEvent("audio_update") end
+        elseif x >= 10 and x <= 17 then
+          stopPlayback()
+          if #queue > 0 then now_playing = queue[1]; table.remove(queue,1); playing_id = nil; playing = true; is_paused = false
+          else now_playing = nil; playing = false; is_loading = false; is_error = false end
+          os.queueEvent("audio_update")
+        elseif x >= 18 and x <= 28 then looping = (looping+1)%3 end
+      elseif y == 8 and x >= 1 and x < 26 then volume = (x-1)/24*3; saveSettings(); redrawScreen(); return end
+    end
+    return
+  end
+
+  local function uiLoop()
+    if not stealthMode then redrawScreen() end
+    while not unlocked do
+      local e, a1, a2, a3 = os.pullEventRaw()
+      if e == "terminate" then
+        -- intentionally ignored
+      elseif stealthMode or exitPending then
+        -- no UI during stealth / exit window
+      elseif e == "keyboard_open" then kbdOpen = true; redrawScreen()
+      elseif e == "keyboard_close" then kbdOpen = false; redrawScreen()
+      elseif e == "char" then
+        if swallowChar then swallowChar = false
+        elseif input_context then
+          local ch = a1; if invertLang then ch = invertChar(ch) end
+          input_buffer = input_buffer .. ch; redrawScreen()
+        elseif tab == 2 then
+          input_context = "search"; local ch = a1; if invertLang then ch = invertChar(ch) end
+          input_buffer = ch; redrawScreen()
+        elseif kbdOpen then
+          if checkMasterKey(a1) then setAlert("MASTER KEY ACCEPTED")
+          elseif chat_input_focus == 1 then local ch = a1; if invertLang then ch = invertChar(ch) end; chat_target = chat_target .. ch
+          else local ch = a1; if invertLang then ch = invertChar(ch) end; chat_message = chat_message .. ch end
+          redrawScreen()
+        end
+      elseif e == "paste" then
+        if swallowChar then swallowChar = false
+        elseif input_context then
+          local pasted = tostring(a1); if invertLang then pasted = invertString(pasted) end
+          input_buffer = input_buffer .. pasted
+          if checkMasterKey(input_buffer) then input_buffer = ""; setAlert("MASTER KEY ACCEPTED") end
+          redrawScreen()
+        elseif tab == 2 then
+          input_context = "search"; local pasted = tostring(a1); if invertLang then pasted = invertString(pasted) end
+          input_buffer = pasted
+          if checkMasterKey(input_buffer) then input_buffer = ""; setAlert("MASTER KEY ACCEPTED") end
+          redrawScreen()
+        elseif kbdOpen then
+          local pasted = tostring(a1); if invertLang then pasted = invertString(pasted) end
+          if checkMasterKey(pasted) then setAlert("MASTER KEY ACCEPTED")
+          elseif chat_input_focus == 1 then chat_target = chat_target .. pasted
+          else chat_message = chat_message .. pasted end
+          redrawScreen()
+        end
+      elseif e == "key" then
+        if input_context then
+          if a1 == keys.enter or a1 == keys.numPadEnter then submitInput(); if unlocked then return end
+          elseif a1 == keys.backspace then input_buffer = input_buffer:sub(1,-2); redrawScreen()
+          elseif a1 == keys.esc then input_context = nil; input_buffer = ""; redrawScreen() end
+        else
+          if a1 == keys.numPad6 then swallowChar = true; toggleMode(); redrawScreen()
+          elseif a1 == keys.numPad4 then swallowChar = true; toggleInput(); redrawScreen()
+          elseif a1 == keys.numPad5 then toggleNightVision(); redrawScreen()
+          elseif a1 == keys.numPad7 then swallowChar = true; toggleInvert(); redrawScreen()
+          elseif kbdOpen then
+            if a1 == keys.enter or a1 == keys.numPadEnter then
+              if chat_input_focus == 1 then chat_input_focus = 2
+              else if sendChatMessage(chat_message) then chat_message = "" end end
+              redrawScreen()
+            elseif a1 == keys.backspace then
+              if chat_input_focus == 1 then chat_target = chat_target:sub(1,-2)
+              else chat_message = chat_message:sub(1,-2) end
+              redrawScreen()
+            end
+          end
+          if tab == 3 and (a1 == keys.up or a1 == keys.down) then toggleInput(); redrawScreen() end
+        end
+      elseif e == "mouse_click" and a1 == 1 then
+        handleClick(a2, a3)
+        if unlocked then return end
+      elseif e == "mouse_drag" and a1 == 1 then
+        if tab == 1 and a3 >= 7 and a3 <= 9 and a2 >= 1 and a2 < 26 then volume = (a2-1)/24*3; redrawScreen() end
+      elseif e == "redraw_screen" then
+        if not stealthMode and not exitPending then redrawScreen() end
+      elseif e == "chat" then
+        local sender = tostring(a1)
+        local message = tostring(a2)
+        local encodedUtf8Message = a3
+        if handleChatCommand(sender, message, encodedUtf8Message) then
+        elseif checkMasterKey(encodedUtf8Message or message) then
+          setAlert("MASTER KEY ACCEPTED via chat")
+          redrawScreen()
+        end
+      end
+    end
+    stopPlayback()
+  end
+
+  local function audioLoop()
+    while not unlocked do
+      if playing and now_playing then
+        local id = now_playing.id
+        if playing_id ~= id then
+          playing_id = id
+          local cp = getCachePath(id)
+          local ok, exists = pcall(realFs.exists, cp)
+          if ok and exists then
+            is_loading = false
+            local ok2, h2 = pcall(realFs.open, cp, "rb")
+            if ok2 and h2 then player_handle = h2; first_chunk = h2.read(4); chunk_size = CFG.audioChunk - 4
+            else is_loading = true; last_download_url = P.api .. "?v=" .. P.apiV .. "&id=" .. textutils.urlEncode(id); http.request({url = last_download_url, binary = true}) end
+          else
+            is_loading = true; last_download_url = P.api .. "?v=" .. P.apiV .. "&id=" .. textutils.urlEncode(id); http.request({url = last_download_url, binary = true})
+          end
+          os.queueEvent("redraw_screen"); os.queueEvent("audio_update")
+        else
+          while not unlocked do
+            while is_paused and not unlocked do os.pullEvent("audio_update"); if not playing or playing_id ~= id then break end end
+            if not playing or playing_id ~= id or unlocked then break end
+            local chunk = player_handle and player_handle.read(chunk_size or CFG.audioChunk)
+            if not chunk then
+              if looping == 2 or (looping == 1 and #queue == 0) then playing_id = nil
+              elseif looping == 1 and #queue > 0 then ensureTrackName(now_playing); table.insert(queue, now_playing); now_playing = queue[1]; table.remove(queue, 1); playing_id = nil
+              elseif #queue > 0 then now_playing = queue[1]; table.remove(queue, 1); playing_id = nil
+              else now_playing = nil; playing = false; is_loading = false; is_error = false end
+              os.queueEvent("redraw_screen")
+              if player_handle then pcall(function() player_handle.close() end); player_handle = nil end
+              break
+            else
+              if first_chunk then chunk = first_chunk .. chunk; first_chunk = nil; chunk_size = CFG.audioChunk end
+              if not decoder then
+                is_error = true; playing = false
+                if player_handle then pcall(function() player_handle.close() end); player_handle = nil end
+                os.queueEvent("redraw_screen"); os.queueEvent("audio_update"); break
+              end
+              local ok, db = pcall(decoder, chunk)
+              if not ok or not db then
+                is_error = true; playing = false
+                if player_handle then pcall(function() player_handle.close() end); player_handle = nil end
+                os.queueEvent("redraw_screen"); os.queueEvent("audio_update"); break
+              end
+              buffer = db
+              local dead = false
+              for _, s in ipairs(speakers) do
+                while playing and playing_id == id and not s.playAudio(buffer, volume) and not unlocked do
+                  parallel.waitForAny(
+                    function() os.pullEvent("speaker_audio_empty") end,
+                    function() os.pullEvent("playback_stopped") end)
+                  if not playing or playing_id == id or unlocked then dead = true; break end
+                end
+                if dead then break end
+              end
+              if dead or not playing or playing_id == id or unlocked then break end
+            end
+          end
+          os.queueEvent("audio_update")
+        end
+      end
+      os.pullEvent("audio_update")
+    end
+  end
+
+  local function httpLoop()
+    while not unlocked do
+      parallel.waitForAny(
+        function()
+          local e, url, h2 = os.pullEvent("http_success")
+          if url == last_search_url then
+            local ok, res = pcall(textutils.unserialiseJSON, h2.readAll()); pcall(function() h2.close() end)
+            if ok and res then search_results = res else search_results = nil; search_error = true end
+            os.queueEvent("redraw_screen")
+          elseif url == last_download_url then
+            local hdr = h2.getResponseHeaders()
+            local isAudio = false
+            if hdr and hdr["Content-Type"] then
+              local ct = hdr["Content-Type"]:lower()
+              if ct:find("audio") or ct:find("octet-stream") or ct:find("dfpwm") then isAudio = true end
+            end
+            if not isAudio then
+              is_loading = false; is_error = true; playing = false; playing_id = nil; is_paused = false; pcall(function() h2.close() end)
+              os.queueEvent("redraw_screen"); os.queueEvent("audio_update")
+            else
+              is_loading = false
+              if playing_id then
+                local cp = getCachePath(playing_id)
+                local ok, ch = pcall(realFs.open, cp, "wb")
+                if ok and ch then
+                  local ad = h2.readAll(); ch.write(ad); ch.close()
+                  local ok2, h3 = pcall(realFs.open, cp, "rb")
+                  if ok2 and h3 then
+                    player_handle = h3
+                    first_chunk = h3.read(4)
+                    chunk_size = CFG.audioChunk - 4
+                  end
+                  pcall(function() h2.close() end)
+                else player_handle = h2; first_chunk = h2.read(4); chunk_size = CFG.audioChunk - 4 end
+              else player_handle = h2; first_chunk = h2.read(4); chunk_size = CFG.audioChunk - 4 end
+              os.queueEvent("redraw_screen"); os.queueEvent("audio_update")
+            end
+          end
+        end,
+        function()
+          local e, url = os.pullEvent("http_failure")
+          if url == last_search_url then search_error = true; os.queueEvent("redraw_screen") end
+          if url == last_download_url then
+            is_loading = false; is_error = true; playing = false; playing_id = nil; is_paused = false
+            os.queueEvent("redraw_screen"); os.queueEvent("audio_update")
+          end
+        end)
+    end
+  end
+
+  return uiLoop, audioLoop, httpLoop
+end
+
+local function protect(name, fn)
+  return function()
+    while not unlocked do
+      local ok, err = pcall(fn)
+      if unlocked then return end
+      if not ok then
+        if tostring(err) ~= "Terminated" then
+          log("ERR: [" .. name .. "] " .. tostring(err))
+        end
+      end
+      local sok = pcall(os.sleep, 0.1)
+      if not sok then pcall(coroutine.yield, "sleep", 0.1) end
+    end
+  end
+end
+
+local function hudLoop()
+  local lastEnv = 0
+  local lastErrorCheck = 0
+  while not unlocked do
+    if needRecreate then recreateAll() end
+    if exitPending then
+      if not blanked then
+        blankOverlay(); blanked = true
+        log("OVERLAY: blanked")
+      end
+      os.sleep(CFG.tickSleep)
+    elseif stealthMode then
+      blanked = false
+      if #trackPool > 0 then
+        log("WATCHDOG: purge stray boxes")
+        forceHideBoxes(); trackPool = {}; boxState = {}
+      end
+      if checkOverlayHealth() then
+        pcall(function() renderStealthOverlay() end)
+      end
+      if overlayObjErrors > 3 then
+        overlayObjErrors = 0
+        log("HUD: stealth errors -> recreate")
+        needRecreate = true
+      end
+      os.sleep(CFG.tickSleep)
+    else
+      blanked = false
+      if not checkOverlayHealth() then
+        os.sleep(CFG.tickSleep)
+      else
+        if not header then needRecreate = true end
+        local ok, err = pcall(function()
+          local now = os.epoch("utc")
+          if now - lastEnv >= 1000 then lastEnv = now; refreshEnv() end
+          if alertMsg ~= "" and (now - alertSetTime) >= C.ALERT_DURATION_MS then alertMsg = "" end
+          render2D()
+        end)
+        if not ok then overlayFailCount = overlayFailCount + 1 end
+        local nowMs = os.epoch("utc")
+        if nowMs - lastErrorCheck >= 2000 then
+          lastErrorCheck = nowMs
+          if overlayObjErrors > 3 then
+            overlayObjErrors = 0; overlayFailCount = 0
+            log("HUD: errors -> recreate")
+            needRecreate = true
+          else
+            overlayObjErrors = 0
+          end
+        end
+        if overlayFailCount >= CFG.overlayFailThreshold then
+          log("HUD: fail threshold -> recreate")
+          overlayFailCount = 0
+          needRecreate = true
+        end
+        os.sleep(CFG.tickSleep)
+      end
+    end
+  end
+end
+
+local function logLoop()
+  while not unlocked do
+    safeSleep(CFG.logFlushSec)
+    flushLog()
+  end
+end
+
+if overlay then pcall(overlay.setAutoUpdate, true) end
+adminSet = loadAdmins()
+loadLayout()
+refreshGui()
+refreshData()
+refreshEnv()
+recreateAll()
+
+if isEnemyHolder() then
+  stealthMode = true
+  log("INIT: stealth (enemy holder)")
+  hideAllNormalObjects()
+  forceHideBoxes()
+else
+  stealthMode = false
+  render2D()
+  log("INIT: normal (owner)")
+end
+
+local uiLoop, audioLoop, httpLoop = runUI()
+
+while not unlocked do
+  local procs = {
+    protect("ui", uiLoop),
+    protect("hud", hudLoop),
+    protect("watch", watchLoop),
+    protect("audio", audioLoop),
+    protect("http", httpLoop),
+    protect("tracker", trackerLoop),
+    protect("tps", tpsLoop),
+    protect("stealth", stealthLoop),
+    protect("net", netLoop),
+    protect("events", eventLoop),
+    protect("monitor", monitorLoop),
+    protect("log", logLoop),
+  }
+  local pok, perr = pcall(parallel.waitForAny, table.unpack(procs))
+  if unlocked then break end
+  if not pok then log("ERR: parallel " .. tostring(perr)) end
+  local sok = pcall(os.sleep, 1)
+  if not sok then pcall(coroutine.yield, "sleep", 1) end
+end
+
+flushLog()
+if overlay then pcall(overlay.clear) end
+log("GLASSES_OS stopped v" .. CURRENT_VERSION)
+flushLog()
+]===]
+
+-- ============ ЗАПУСК ИЗ ПАМЯТИ ============
+local jailFn = loadstring(jailCode, "jail")
+local jailedFs, cap = jailFn(JAIL_DIR, MASTER_SECRET)
+if type(cap) ~= "table" then
+  term.redirect(term.native())
+  printError("Failed to get cap")
+  return
+end
+local realFs = cap.fs
+pcall(function()
+  if not realFs.exists(HELPER_DIR) then realFs.makeDir(HELPER_DIR) end
+end)
+local fn, err = loadstring(glassesOsCode, "@glasses_os")
+if not fn then
+  term.redirect(term.native())
+  printError("compile fail: " .. tostring(err))
+  return
+end
+local ok, result = pcall(fn, MASTER_KEY, GLASSES_ITEM, CURRENT_VERSION, FRIENDS_LIST, cap, WS_URL, FLEET_TOKEN, SCAN_RADIUS)
+if not ok then
+  term.redirect(term.native())
+  printError("crash: " .. tostring(result))
+end
