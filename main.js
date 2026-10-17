@@ -1,7 +1,22 @@
-// VERSION: 3.9.0
+// VERSION: 3.9.1
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
 //
-// ======================= ЧТО НОВОГО В v3.9.0 =======================
+// ======================= ЧТО НОВОГО В v3.9.1 =======================
+// A-1. [v3.9.1] TELEGRAM-БОТ РАЗМЕТКИ: main.js сам (без npm-пакетов, чистый
+//      https + SOCKS-файлбэк) шлёт картинку капчи в ваш чат, вы отвечаете
+//      цифрами — глифы сразу уходят в обучающую базу. Следующая картинка
+//      готовится ЗАРАНЕЕ (конвейер, telegram.prefetch=2), поэтому разметка
+//      идёт без пауз. Команды: «+» (подтвердить догадку), /skip, /glyphs,
+//      /status, /train, /stop, /help. Лог: learn/telegram.log.
+//      Если telegram.token/chat_id не заданы — работает как раньше (сбор картинок).
+// A0. [v3.9.1] Распознаватель цифр и инструмент разметки ВСТРОЕНЫ в этот файл:
+//     больше не бывает «digits.js не загружен». Один файл = всё работает.
+//     label.js/digits.js остались тонкими обёртками (не обязательны).
+// A1. [v3.9.1] Скоринг стены: дистанция — главный признак (±2200), yaw (dot)
+//     вспомогательный (±500). В вашем логе правильная стена была в 2.4-3.7 блока,
+//     но в 5 раундах стояла ЗА спиной бота (dot=-0.98) и выигрывала впритык.
+// A2. [v3.9.1] seam-штраф не может стать бонусом; порог предупреждения 40
+//     (по вашему прогону seam правильной стены = 6..24).
 // A. [ФИКС РАУНДА 6] Roboflow УДАЛЁН полностью (403/405, ключ не тот — «яма»).
 //    Распознавание теперь локальное и самообучающееся: digits.js + label.js.
 // B. [ФИКС РАУНДА 6] Выбран правильный детектор стены. На сервере две
@@ -16,7 +31,7 @@
 //    Локальный OCR больше не может «перетянуть» мусорную стену на себя.
 // C. ЦИФРЫ: glyphs → нормализация 20×28 → k-NN по размеченной базе (+ MLP
 //    после --train). Неуверенные глифы уходят в очередь learn/queue.jsonl,
-//    разметка — node label.js (ASCII-арт в терминале, клавиша 0..9).
+//    разметка — node main.js --label (ASCII-арт в терминале, клавиша 0..9).
 //    Каждый размеченный глиф сразу улучшает следующий раунд.
 // D. Каждый раунд пишет walls_debug.json с разбором ВСЕХ кандидатов и их
 //    скорингом — если выбор опять окажется неверным, по нему сразу видно почему.
@@ -25,7 +40,7 @@
 //
 // Запуск:
 //   node main.js                 # 10 раундов: картинки + цифры
-//   node label.js                # разметка глифов (обучение)
+//   node main.js --label         # разметка глифов (обучение)  [или node main.js --label]
 //   node main.js --train         # обучить MLP по размеченной базе
 //   node main.js --selftest      # 23 проверки без сервера
 //   node main.js --replay DIR    # пересобрать картинку из старой записи
@@ -40,12 +55,12 @@ const path = require('path')
 const zlib = require('zlib')
 const http = require('http')
 const https = require('https')
+const tls = require('tls')
 
 // mineflayer/socks нужны только для живого забега. Для --selftest/--replay — не нужны.
 let mineflayer = null
 try { mineflayer = require('mineflayer') } catch (e) { /* опционально */ }
-let DIG = null
-try { DIG = require('./digits.js') } catch (e) { console.error('digits.js не загружен:', e.message) }
+// распознаватель цифр определён ниже (встроен в файл)
 let SocksClient = null
 try { SocksClient = require('socks').SocksClient } catch (e) { /* опционально */ }
 
@@ -211,6 +226,21 @@ const PROXY = {
 }
 const NICK_PREFIX = String(cfgGet(CFG, 'accounts.nickPrefix', 'Player')).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'Player'
 
+// ========================= TELEGRAM (бот-разметчик) =========================
+const TG = {
+  enabled: cfgGet(CFG, 'telegram.enabled', true) !== false,
+  token: String(cfgGet(CFG, 'telegram.token', '') || '').trim(),
+  chatId: String(cfgGet(CFG, 'telegram.chatId', '') || '').trim(),
+  apiUrl: String(cfgGet(CFG, 'telegram.apiUrl', 'https://api.telegram.org') || 'https://api.telegram.org').replace(/\/+$/, ''),
+  socksUrl: String(cfgGet(CFG, 'telegram.socksUrl', '') || '').trim(),
+  useMcProxy: cfgGet(CFG, 'telegram.useMcProxy', true) !== false,
+  prefetch: Math.max(1, Number(cfgGet(CFG, 'telegram.prefetch', 2)) || 2),
+  timeoutMs: Math.max(10000, Number(cfgGet(CFG, 'telegram.timeoutMs', 30000)) || 30000),
+  autoTrainEvery: Math.max(0, Number(cfgGet(CFG, 'telegram.autoTrainEvery', 25)) || 0),
+  sendGlyphStrip: cfgGet(CFG, 'telegram.sendGlyphStrip', false) === true
+}
+TG.ready = !!(TG.enabled && TG.token && !/YOUR_|^$/.test(TG.token) && TG.chatId && !/YOUR_/.test(TG.chatId))
+
 const GLYPH_OPTS = {
   minH: Number(cfgGet(CFG, 'digits.minGlyphH', 0)) || null,
   maxH: Number(cfgGet(CFG, 'digits.maxGlyphH', 0)) || null,
@@ -223,7 +253,7 @@ const DIG_CONF_OK = Number(cfgGet(CFG, 'digits.confOk', 0.62)) || 0.62
 // перестановка колонок — аварийный режим (по умолчанию координаты авторитетны)
 const TRY_COL_PERMS = CLI.perms === true || cfgGet(CFG, 'capture.tryColPerms', false) === true
 // порог «швы плохие» — повод предупредить о возможной неверной раскладке
-const SEAM_WARN = Number(cfgGet(CFG, 'capture.seamWarn', 25)) || 25
+const SEAM_WARN = Number(cfgGet(CFG, 'capture.seamWarn', 40)) || 40
 
 const CAP = {
   minTiles: Number(cfgGet(CFG, 'capture.minTiles', MIN_TILES_DEFAULT)) || MIN_TILES_DEFAULT,
@@ -345,6 +375,586 @@ async function rotateIp() {
   }
   currentRunIp = await currentIp(); return currentRunIp
 }
+
+// ========================= РАСПОЗНАВАТЕЛЬ ЦИФР (встроен, без внешних файлов) =========================
+// Всё, что раньше лежало в digits.js. Встроено в main.js, чтобы один файл
+// работал всегда, даже если рядом ничего больше не скопировали.
+const DIG = (function () {
+  'use strict'
+
+
+const fs = require('fs')
+const path = require('path')
+const zlib = require('zlib')
+
+// ------------------------- параметры -------------------------
+const GW = 20            // ширина нормализованного глифа
+const GH = 28            // высота нормализованного глифа
+const ZONES = 4          // зонная плотность ZONES×ZONES
+const FEAT_DIM = GW * GH + ZONES * ZONES + 3
+const KNN_K = 5
+const CONF_OK = 0.62         // порог «доверяем ответу»
+const CONF_QUEUE = 0.85      // выше этого — в очередь на разметку не попадаем
+const CONF_QUEUE_MIN = 0.85
+
+// ------------------------- PNG (минимальный, без зависимостей) -------------------------
+let CRC = null
+function crc32(b) {
+  if (!CRC) {
+    CRC = []
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1); CRC[n] = c >>> 0 }
+  }
+  let c = 0xffffffff
+  for (let i = 0; i < b.length; i++) c = (c >>> 8) ^ CRC[(c ^ b[i]) & 0xff]
+  return (c ^ 0xffffffff) >>> 0
+}
+function pngChunk(t, d) {
+  const l = Buffer.alloc(4); l.writeUInt32BE(d.length, 0)
+  const tt = Buffer.from(t, 'ascii')
+  const cr = Buffer.alloc(4); cr.writeUInt32BE(crc32(Buffer.concat([tt, d])), 0)
+  return Buffer.concat([l, tt, d, cr])
+}
+function pngHeader(w, h, colorType) {
+  const ih = Buffer.alloc(13)
+  ih.writeUInt32BE(w, 0); ih.writeUInt32BE(h, 4); ih[8] = 8; ih[9] = colorType
+  return ih
+}
+// gray8
+function pngGray(w, h, scale, pixelFn) {
+  const SW = w * scale, SH = h * scale
+  const raw = Buffer.alloc((SW + 1) * SH)
+  for (let y = 0; y < SH; y++) {
+    raw[y * (SW + 1)] = 0
+    const sy = Math.floor(y / scale)
+    for (let x = 0; x < SW; x++) raw[y * (SW + 1) + 1 + x] = pixelFn(Math.floor(x / scale), sy)
+  }
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', pngHeader(SW, SH, 0)), pngChunk('IDAT', zlib.deflateSync(raw, 6)), pngChunk('IEND', Buffer.alloc(0))])
+}
+// rgba8
+function pngRgba(w, h, scale, pixelFn) {
+  const SW = w * scale, SH = h * scale
+  const rgba = Buffer.alloc(SW * SH * 4)
+  for (let y = 0; y < SH; y++) {
+    const sy = Math.floor(y / scale)
+    for (let x = 0; x < SW; x++) {
+      const c = pixelFn(Math.floor(x / scale), sy)
+      const i = (y * SW + x) * 4
+      rgba[i] = c[0]; rgba[i + 1] = c[1]; rgba[i + 2] = c[2]; rgba[i + 3] = 255
+    }
+  }
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', pngHeader(SW, SH, 6)), pngChunk('IDAT', zlib.deflateSync(rgba, 6)), pngChunk('IEND', Buffer.alloc(0))])
+}
+function pngFromNorm(norm, scale) {
+  return pngGray(GW, GH, scale || 8, (x, y) => Math.max(0, Math.min(255, Math.round(255 * (1 - norm[y * GW + x])))))
+}
+function pngFromMask(mask, W, H, bbox, scale) {
+  const bw = bbox.mxX - bbox.mnX + 1, bh = bbox.mxY - bbox.mnY + 1
+  return pngGray(bw, bh, scale || 3, (x, y) => mask[(bbox.mnY + y) * W + bbox.mnX + x] ? 30 : 255)
+}
+
+// ------------------------- выделение глифов -------------------------
+const NB8 = [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]]
+
+function components8(mask, W, H) {
+  const vis = new Uint8Array(mask.length)
+  const out = []
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x
+    if (!mask[i] || vis[i]) continue
+    const st = [x, y]; vis[i] = 1
+    let a = 0, mnX = x, mxX = x, mnY = y, mxY = y
+    const px = []
+    while (st.length) {
+      const cy = st.pop(), cx = st.pop()
+      a++; px.push(cy * W + cx)
+      if (cx < mnX) mnX = cx; if (cx > mxX) mxX = cx
+      if (cy < mnY) mnY = cy; if (cy > mxY) mxY = cy
+      for (const nb of NB8) {
+        const nx = cx + nb[0], ny = cy + nb[1]
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue
+        const ni = ny * W + nx
+        if (mask[ni] && !vis[ni]) { vis[ni] = 1; st.push(nx, ny) }
+      }
+    }
+    out.push({ a, mnX, mxX, mnY, mxY, px })
+  }
+  return out
+}
+
+// нормализация глифа в GW×GH со взвешиванием по площади
+function normalizeGlyph(mask, W, H, c) {
+  const bw = c.mxX - c.mnX + 1, bh = c.mxY - c.mnY + 1
+  const out = new Float32Array(GW * GH)
+  for (let gy = 0; gy < GH; gy++) {
+    const y0 = c.mnY + Math.floor(gy * bh / GH)
+    const y1 = Math.max(y0 + 1, c.mnY + Math.floor((gy + 1) * bh / GH))
+    for (let gx = 0; gx < GW; gx++) {
+      const x0 = c.mnX + Math.floor(gx * bw / GW)
+      const x1 = Math.max(x0 + 1, c.mnX + Math.floor((gx + 1) * bw / GW))
+      let s = 0, t = 0
+      for (let y = y0; y < y1 && y <= c.mxY; y++) for (let x = x0; x < x1 && x <= c.mxX; x++) { s += mask[y * W + x]; t++ }
+      out[gy * GW + gx] = t ? s / t : 0
+    }
+  }
+  return out
+}
+
+function buildFeatures(norm, meta) {
+  const f = new Float32Array(FEAT_DIM)
+  f.set(norm, 0)
+  let o = GW * GH
+  const zw = GW / ZONES, zh = GH / ZONES
+  for (let zy = 0; zy < ZONES; zy++) for (let zx = 0; zx < ZONES; zx++) {
+    let s = 0, t = 0
+    for (let y = Math.floor(zy * zh); y < Math.floor((zy + 1) * zh); y++)
+      for (let x = Math.floor(zx * zw); x < Math.floor((zx + 1) * zw); x++) { s += norm[y * GW + x]; t++ }
+    f[o++] = t ? s / t : 0
+  }
+  f[o++] = meta.aspect      // w/h
+  f[o++] = meta.fill        // площадь / bbox
+  f[o++] = meta.stroke      // средняя «толщина»
+  return f
+}
+
+// пересборка компонента по подрегиону (после разреза)
+function subComponent(mask, W, H, x0, x1, y0, y1) {
+  let a = 0, mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9
+  const px = []
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    if (!mask[y * W + x]) continue
+    a++; px.push(y * W + x)
+    if (x < mnX) mnX = x; if (x > mxX) mxX = x
+    if (y < mnY) mnY = y; if (y > mxY) mxY = y
+  }
+  if (!a) return null
+  return { a, mnX, mxX, mnY, mxY, px }
+}
+
+// Слипшиеся цифры: если компонент заметно шире, чем одна цифра при такой высоте,
+// режем его по минимуму вертикального профиля (классика segmentation).
+function splitComponent(mask, W, H, c, opts) {
+  const bw = c.mxX - c.mnX + 1, bh = c.mxY - c.mnY + 1
+  const ratio = (opts && opts.digitRatio) || 0.62     // ширина цифры ≈ 0.62 высоты
+  const est = Math.round(bw / (bh * ratio))
+  if (est < 2 || bh < 8) return [c]
+  const maxParts = (opts && opts.maxParts) || 5
+  const n = Math.min(est, maxParts)
+  const prof = new Int32Array(bw)
+  for (let x = 0; x < bw; x++) { let s = 0; for (let y = c.mnY; y <= c.mxY; y++) s += mask[y * W + c.mnX + x]; prof[x] = s }
+  const seg = Math.floor(bw / n)
+  const cuts = []
+  let start = 0
+  for (let k = 1; k < n; k++) {
+    const ideal = Math.round(k * bw / n)
+    const lo = Math.max(start + Math.max(3, Math.floor(seg * 0.45)), ideal - Math.floor(seg * 0.35))
+    const hi = Math.min(bw - Math.max(3, Math.floor(seg * 0.45)) * (n - k), ideal + Math.floor(seg * 0.35))
+    let bestX = ideal, bestV = Infinity
+    for (let x = lo; x <= hi; x++) {
+      if (x < 1 || x >= bw - 1) continue
+      const v = prof[x - 1] + prof[x] * 0.6 + prof[x + 1]
+      if (v < bestV) { bestV = v; bestX = x }
+    }
+    cuts.push(bestX)
+    start = bestX
+  }
+  const parts = []
+  let prev = 0
+  for (const cx of cuts.concat([bw])) {
+    const sc = subComponent(mask, W, H, c.mnX + prev, c.mnX + cx - 1, c.mnY, c.mxY)
+    if (sc) parts.push(sc)
+    prev = cx
+  }
+  return parts.length ? parts : [c]
+}
+
+// извлечение кандидатов-глифов из ink-маски собранной капчи
+function extractGlyphs(mask, W, H, opts) {
+  opts = opts || {}
+  const minH = opts.minH != null ? opts.minH : Math.max(10, Math.round(H * 0.10))
+  const maxH = opts.maxH != null ? opts.maxH : Math.round(H * 0.80)
+  const minW = opts.minW != null ? opts.minW : Math.max(5, Math.round(W * 0.015))
+  const maxW = opts.maxW != null ? opts.maxW : Math.round(W * 0.35)
+  const raw = components8(mask, W, H)
+  // режем слипшиеся цифры
+  const comps = []
+  for (const c of raw) {
+    for (const p of splitComponent(mask, W, H, c, opts)) comps.push(p)
+  }
+  const out = []
+  for (const c of comps) {
+    const bw = c.mxX - c.mnX + 1, bh = c.mxY - c.mnY + 1
+    const fill = c.a / (bw * bh)
+    const aspect = bw / bh
+    if (bh < minH || bh > maxH) continue
+    if (bw < minW || bw > maxW) continue
+    if (aspect < 0.12 || aspect > 3.0) continue
+    if (fill < 0.06 || fill > 0.95) continue
+    // отбрасываем «линии» (рамки/подчёркивания)
+    if (fill < 0.25 && (bw > W * 0.6 || bh > H * 0.6)) continue
+    const norm = normalizeGlyph(mask, W, H, c)
+    let sum = 0
+    for (let i = 0; i < norm.length; i++) sum += norm[i]
+    const stroke = sum / (GW * GH)
+    const feat = buildFeatures(norm, { aspect, fill, stroke })
+    out.push({
+      bbox: { mnX: c.mnX, mnY: c.mnY, mxX: c.mxX, mxY: c.mxY, w: bw, h: bh },
+      cx: c.mnX + bw / 2, cy: c.mnY + bh / 2,
+      area: c.a, fill: Math.round(fill * 1000) / 1000, aspect: Math.round(aspect * 1000) / 1000,
+      stroke: Math.round(stroke * 1000) / 1000, norm, feat, mask, W, H
+    })
+  }
+  return out
+}
+
+// строка цифр: самая населённая горизонтальная полоса, слева направо
+function dominantRow(glyphs) {
+  if (!glyphs.length) return []
+  const hs = glyphs.map(g => g.bbox.h).sort((a, b) => a - b)
+  const medH = hs[Math.floor(hs.length / 2)]
+  const band = Math.max(12, medH * 0.6)
+  const sorted = glyphs.slice().sort((a, b) => a.cy - b.cy)
+  let best = []
+  for (let i = 0; i < sorted.length; i++) {
+    const grp = sorted.filter(g => Math.abs(g.cy - sorted[i].cy) <= band)
+    if (grp.length > best.length) best = grp
+  }
+  return best.sort((a, b) => a.cx - b.cx)
+}
+
+// ------------------------- ASCII-арт для разметки -------------------------
+function asciiArt(norm, w, h) {
+  w = w || GW; h = h || GH
+  const RAMP = ' .:-=+*#%@'
+  const lines = []
+  for (let y = 0; y < h; y++) {
+    let s = '|'
+    for (let x = 0; x < w; x++) {
+      const v = norm[y * w + x]
+      s += RAMP[Math.max(0, Math.min(RAMP.length - 1, Math.round(v * (RAMP.length - 1))))]
+    }
+    lines.push(s + '|')
+  }
+  return lines.join('\n')
+}
+
+// ------------------------- база размеченных глифов -------------------------
+function f32ToB64(f) { return Buffer.from(f.buffer, f.byteOffset, f.byteLength).toString('base64') }
+function b64ToF32(s) {
+  const b = Buffer.from(s, 'base64')
+  return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)
+}
+
+class GlyphStore {
+  constructor(dir) {
+    this.dir = dir
+    this.file = path.join(dir, 'glyphs.jsonl')
+    this.samples = []
+    this.dirty = false
+    this.load()
+  }
+  load() {
+    try {
+      if (!fs.existsSync(this.file)) return
+      const lines = fs.readFileSync(this.file, 'utf8').split('\n')
+      for (const ln of lines) {
+        const s = ln.trim()
+        if (!s) continue
+        try {
+          const o = JSON.parse(s)
+          if (o && typeof o.digit === 'number' && o.f) this.samples.push({ digit: o.digit, feat: b64ToF32(o.f), src: o.src || '', id: o.id || '' })
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  ensureDir() { try { fs.mkdirSync(this.dir, { recursive: true }) } catch (e) {} }
+  add(digit, feat, meta) {
+    const id = 'g' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36)
+    const rec = { id, digit, f: f32ToB64(feat), src: (meta && meta.src) || '', ts: new Date().toISOString() }
+    this.samples.push({ digit, feat, src: rec.src, id })
+    this.ensureDir()
+    fs.appendFileSync(this.file, JSON.stringify(rec) + '\n')
+    // картинка — для контроля глазами
+    try {
+      const d = path.join(this.dir, 'glyphs', String(digit))
+      fs.mkdirSync(d, { recursive: true })
+      fs.writeFileSync(path.join(d, id + '.png'), pngFromNorm(feat.subarray(0, GW * GH), 8))
+    } catch (e) {}
+    return id
+  }
+  counts() {
+    const c = {}
+    for (const s of this.samples) c[s.digit] = (c[s.digit] || 0) + 1
+    return c
+  }
+  get size() { return this.samples.length }
+  // k-NN + оценка уверенности.
+  // conf  — доля голосов ближайших соседей (вес 1/(1+d²), чтобы дальние не размывали);
+  // sep   — во сколько раз ближайший «чужой» пример дальше ближайшего «своего»
+  //         (главный признак: у верно распознанной цифры sep обычно десятки);
+  // trust — итоговая уверенность, которую сравниваем с порогом.
+  classify(feat, k) {
+    if (!this.samples.length) return null
+    k = Math.min(k || KNN_K, this.samples.length)
+    const dists = []
+    for (const s of this.samples) {
+      let d = 0
+      const f = s.feat
+      for (let i = 0; i < FEAT_DIM; i++) { const t = feat[i] - f[i]; d += t * t }
+      dists.push({ d: Math.sqrt(d), digit: s.digit })
+    }
+    dists.sort((a, b) => a.d - b.d)
+    // ближайший пример каждого класса
+    const nearest = {}
+    for (const t of dists) if (nearest[t.digit] === undefined) nearest[t.digit] = t.d
+    const rankedCls = Object.entries(nearest).map(([d, v]) => ({ digit: Number(d), d: v })).sort((a, b) => a.d - b.d)
+    const bestCls = rankedCls[0]
+    const secondCls = rankedCls[1] || { digit: -1, d: Infinity }
+    // голосование k ближайших
+    const top = dists.slice(0, k)
+    const votes = {}
+    let wsum = 0
+    for (const t of top) { const w = 1 / (1 + t.d * t.d); votes[t.digit] = (votes[t.digit] || 0) + w; wsum += w }
+    const ranked = Object.entries(votes).map(([d, w]) => ({ digit: Number(d), w })).sort((a, b) => b.w - a.w)
+    const best = ranked[0]
+    const second = ranked[1] || { digit: -1, w: 0 }
+    const conf = wsum ? best.w / wsum : 0
+    const margin = wsum ? (best.w - second.w) / wsum : 0
+    const dSame = bestCls ? bestCls.d : 0
+    const dOther = secondCls.d
+    const sep = isFinite(dOther) ? dOther / Math.max(0.05, dSame) : 20
+    const cls = this.counts()[best.digit] || 0
+    const sepFactor = Math.min(1, sep / 4)
+    const classFactor = 0.75 + 0.25 * Math.min(1, cls / 5)
+    const trust = conf * (0.35 + 0.65 * sepFactor) * classFactor
+    return {
+      digit: best.digit, conf: Math.round(conf * 1000) / 1000, trust: Math.round(trust * 1000) / 1000,
+      margin: Math.round(margin * 1000) / 1000, sep: Math.round(Math.min(sep, 999) * 100) / 100,
+      dist: Math.round(dSame * 1000) / 1000, distOther: isFinite(dOther) ? Math.round(dOther * 1000) / 1000 : null,
+      alt: second.digit >= 0 ? second.digit : null, classCount: cls, method: 'knn'
+    }
+  }
+}
+
+// ------------------------- очередь на разметку -------------------------
+class LabelQueue {
+  constructor(dir) {
+    this.dir = dir
+    this.file = path.join(dir, 'queue.jsonl')
+    this.items = []
+    this.load()
+  }
+  load() {
+    try {
+      if (!fs.existsSync(this.file)) return
+      for (const ln of fs.readFileSync(this.file, 'utf8').split('\n')) {
+        const s = ln.trim(); if (!s) continue
+        try { this.items.push(JSON.parse(s)) } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  save() {
+    try {
+      fs.mkdirSync(this.dir, { recursive: true })
+      fs.writeFileSync(this.file, this.items.map(i => JSON.stringify(i)).join('\n') + (this.items.length ? '\n' : ''))
+    } catch (e) {}
+  }
+  push(item) { this.items.push(item); this.dirty = true }
+  remove(id) { const i = this.items.findIndex(x => x.id === id); if (i >= 0) this.items.splice(i, 1); this.dirty = true }
+  get size() { return this.items.length }
+  has(feat) {
+    // не дублируем один и тот же глиф
+    for (const it of this.items) {
+      if (!it.f) continue
+      const f = b64ToF32(it.f)
+      let d = 0
+      for (let i = 0; i < FEAT_DIM; i++) { const t = feat[i] - f[i]; d += t * t }
+      if (Math.sqrt(d) < 0.35) return true
+    }
+    return false
+  }
+}
+
+// ------------------------- MLP (чистый JS) -------------------------
+class MLP {
+  constructor(nIn, nHid, nOut) {
+    this.nIn = nIn || FEAT_DIM; this.nHid = nHid || 20; this.nOut = nOut || 10
+    this.W1 = new Float64Array(this.nIn * this.nHid)
+    this.b1 = new Float64Array(this.nHid)
+    this.W2 = new Float64Array(this.nHid * this.nOut)
+    this.b2 = new Float64Array(this.nOut)
+    this.initWeights()
+  }
+  initWeights() {
+    const s1 = Math.sqrt(2 / this.nIn), s2 = Math.sqrt(2 / this.nHid)
+    for (let i = 0; i < this.W1.length; i++) this.W1[i] = (Math.random() * 2 - 1) * s1
+    for (let i = 0; i < this.W2.length; i++) this.W2[i] = (Math.random() * 2 - 1) * s2
+  }
+  forward(x) {
+    const h = new Float64Array(this.nHid)
+    for (let j = 0; j < this.nHid; j++) {
+      let s = this.b1[j]
+      for (let i = 0; i < this.nIn; i++) s += x[i] * this.W1[i * this.nHid + j]
+      h[j] = s > 0 ? s : 0.01 * s   // LeakyReLU
+    }
+    const o = new Float64Array(this.nOut)
+    let mx = -Infinity
+    for (let k = 0; k < this.nOut; k++) {
+      let s = this.b2[k]
+      for (let j = 0; j < this.nHid; j++) s += h[j] * this.W2[j * this.nOut + k]
+      o[k] = s; if (s > mx) mx = s
+    }
+    let sum = 0
+    for (let k = 0; k < this.nOut; k++) { o[k] = Math.exp(o[k] - mx); sum += o[k] }
+    for (let k = 0; k < this.nOut; k++) o[k] /= sum
+    return { h, o }
+  }
+  predict(x) {
+    const { o } = this.forward(x)
+    let bi = 0, si = -1
+    for (let k = 0; k < this.nOut; k++) if (o[k] > o[bi]) { si = bi; bi = k } else if (si < 0 || o[k] > o[si]) si = k
+    return { digit: bi, conf: o[bi], alt: si >= 0 ? si : null, margin: o[bi] - (si >= 0 ? o[si] : 0), method: 'mlp' }
+  }
+  train(X, Y, opts) {
+    opts = opts || {}
+    const epochs = opts.epochs || 120, lr0 = opts.lr || 0.02, bs = opts.batch || 16
+    const n = X.length
+    const gW1 = new Float64Array(this.W1.length), gb1 = new Float64Array(this.b1.length)
+    const gW2 = new Float64Array(this.W2.length), gb2 = new Float64Array(this.b2.length)
+    const idx = [...Array(n).keys()]
+    const hist = []
+    for (let ep = 0; ep < epochs; ep++) {
+      for (let i = idx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = idx[i]; idx[i] = idx[j]; idx[j] = t }
+      const lr = lr0 * (1 - ep / epochs) + lr0 * 0.1
+      let loss = 0
+      for (let b = 0; b < n; b += bs) {
+        gW1.fill(0); gb1.fill(0); gW2.fill(0); gb2.fill(0)
+        const m = Math.min(bs, n - b)
+        for (let s = 0; s < m; s++) {
+          const x = X[idx[b + s]], y = Y[idx[b + s]]
+          const { h, o } = this.forward(x)
+          loss += -Math.log(Math.max(1e-9, o[y]))
+          const dO = new Float64Array(this.nOut)
+          for (let k = 0; k < this.nOut; k++) dO[k] = o[k] - (k === y ? 1 : 0)
+          const dH = new Float64Array(this.nHid)
+          for (let j = 0; j < this.nHid; j++) {
+            let s2 = 0
+            for (let k = 0; k < this.nOut; k++) { s2 += dO[k] * this.W2[j * this.nOut + k]; gW2[j * this.nOut + k] += dO[k] * h[j] }
+            dH[j] = h[j] > 0 ? s2 : 0.01 * s2
+          }
+          for (let k = 0; k < this.nOut; k++) gb2[k] += dO[k]
+          for (let j = 0; j < this.nHid; j++) {
+            gb1[j] += dH[j]
+            if (Math.abs(dH[j]) < 1e-12) continue
+            for (let i = 0; i < this.nIn; i++) gW1[i * this.nHid + j] += dH[j] * x[i]
+          }
+        }
+        const sc = lr / m
+        for (let i = 0; i < this.W1.length; i++) this.W1[i] -= sc * gW1[i]
+        for (let i = 0; i < this.b1.length; i++) this.b1[i] -= sc * gb1[i]
+        for (let i = 0; i < this.W2.length; i++) this.W2[i] -= sc * gW2[i]
+        for (let i = 0; i < this.b2.length; i++) this.b2[i] -= sc * gb2[i]
+      }
+      if (ep % 10 === 0 || ep === epochs - 1) hist.push({ epoch: ep, loss: Math.round(loss / n * 1000) / 1000, acc: this.accuracy(X, Y) })
+    }
+    return hist
+  }
+  accuracy(X, Y) {
+    let ok = 0
+    for (let i = 0; i < X.length; i++) if (this.predict(X[i]).digit === Y[i]) ok++
+    return X.length ? Math.round(1000 * ok / X.length) / 10 : 0
+  }
+  toJSON() {
+    return { v: 1, nIn: this.nIn, nHid: this.nHid, nOut: this.nOut, trained: new Date().toISOString(),
+      W1: Buffer.from(this.W1.buffer).toString('base64'), b1: Buffer.from(this.b1.buffer).toString('base64'),
+      W2: Buffer.from(this.W2.buffer).toString('base64'), b2: Buffer.from(this.b2.buffer).toString('base64') }
+  }
+  static fromJSON(o) {
+    if (!o || o.nIn !== FEAT_DIM) return null
+    const m = new MLP(o.nIn, o.nHid, o.nOut)
+    const rd = (s, n) => { const b = Buffer.from(s, 'base64'); const a = new Float64Array(b.buffer, b.byteOffset, b.byteLength / 8); return a.length === n ? a : null }
+    const W1 = rd(o.W1, m.W1.length), b1 = rd(o.b1, m.b1.length), W2 = rd(o.W2, m.W2.length), b2 = rd(o.b2, m.b2.length)
+    if (!W1 || !b1 || !W2 || !b2) return null
+    m.W1 = W1; m.b1 = b1; m.W2 = W2; m.b2 = b2
+    m.trained = o.trained
+    return m
+  }
+  static load(dir) {
+    try {
+      const p = path.join(dir, 'model.json')
+      if (!fs.existsSync(p)) return null
+      return MLP.fromJSON(JSON.parse(fs.readFileSync(p, 'utf8')))
+    } catch (e) { return null }
+  }
+  save(dir) {
+    try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'model.json'), JSON.stringify(this.toJSON())) ; return true } catch (e) { return false }
+  }
+}
+
+// ------------------------- итоговое распознавание -------------------------
+function recognize(glyphs, store, model, opts) {
+  opts = opts || {}
+  const row = dominantRow(glyphs)
+  const items = row.map((g, i) => {
+    const knn = store ? store.classify(g.feat, opts.k || KNN_K) : null
+    let mlp = null
+    if (model) { try { mlp = model.predict(g.feat) } catch (e) {} }
+    // берём тот результат, который увереннее; при равенстве — k-NN (он объяснимее)
+    let pick = null
+    if (knn && mlp) pick = (mlp.conf >= (knn.trust || 0)) ? mlp : knn
+    else pick = knn || mlp
+    return {
+      idx: i, x: Math.round(g.cx), y: Math.round(g.cy), w: g.bbox.w, h: g.bbox.h,
+      fill: g.fill, aspect: g.aspect,
+      knn: knn ? { digit: knn.digit, conf: knn.conf, trust: knn.trust, alt: knn.alt, dist: knn.dist, n: knn.classCount } : null,
+      mlp: mlp ? { digit: mlp.digit, conf: Math.round(mlp.conf * 1000) / 1000, alt: mlp.alt } : null,
+      digit: pick ? pick.digit : null,
+      conf: pick ? Math.round(((pick.trust != null ? pick.trust : pick.conf) || 0) * 1000) / 1000 : 0,
+      method: pick ? pick.method : 'none',
+      glyph: g
+    }
+  })
+  const confOk = opts.confOk != null ? opts.confOk : CONF_OK
+  const text = items.filter(it => it.conf >= confOk).map(it => String(it.digit)).join('')
+  const textAll = items.map(it => it.digit === null ? '?' : (it.conf >= confOk ? String(it.digit) : String(it.digit).toLowerCase())).join('')
+  const needLabel = items.filter(it => it.conf < (opts.confQueue != null ? opts.confQueue : CONF_QUEUE))
+  return { text, textAll, items, needLabel, rowCount: row.length, allCount: glyphs.length }
+}
+
+function enqueueGlyphs(queue, needLabel, meta) {
+  let added = 0
+  for (const it of needLabel) {
+    const g = it.glyph
+    if (!g || !g.feat) continue
+    if (queue.has(g.feat)) continue
+    const id = 'q' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36)
+    let png = ''
+    try {
+      const d = path.join(queue.dir, 'unlabeled')
+      fs.mkdirSync(d, { recursive: true })
+      png = path.join(d, id + '.png')
+      fs.writeFileSync(png, pngFromNorm(g.feat.subarray(0, GW * GH), 8))
+    } catch (e) {}
+    queue.push({
+      id, f: f32ToB64(g.feat), png,
+      src: (meta && meta.src) || '', round: meta && meta.round, wall: meta && meta.wall,
+      bbox: g.bbox, conf: it.conf, guess: it.digit, ts: new Date().toISOString()
+    })
+    added++
+  }
+  if (added) queue.save()
+  return added
+}
+
+  return {
+    GW, GH, ZONES, FEAT_DIM, CONF_OK, CONF_QUEUE,
+    components8, splitComponent, subComponent, normalizeGlyph, buildFeatures,
+    extractGlyphs, dominantRow, asciiArt,
+    pngGray, pngRgba, pngFromNorm, pngFromMask,
+    GlyphStore, LabelQueue, MLP, recognize, enqueueGlyphs, f32ToB64, b64ToF32
+  }
+})()
 
 // ========================= ПАЛИТРА КАРТЫ MINECRAFT =========================
 const BASE_COLORS = [[0,0,0],[127,178,56],[247,233,163],[199,199,199],[255,0,0],[160,160,255],[167,167,167],[0,124,0],[255,255,255],[164,168,184],[151,109,77],[112,112,112],[64,128,255],[104,83,50],[255,252,245],[216,127,51],[178,76,216],[102,153,216],[229,229,51],[127,204,25],[242,127,165],[76,76,76],[153,153,153],[76,127,153],[127,63,178],[51,76,178],[102,76,51],[102,127,51],[153,51,51],[25,25,25],[250,238,77],[92,219,213],[74,128,255],[0,217,58],[135,107,58],[112,2,2],[143,119,100],[161,83,37],[149,88,108],[114,119,139],[186,133,35],[103,117,52],[160,77,78],[57,42,35],[135,106,97],[86,91,91],[118,70,86],[74,59,91],[77,51,35],[76,83,42],[143,61,46],[37,22,16],[189,48,49],[148,63,97],[126,32,44],[22,119,121],[58,142,140],[74,117,116],[23,121,121],[90,90,90],[224,169,112],[127,106,82],[221,169,46],[156,104,66]]
@@ -1324,7 +1934,6 @@ async function saveRecord(outDir, snap, label, roundNo) {
   // ---- база цифр (обучаемая) ----
   let store = null, model = null, queue = null
   try {
-    if (!DIG) throw new Error('digits.js не загружен')
     store = new DIG.GlyphStore(LEARN_DIR)
     model = DIG.MLP.load(LEARN_DIR)
     queue = new DIG.LabelQueue(LEARN_DIR)
@@ -1355,11 +1964,16 @@ async function saveRecord(outDir, snap, label, roundNo) {
     const fillRatio = asm.placed / Math.max(1, asm.grid.total)
 
     // ---- скоринг: геометрия важнее, локальное распознавание — вспомогательный сигнал ----
-    const seamPenalty = asm.seamCost <= 25 ? asm.seamCost * 12 : 300 + (asm.seamCost - 25) * 40
+    const seamPenalty = Math.max(0, asm.seamCost <= 25 ? asm.seamCost * 12 : 300 + (asm.seamCost - 25) * 40)
     const sizeBonus = asm.placed * 90
     const fillBonus = Math.round(fillRatio * 1500)
-    const dotBonus = dot === null ? 0 : (dot >= 0.9 ? 1800 : dot >= 0.7 ? 1100 : dot >= 0.4 ? 400 : dot >= 0.1 ? -300 : -1800)
-    const distBonus = dist === null ? 0 : (dist <= 10 ? 1000 : dist <= 18 ? 650 : dist <= 30 ? 250 : dist <= 50 ? 0 : -400)
+    // Дистанция — самый надёжный признак: бота телепортируют вплотную к СВОЕЙ капче
+    // (в вашем логе 2.4-3.7 блока у правильной стены и десятки у соседней).
+    // yaw (dot) ненадёжен: сервер не всегда его ставит, поэтому вес маленький.
+    const distBonus = dist === null ? 0
+      : (dist <= 6 ? 2200 : dist <= 12 ? 1500 : dist <= 20 ? 700 : dist <= 35 ? 0 : dist <= 60 ? -1500 : -3000)
+    const dotBonus = dot === null ? 0
+      : (dot >= 0.7 ? 500 : dot >= 0.2 ? 150 : dot >= -0.3 ? -150 : -500)
     const confident = rec.items.filter(i => i.conf >= DIG_CONF_OK).length
     const digitBonus = Math.min(900, (rec.text.length >= 3 ? 500 : 0) + confident * 100)
     const gapPenalty = w.contiguous ? 0 : 1200
@@ -1448,7 +2062,7 @@ async function saveRecord(outDir, snap, label, roundNo) {
     fs.writeFileSync(path.join(outDir, 'digits.json'), JSON.stringify({
       text: best.rec.text, textAll: best.rec.textAll, rowCount: best.rec.rowCount, allGlyphs: best.rec.allCount,
       needLabel: best.rec.needLabel.length, queued,
-      model: model ? 'mlp+knn' : (store && store.size ? 'knn' : 'нет (база пуста — запустите node label.js)'),
+      model: model ? 'mlp+knn' : (store && store.size ? 'knn' : 'нет (база пуста — запустите node main.js --label)'),
       items: best.rec.items.map(it => ({
         x: it.x, y: it.y, w: it.w, h: it.h, digit: it.digit, conf: it.conf, method: it.method,
         knn: it.knn, mlp: it.mlp
@@ -1494,7 +2108,7 @@ async function saveRecord(outDir, snap, label, roundNo) {
   }
   step(label + ': 🔢 ЦИФРЫ="' + best.rec.text + '"' + (best.rec.textAll !== best.rec.text ? ' (сырое "' + best.rec.textAll + '")' : '') +
     ' глифов=' + best.rec.rowCount + '/' + best.rec.allCount +
-    (queued ? ' | в очередь на разметку: +' + queued + ' (node label.js)' : ''))
+    (queued ? ' | в очередь на разметку: +' + queued + ' (node main.js --label)' : ''))
 
   return {
     wall: best.w.tag, cols: asm.grid.cols, rows: asm.grid.rows,
@@ -1502,6 +2116,15 @@ async function saveRecord(outDir, snap, label, roundNo) {
     ori: asm.ori.tag, hAsc: asm.ori.hAsc, yAsc: asm.ori.yAsc, rotRule: asm.rotRule, permUsed: asm.permUsed, colPerm: asm.colPerm,
     seamCost: asm.seamCost, natSeamCost: asm.natSeamCost, score: best.score, dot: best.dot, dist: best.dist,
     digits: best.rec.text, digitsAll: best.rec.textAll, glyphCount: best.rec.rowCount, needLabel: best.rec.needLabel.length, queued,
+    // признаки глифов — нужны, чтобы разметить ответом из Telegram
+    digitItems: (best.rec.items || []).map(it => ({
+      x: it.x, y: it.y, w: it.w, h: it.h,
+      guess: it.digit, conf: it.conf, method: it.method,
+      bbox: it.glyph ? it.glyph.bbox : null,
+      feat: it.glyph ? it.glyph.feat : null
+    })),
+    pngFile: path.join(outDir, 'ORIGINAL_CAPTCHA_x1.png'),
+    pngFile2x: path.join(outDir, 'ORIGINAL_CAPTCHA.png'),
     candidates: stats.map(s => ({ wall: s.w.tag, score: s.score, breakdown: s.breakdown })),
     inkDensity: Math.round(best.im.inkCount / (asm.W * asm.H) * 10000) / 10000,
     layout: asm.layout, dir: outDir, capFile, originalFile: 'ORIGINAL_CAPTCHA.png'
@@ -1898,7 +2521,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.9.0: геометрия сборки ===')
+  console.log('=== SELFTEST v3.9.1: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -2214,6 +2837,29 @@ async function selftest() {
       (rec ? ' | счёт: ' + rec.candidates.map(c => c.wall + '=' + c.score).join(', ') : ''))
   }
 
+  // ---- РЕГРЕССИЯ из вашего лога: бот стоит вплотную к капче, но yaw смотрит назад (dot≈-1) ----
+  console.log('--- ближайшая стена выигрывает, даже если бот смотрит не на неё ---')
+  {
+    const cols = 4, rows = 3
+    const gA = makeSyntheticDigits(cols, rows, '5309', 2468)
+    const gB = makeSyntheticDigits(cols, rows, '1111', 1357)
+    // капча вплотную сзади (dist≈2.5, dot≈-1), конкурент — далеко впереди (dist≈60, dot≈+1)
+    const view = { x: 202, y: 70, z: 305, yaw: 0, pitch: 0 }   // бот смотрит на +z (на юг)
+    // A — капча: вплотную, но ЗА спиной (dot ≈ -1).  B — соседняя: далеко ВПЕРЕДИ (dot ≈ +1)
+    const A = makeWallSnapshot(gA.img, gA.W, gA.H, { axis: 'z', viewSide: +1, rots: true, id0: 4000, ox: 200, oy: 70, oz: 302, view })
+    const B = makeWallSnapshot(gB.img, gB.W, gB.H, { axis: 'z', viewSide: -1, rots: true, id0: 4100, ox: 200, oy: 70, oz: 365, view })
+    const maps = new Map([...A.maps, ...B.maps])
+    const snap = { maps, frames: A.frames.concat(B.frames), chats: [], events: ['selftest'], view, metaDump: [] }
+    const outDir = path.join(REC_ROOT || __dirname, 'selftest_learn', 'behind')
+    const rec = await saveRecord(outDir, snap, 'BEHIND', null)
+    const ok = !!rec && rec.wall === 'z302' && rec.digits === '5309' && rec.dot < 0
+    if (!ok) fails++
+    console.log('  ' + (ok ? '\u2705' : '\u274c') + ' выбрана=' + (rec ? rec.wall : 'нет') + ' (ждали z302, dot<0)' +
+      ' dot=' + (rec ? rec.dot.toFixed(2) : '?') + ' dist=' + (rec ? rec.dist : '?') +
+      ' цифры="' + (rec ? rec.digits : '') + '" (ждали "5309")' +
+      (rec ? ' | счёт: ' + rec.candidates.map(c => c.wall + '=' + c.score).join(', ') : ''))
+  }
+
   LEARN_DIR = learnWas
   if (!CLI.debug) {
     for (const d of ['selftest_e2e', 'selftest_learn', 'selftest']) {
@@ -2251,16 +2897,549 @@ function replayDir(dir) {
   return { snap, out }
 }
 
+// ========================= TELEGRAM: ТРАНСПОРТ =========================
+function tgLogFile() { return path.join(LEARN_DIR, 'telegram.log') }
+function tgLog(msg) {
+  const line = new Date().toISOString().slice(11, 19) + ' [TG] ' + msg
+  try { fs.mkdirSync(LEARN_DIR, { recursive: true }); fs.appendFileSync(tgLogFile(), line + '\n') } catch (e) {}
+  step('[TG] ' + msg)
+}
+
+function parseSocksUrl(s) {
+  try {
+    const m = String(s || '').match(/^socks5[h]?:\/\/([^:]*):([^@]*)@([^:]+):(\d+)\/?$/i)
+    if (!m) return null
+    return { host: m[3], port: Number(m[4]), username: decodeURIComponent(m[1]), password: decodeURIComponent(m[2]) }
+  } catch (e) { return null }
+}
+
+function socksTlsConnect(host, port, socks, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (!SocksClient) { reject(new Error('модуль socks не установлен')); return }
+    let done = false
+    const to = setTimeout(() => { if (!done) { done = true; reject(new Error('SOCKS timeout')) } }, timeoutMs || 25000)
+    SocksClient.createConnection({
+      proxy: { host: socks.host, port: socks.port, type: 5, userId: socks.username, password: socks.password },
+      command: 'connect', destination: { host, port }
+    }).then(conn => {
+      if (done) { try { conn.socket.destroy() } catch (e) {} return }
+      let secure = null
+      try {
+        secure = tls.connect({ socket: conn.socket, servername: host, minVersion: 'TLSv1.2' }, () => {
+          if (done) return
+          done = true; clearTimeout(to)
+          resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {} try { conn.socket.destroy() } catch (e) {} } })
+        })
+      } catch (e) { if (!done) { done = true; clearTimeout(to); try { conn.socket.destroy() } catch (x) {}; reject(e) } ; return }
+      secure.on('error', e => { if (!done) { done = true; clearTimeout(to); try { conn.socket.destroy() } catch (x) {}; reject(e) } })
+    }).catch(e => { if (!done) { done = true; clearTimeout(to); reject(e) } })
+  })
+}
+
+async function httpsRequest(o) {
+  const secure = o.secure !== false
+  const host = o.host, port = o.port || (secure ? 443 : 80)
+  const mod = secure ? https : http
+  let sock = null
+  if (o.socks) {
+    if (!secure) { /* через SOCKS без TLS не ходим */ }
+    else {
+      try { sock = await socksTlsConnect(host, port, o.socks, Math.min(25000, o.timeoutMs || 30000)) }
+      catch (e) { return { ok: false, error: 'SOCKS: ' + ((e && e.message) || e) } }
+    }
+  }
+  return await new Promise(resolve => {
+    const headers = Object.assign({}, o.headers || {})
+    if (o.body) headers['Content-Length'] = Buffer.isBuffer(o.body) ? o.body.length : Buffer.byteLength(o.body)
+    const opts = { hostname: host, port, path: o.path, method: o.method || 'POST', timeout: o.timeoutMs || 30000, headers }
+    if (sock) opts.createConnection = () => sock.socket
+    let req
+    try {
+      req = mod.request(opts, res => {
+        const chunks = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => { if (sock) try { sock.cleanup() } catch (e) {}; resolve({ ok: true, status: res.statusCode, body: Buffer.concat(chunks) }) })
+        res.on('error', e => { if (sock) try { sock.cleanup() } catch (x) {}; resolve({ ok: false, error: 'RES: ' + e.message }) })
+      })
+    } catch (e) { if (sock) try { sock.cleanup() } catch (x) {}; resolve({ ok: false, error: 'REQ: ' + ((e && e.message) || e) }); return }
+    req.on('error', e => { if (sock) try { sock.cleanup() } catch (x) {}; resolve({ ok: false, error: ((e && e.code) ? e.code + ' ' : '') + e.message }) })
+    req.on('timeout', () => { try { req.destroy() } catch (e) {}; if (sock) try { sock.cleanup() } catch (x) {}; resolve({ ok: false, error: 'timeout' }) })
+    if (o.body) req.write(o.body)
+    req.end()
+  })
+}
+
+function tgMultipart(fields, file) {
+  const b = '----tg' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+  const parts = []
+  for (const k of Object.keys(fields)) {
+    if (fields[k] === undefined || fields[k] === null) continue
+    parts.push(Buffer.from('--' + b + '\r\nContent-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(fields[k]) + '\r\n'))
+  }
+  if (file) {
+    parts.push(Buffer.from('--' + b + '\r\nContent-Disposition: form-data; name="' + file.field + '"; filename="' + file.name + '"\r\nContent-Type: ' + (file.type || 'application/octet-stream') + '\r\n\r\n'))
+    parts.push(Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data))
+    parts.push(Buffer.from('\r\n'))
+  }
+  parts.push(Buffer.from('--' + b + '--\r\n'))
+  return { body: Buffer.concat(parts), contentType: 'multipart/form-data; boundary=' + b }
+}
+
+let tgTransport = null
+function tgTransports() {
+  const list = ['direct']
+  let isHttp = false
+  try { isHttp = new URL(TG.apiUrl).protocol === 'http:' } catch (e) {}
+  if (isHttp) return list   // локальный/тестовый endpoint — прокси не нужен
+  const s = parseSocksUrl(TG.socksUrl)
+  if (s) list.push({ name: 'tg.socksUrl', socks: s })
+  if (TG.useMcProxy && PROXY.host) list.push({ name: 'mc-proxy', socks: { host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password } })
+  return list
+}
+function tgTransportByName(n) {
+  if (n === 'direct' || !n) return 'direct'
+  const f = tgTransports().find(t => t !== 'direct' && t.name === n)
+  return f || 'direct'
+}
+
+// вызов метода Telegram Bot API: сначала рабочий транспорт, потом остальные
+async function tgApi(method, params, file, timeoutMs) {
+  if (!TG.token) return { ok: false, description: 'нет telegram.token' }
+  let u
+  try { u = new URL(TG.apiUrl + '/bot' + TG.token + '/' + method) } catch (e) { return { ok: false, description: 'плохой telegram.apiUrl' } }
+  const order = []
+  if (tgTransport) order.push(tgTransport)
+  for (const t of tgTransports()) if (order.indexOf(t) < 0) order.push(t)
+
+  let lastErr = 'нет транспорта'
+  for (const tr of order) {
+    for (let retry = 0; retry < 2; retry++) {
+      let body = null, headers = {}
+      if (file) { const mp = tgMultipart(params || {}, file); body = mp.body; headers['Content-Type'] = mp.contentType }
+      else { body = JSON.stringify(params || {}); headers['Content-Type'] = 'application/json' }
+      const socks = (tr === 'direct') ? null : tr.socks
+      const tName = (tr === 'direct') ? 'direct' : tr.name
+      const secure = u.protocol !== 'http:'
+      const r = await httpsRequest({ host: u.hostname, port: Number(u.port || (secure ? 443 : 80)), path: u.pathname + u.search, method: 'POST', headers, body, timeoutMs: timeoutMs || TG.timeoutMs, socks, secure })
+      if (!r.ok) { lastErr = tName + ': ' + r.error; tgLog('API ' + method + ' через ' + tName + ' не прошёл: ' + r.error); break }
+      let json = null
+      try { json = JSON.parse(r.body.toString('utf8')) } catch (e) {}
+      if (r.status === 429) {
+        const ra = json && json.parameters && json.parameters.retry_after ? Number(json.parameters.retry_after) : 3
+        tgLog('429 too many requests, жду ' + ra + 'с')
+        await sleep(Math.min(30, ra) * 1000)
+        continue
+      }
+      if (json && json.ok) {
+        if (tgTransport !== tr) { tgTransport = tr; tgLog('транспорт: ' + tName) }
+        return json
+      }
+      return { ok: false, error_code: r.status, description: (json && json.description) || ('HTTP ' + r.status + ' ' + r.body.toString('utf8').slice(0, 200)) }
+    }
+  }
+  return { ok: false, description: lastErr }
+}
+
+async function tgSendText(text) {
+  const r = await tgApi('sendMessage', { chat_id: TG.chatId, text, disable_web_page_preview: true })
+  if (!r.ok) tgLog('sendMessage ошибка: ' + (r.description || r.error_code))
+  return r
+}
+async function tgSendPhoto(png, caption) {
+  const r = await tgApi('sendPhoto', { chat_id: TG.chatId, caption, parse_mode: '' }, { field: 'photo', name: 'captcha.png', type: 'image/png', data: png })
+  if (!r.ok) tgLog('sendPhoto ошибка: ' + (r.description || r.error_code))
+  return r
+}
+
+// ========================= TELEGRAM: ОЧЕРЕДЬ И РАЗМЕТКА =========================
+class AsyncQueue {
+  constructor(cap) { this.cap = Math.max(1, cap); this.items = []; this.closed = false; this.pushWait = []; this.shiftWait = [] }
+  async push(x) {
+    while (this.items.length >= this.cap && !this.closed) await new Promise(r => this.pushWait.push(r))
+    this.items.push(x)
+    const w = this.shiftWait.shift(); if (w) w()
+  }
+  async shift() {
+    while (!this.items.length && !this.closed) await new Promise(r => this.shiftWait.push(r))
+    if (this.items.length) return this.items.shift()
+    return null
+  }
+  close() { this.closed = true; while (this.pushWait.length) this.pushWait.shift()(); while (this.shiftWait.length) this.shiftWait.shift()() }
+  get size() { return this.items.length }
+}
+
+// разметка глифов ответом пользователя: цифры сопоставляются слева направо
+function labelRoundWithDigits(store, rec, round, digits) {
+  const items = (rec.digitItems || []).filter(it => it.feat)
+  if (!items.length) return { ok: false, reason: 'нет глифов' }
+  if (digits.length !== items.length) return { ok: false, reason: 'не совпало количество', found: items.length, got: digits.length }
+  items.forEach((it, i) => {
+    try { store.add(Number(digits[i]), it.feat, { src: 'tg:round' + round + ':' + i }) } catch (e) { tgLog('store.add err: ' + e.message) }
+  })
+  return { ok: true, n: items.length }
+}
+
+// убрать глифы этого раунда из очереди ручной разметки (они уже размечены через TG)
+function dropQueueRound(round) {
+  try {
+    const q = new DIG.LabelQueue(LEARN_DIR)
+    const before = q.items.length
+    q.items = q.items.filter(it => Number(it.round) !== Number(round))
+    if (q.items.length !== before) q.save()
+    return before - q.items.length
+  } catch (e) { return 0 }
+}
+
+// полоса из нормализованных глифов (для команды /glyphs и диагностики)
+function glyphStripPng(items) {
+  const list = (items || []).filter(it => it.feat)
+  if (!list.length) return null
+  const stride = DIG.GW + 8
+  const W = list.length * stride + 6, H = DIG.GH + 8
+  const canvas = new Uint8Array(W * H)
+  canvas.fill(255)
+  list.forEach((it, i) => {
+    const ox = 4 + i * stride
+    for (let y = 0; y < DIG.GH; y++) for (let x = 0; x < DIG.GW; x++) {
+      const v = Number(it.feat[y * DIG.GW + x]) || 0
+      canvas[(y + 4) * W + ox + x] = Math.max(0, Math.min(255, Math.round(255 * (1 - v))))
+    }
+    if (i > 0) for (let y = 2; y < H - 2; y++) canvas[y * W + ox - 4] = 190
+  })
+  return DIG.pngGray(W, H, 4, (x, y) => canvas[y * W + x])
+}
+
+// обучение MLP из накопленной базы (используется и в --train, и в автообучении)
+function trainModel(store, opts) {
+  opts = opts || {}
+  if (store.size < 20) return { ok: false, reason: 'мало данных (' + store.size + ')' }
+  const idx = [...Array(store.size).keys()]
+  for (let i = idx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = idx[i]; idx[i] = idx[j]; idx[j] = t }
+  const nTest = Math.max(1, Math.floor(idx.length * 0.2))
+  const testIdx = idx.slice(0, nTest), trainIdx = idx.slice(nTest)
+  const X = a => a.map(i => Array.from(store.samples[i].feat))
+  const Y = a => a.map(i => store.samples[i].digit)
+  const t0 = Date.now()
+  const mlp = new DIG.MLP(DIG.FEAT_DIM, Number(cfgGet(CFG, 'digits.hidden', 20)) || 20, 10)
+  const hist = mlp.train(X(trainIdx), Y(trainIdx), { epochs: Number(cfgGet(CFG, 'digits.epochs', 150)) || 150, batch: 8, lr: 0.03 })
+  const res = {
+    ok: true, ms: Date.now() - t0, samples: store.size,
+    loss0: hist.length ? hist[0].loss : null, loss1: hist.length ? hist[hist.length - 1].loss : null,
+    accTrain: mlp.accuracy(X(trainIdx), Y(trainIdx)), accTest: mlp.accuracy(X(testIdx), Y(testIdx)), testSize: nTest,
+    counts: store.counts(), mlp
+  }
+  mlp.save(LEARN_DIR)
+  return res
+}
+
+// ========================= TELEGRAM: СЕССИЯ РАЗМЕТКИ =========================
+async function runTelegramSession(ctx, captureFn) {
+  const doCapture = captureFn || captureRound
+  const store = new DIG.GlyphStore(LEARN_DIR)
+  let model = DIG.MLP.load(LEARN_DIR)
+  const q = new AsyncQueue(TG.prefetch)
+  const st = { offset: 0, stop: false, labeled: 0, newLabels: 0, rounds: 0, skipped: 0, lastModelInfo: null }
+
+  const me = await tgApi('getMe')
+  if (!me.ok) {
+    tgLog('❌ getMe не прошёл: ' + (me.description || me.error_code) + ' — работаю БЕЗ Telegram')
+    return false
+  }
+  tgLog('бот @' + (me.result && me.result.username) + ' (id ' + (me.result && me.result.id) + ') | chat_id=' + TG.chatId +
+    ' | транспорт=' + (tgTransport === 'direct' ? 'direct' : (tgTransport && tgTransport.name)))
+  tgLog('база цифр: ' + store.size + ' ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет'))
+
+  // сбрасываем старые апдейты, чтобы не отвечать на вчерашние сообщения
+  await tgApi('getUpdates', { offset: -1, timeout: 0 })
+
+  await tgSendText('🟢 Бот запущен (v3.9.1)\n' +
+    'Раундов: ' + TARGET_ROUNDS + ' | предзагрузка: ' + TG.prefetch + ' картинки\n' +
+    'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её и создадут)') + '\n\n' +
+    'Как отвечать:\n' +
+    '• пришли цифры с картинки, например 4815\n' +
+    '• «+» — подтвердить мою догадку\n' +
+    '• /skip — пропустить картинку\n' +
+    '• /glyphs — показать, что я вырезал как цифры\n' +
+    '• /status — состояние базы\n' +
+    '• /train — обучить нейросеть сейчас\n' +
+    '• /stop — остановить всё')
+
+  // ---------- производитель: ловит раунды вперёд ----------
+  const producer = (async () => {
+    try {
+      for (let r = 1; r <= TARGET_ROUNDS && !st.stop && !ctx.aborted; r++) {
+        const t0 = Date.now()
+        let rec = null
+        try { rec = await doCapture(r, ctx) }
+        catch (e) { tgLog('❌ раунд ' + r + ': исключение при сборе: ' + ((e && e.message) || e)) }
+        st.rounds++
+        await q.push({ round: r, rec, ms: Date.now() - t0 })
+        if (!st.stop) tgLog('раунд ' + r + ' подготовлен за ' + Math.round((Date.now() - t0) / 1000) + 'с → в очереди (готово заранее: ' + q.size + ')')
+      }
+    } catch (e) {
+      tgLog('❌ производитель упал: ' + ((e && e.message) || e))
+    } finally {
+      q.close()
+      tgLog('сбор завершён: раундов ' + st.rounds)
+    }
+  })()
+
+  // ---------- потребитель: шлёт картинку и ждёт ответ ----------
+  const consumer = (async () => {
+    try {
+    while (!st.stop) {
+      const item = await q.shift()
+      if (!item) break
+      const { round, rec } = item
+      if (!rec) {
+        await tgSendText('⚠️ Раунд ' + round + '/' + TARGET_ROUNDS + ' не собрался (стена не найдена или мало плиток). Еду дальше.')
+        continue
+      }
+      const items = (rec.digitItems || []).filter(it => it.feat)
+      const guess = rec.digits || ''
+      const guessFull = guess.length === items.length && items.length > 0 && items.every(it => it.conf >= DIG_CONF_OK)
+      let png = null
+      try { png = fs.readFileSync(rec.pngFile) } catch (e) { try { png = fs.readFileSync(rec.pngFile2x) } catch (e2) {} }
+      if (!png) { await tgSendText('⚠️ Раунд ' + round + ': картинка не прочиталась с диска'); continue }
+
+      const cap = '🖼 Раунд ' + round + '/' + TARGET_ROUNDS + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows +
+        ' · seam ' + rec.seamCost + '\n' +
+        'Глифов найдено: ' + items.length + '\n' +
+        (items.length
+          ? (guessFull ? 'Моя догадка: ' + guess + ' — ответь «+» если верно, либо пришли правильные цифры'
+            : (guess ? 'Черновик (неуверенно): ' + rec.digitsAll + ' — пришли ' + items.length + ' цифр'
+              : 'Пришли ' + items.length + ' цифр слева направо'))
+          : '❗ глифы не нашлись — пришли /skip и я сообщу в лог (нужна настройка порогов)')
+      const sent = await tgSendPhoto(png, cap)
+      if (!sent.ok) { tgLog('не отправил фото раунда ' + round + ': ' + (sent.description || '')); continue }
+      tgLog('раунд ' + round + ': фото отправлено (message_id=' + (sent.result && sent.result.message_id) +
+        ') глифов=' + items.length + ' догадка="' + guess + '" уверен=' + guessFull)
+
+      if (TG.sendGlyphStrip && items.length) {
+        const strip = glyphStripPng(items)
+        if (strip) await tgSendPhoto(strip, 'Что я вырезал как цифры (раунд ' + round + ')')
+      }
+
+      // ---------- ждём ответ ----------
+      let answered = false
+      while (!answered && !st.stop) {
+        const msg = await tgWaitMessage(st)
+        if (!msg) continue
+        const text = String((msg.text || '')).trim()
+        const low = text.toLowerCase()
+        tgLog('раунд ' + round + ': ответ «' + text.slice(0, 60) + '» (update_id=' + msg.update_id + ')')
+
+        if (low === '/stop' || low === '/stop@' + ((me.result && me.result.username) || '').toLowerCase()) {
+          st.stop = true; ctx.aborted = true
+          await tgSendText('⏹ Остановлено по команде. Собрано раундов: ' + st.rounds + ', размечено глифов: ' + st.labeled)
+          break
+        }
+        if (low === '/help') {
+          await tgSendText('цифры — разметить картинку\n«+» — подтвердить догадку\n/skip — пропустить\n/glyphs — показать вырезанные глифы\n/status — состояние\n/train — обучить MLP\n/stop — остановить')
+          continue
+        }
+        if (low === '/status') {
+          await tgSendText('📊 База: ' + store.size + ' глифов ' + JSON.stringify(store.counts()) +
+            '\nMLP: ' + (model ? 'есть' : 'нет') + (st.lastModelInfo ? '\nПоследнее обучение: ' + st.lastModelInfo : '') +
+            '\nРазмечено в этой сессии: ' + st.labeled + ' | раундов собрано: ' + st.rounds + ' | пропущено: ' + st.skipped +
+            '\nВ очереди ручной разметки: ' + (new DIG.LabelQueue(LEARN_DIR)).size)
+          continue
+        }
+        if (low === '/glyphs') {
+          const strip = glyphStripPng(items)
+          if (strip) await tgSendPhoto(strip, 'Глифы раунда ' + round + ' (слева направо). Догадки: ' +
+            items.map((it, i) => (i + 1) + ') ' + (it.guess === null || it.guess === undefined ? '?' : it.guess) + '·' + it.conf).join('  '))
+          else await tgSendText('Глифов нет — вырезать нечего')
+          continue
+        }
+        if (low === '/train') {
+          const r = trainModel(store)
+          if (!r.ok) { await tgSendText('⚠️ ' + r.reason + '. Нужно ≥20 примеров.'); continue }
+          model = r.mlp
+          st.lastModelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.ms + 'мс)'
+          await tgSendText('🧠 MLP обучена: ' + st.lastModelInfo + '\nБаза: ' + r.samples + ' ' + JSON.stringify(r.counts))
+          continue
+        }
+        if (low === '/skip') {
+          st.skipped++
+          await tgSendText('⏭ Раунд ' + round + ' пропущен (глифы остались в очереди: node main.js --label)')
+          answered = true
+          break
+        }
+
+        let digits = ''
+        if (text === '+' || low === '+' || low === 'да' || low === 'ok' || low === 'верно') {
+          if (guess.length === items.length && items.length) digits = guess
+          else { await tgSendText('⚠️ У меня нет уверенной догадки (' + items.length + ' глифов, черновик «' + (rec.digitsAll || '') + '»). Пришли цифры явно.'); continue }
+        } else {
+          digits = text.replace(/[^0-9]/g, '')
+        }
+
+        if (!digits) { await tgSendText('Не понял. Пришли только цифры (например 4815), «+», /skip или /help'); continue }
+
+        const res = labelRoundWithDigits(store, rec, round, digits)
+        if (!res.ok) {
+          await tgSendText('⚠️ ' + (res.reason === 'не совпало количество'
+            ? ('я нашёл ' + res.found + ' глифов, а цифр ' + res.got + '. Пришли ровно ' + res.found + ' цифр или /skip')
+            : res.reason) + '\n/glyphs — посмотреть, что я вырезал')
+          continue
+        }
+        st.labeled += res.n
+        st.newLabels += res.n
+        const dropped = dropQueueRound(round)
+        let reply = '✅ Раунд ' + round + ': ' + digits + ' → размечено ' + res.n + ' глифов\n' +
+          'База: ' + store.size + ' примеров ' + JSON.stringify(store.counts()) +
+          (dropped ? '\n(из очереди ручной разметки убрано ' + dropped + ')' : '')
+        // автообучение
+        if (TG.autoTrainEvery && st.newLabels >= TG.autoTrainEvery && store.size >= 30) {
+          const r = trainModel(store)
+          st.newLabels = 0
+          if (r.ok) {
+            model = r.mlp
+            st.lastModelInfo = r.accTrain + '% train / ' + r.accTest + '% holdout (' + r.ms + 'мс)'
+            reply += '\n🧠 автообучение MLP: ' + st.lastModelInfo
+            tgLog('автообучение MLP: ' + st.lastModelInfo + ' | база ' + r.samples)
+          } else { tgLog('автообучение пропущено: ' + r.reason); st.newLabels = 0 }
+        }
+        const nxt = q.size
+        reply += '\n' + (nxt ? '⏩ Следующая картинка уже готова (' + nxt + ' в очереди)' : '⏳ готовлю следующую…')
+        await tgSendText(reply)
+        tgLog('раунд ' + round + ': размечено ' + res.n + ' глифов как «' + digits + '», база=' + store.size + ', в очереди дальше=' + nxt)
+        answered = true
+      }
+    }
+    } catch (e) {
+      st.stop = true
+      try { q.close() } catch (e2) {}
+      tgLog('❌ потребитель упал: ' + ((e && e.stack) || (e && e.message) || e))
+      try { await tgSendText('❌ Внутренняя ошибка сессии: ' + ((e && e.message) || e) + '\nПодробности: ' + tgLogFile()) } catch (e2) {}
+    }
+  })()
+
+  await Promise.all([producer, consumer])
+  q.close()
+
+  const fin = '🏁 Готово.\nРаундов собрано: ' + st.rounds + '\nРазмечено глифов: ' + st.labeled +
+    '\nПропущено картинок: ' + st.skipped + '\nБаза: ' + store.size + ' ' + JSON.stringify(store.counts()) +
+    (st.lastModelInfo ? '\nMLP: ' + st.lastModelInfo : '')
+  if (!st.stop) await tgSendText(fin)
+  tgLog('сессия завершена: раундов=' + st.rounds + ' размечено=' + st.labeled + ' пропущено=' + st.skipped + ' база=' + store.size)
+  return true
+}
+
+// долгое ожидание сообщения (long polling); команды обрабатывает вызывающий
+async function tgWaitMessage(st) {
+  while (!st.stop) {
+    const r = await tgApi('getUpdates', { offset: st.offset, timeout: 25, allowed_updates: ['message'] }, null, 45000)
+    if (!r.ok) {
+      tgLog('getUpdates ошибка: ' + (r.description || r.error_code) + ' — повтор через 3с')
+      await sleep(3000)
+      continue
+    }
+    const list = r.result || []
+    for (const u of list) {
+      st.offset = Math.max(st.offset, u.update_id + 1)
+      const msg = u.message
+      if (!msg) continue
+      if (String(msg.chat && msg.chat.id) !== String(TG.chatId)) {
+        tgLog('игнорирую сообщение из чата ' + (msg.chat && msg.chat.id) + ' (нужен ' + TG.chatId + ')')
+        continue
+      }
+      msg.update_id = u.update_id
+      return msg
+    }
+  }
+  return null
+}
+
 // ========================= ОБУЧЕНИЕ ЦИФР =========================
 function runLabelTool() {
-  try {
-    const tool = require('./label.js')
-    tool.run({ learnDir: LEARN_DIR })
-  } catch (e) {
-    console.error('Не удалось запустить label.js: ' + e.message)
-    console.error('Файл label.js должен лежать рядом с main.js')
-    process.exit(1)
+  const readline = require('readline')
+  const store = new DIG.GlyphStore(LEARN_DIR)
+  const queue = new DIG.LabelQueue(LEARN_DIR)
+
+  const rewriteStore = () => {
+    try {
+      const lines = store.samples.map(s => JSON.stringify({ id: s.id, digit: s.digit, f: DIG.f32ToB64(s.feat), src: s.src || '', ts: new Date().toISOString() }))
+      fs.mkdirSync(LEARN_DIR, { recursive: true })
+      fs.writeFileSync(path.join(LEARN_DIR, 'glyphs.jsonl'), lines.join('\n') + (lines.length ? '\n' : ''))
+    } catch (e) { console.error('rewriteStore err:', e.message) }
   }
+
+  console.log('=== РАЗМЕТКА ГЛИФОВ КАПЧИ ===')
+  console.log('База: ' + LEARN_DIR)
+  console.log('Уже размечено: ' + store.size + ' ' + JSON.stringify(store.counts()))
+  console.log('В очереди: ' + queue.size)
+  if (!queue.size) {
+    console.log('')
+    console.log('Очередь пуста. Сначала соберите капчу (node main.js) или пересоберите старые')
+    console.log('записи (node main.js --replay-all records), затем вернитесь сюда.')
+    return
+  }
+  console.log('')
+  console.log('Управление: 0..9 — метка | s — пропустить | x — удалить | u — отменить | q — выйти и сохранить')
+  console.log('')
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  const asked = []
+  let labeled = 0, skipped = 0, removed = 0, pos = 0
+
+  function finish() {
+    rl.close()
+    console.log('')
+    console.log('=== ИТОГ ===')
+    console.log('размечено: ' + labeled + ' | пропущено: ' + skipped + ' | удалено: ' + removed)
+    console.log('в базе: ' + store.size + ' ' + JSON.stringify(store.counts()))
+    console.log('осталось в очереди: ' + queue.size)
+    console.log(store.size >= 20 ? 'Можно обучить нейросеть: node main.js --train'
+      : 'Для обучения MLP нужно ≥20 примеров (лучше 100+). k-NN работает уже сейчас.')
+    setTimeout(() => process.exit(0), 100)
+  }
+  function ask() { rl.question('цифра (0-9 / s / x / u / q): ', answer) }
+  function show() {
+    if (pos >= queue.items.length) { finish(); return }
+    const it = queue.items[pos]
+    let norm
+    try { norm = DIG.b64ToF32(it.f).subarray(0, DIG.GW * DIG.GH) } catch (e) { pos++; show(); return }
+    console.log('───── ' + (pos + 1) + ' / ' + queue.items.length + ' ───── id=' + it.id +
+      (it.round ? ' раунд=' + it.round : '') + (it.wall ? ' стена=' + it.wall : '') +
+      (it.bbox ? ' размер=' + it.bbox.w + '×' + it.bbox.h : '') +
+      (it.guess !== null && it.guess !== undefined ? ' догадка=' + it.guess + ' (уверенность ' + (it.conf || 0) + ')' : ''))
+    console.log(DIG.asciiArt(norm))
+    if (it.png) console.log('файл: ' + it.png)
+    ask()
+  }
+  function answer(a) {
+    a = String(a || '').trim().toLowerCase()
+    if (a === 'q') { finish(); return }
+    const it = queue.items[pos]
+    if (!it) { finish(); return }
+    if (/^[0-9]$/.test(a)) {
+      store.add(Number(a), DIG.b64ToF32(it.f), { src: (it.src || '') + '#' + it.id })
+      asked.push({ pos, id: it.id, item: it })
+      queue.items.splice(pos, 1); queue.save()
+      labeled++
+      console.log('  ✓ записано как ' + a + '  (в базе ' + store.size + ')')
+      show(); return
+    }
+    if (a === 's') { pos++; skipped++; console.log('  → пропущен'); show(); return }
+    if (a === 'x') { queue.items.splice(pos, 1); queue.save(); removed++; console.log('  ✗ удалён из очереди'); show(); return }
+    if (a === 'u') {
+      const last = asked.pop()
+      if (!last) { console.log('  нечего отменять'); show(); return }
+      const i = store.samples.findIndex(s => s.src && s.src.endsWith('#' + last.id))
+      if (i >= 0) { store.samples.splice(i, 1); rewriteStore() }
+      queue.items.splice(Math.min(last.pos, queue.items.length), 0, last.item)
+      queue.save()
+      pos = Math.min(last.pos, queue.items.length - 1)
+      labeled = Math.max(0, labeled - 1)
+      console.log('  ↩ отменено')
+      show(); return
+    }
+    console.log('  ? введите 0-9, s, x, u или q')
+    ask()
+  }
+  show()
 }
 
 function runTrain() {
@@ -2270,7 +3449,7 @@ function runTrain() {
   console.log('=== Обучение MLP ===')
   console.log('База: ' + store.size + ' глифов ' + JSON.stringify(counts))
   if (store.size < 20) {
-    console.log('Мало данных. Сначала разметьте глифы: node label.js (нужно хотя бы 20, лучше 100+)')
+    console.log('Мало данных. Сначала разметьте глифы: node main.js --label (нужно хотя бы 20, лучше 100+)')
     process.exit(1)
   }
   const missing = []
@@ -2305,7 +3484,7 @@ function runTrain() {
 
   if (mlp.save(LEARN_DIR)) console.log('✅ модель сохранена: ' + path.join(LEARN_DIR, 'model.json'))
   else { console.log('❌ не удалось сохранить модель'); process.exit(1) }
-  if (accTest < accTrain - 20) console.log('⚠️ похоже на переобучение — добавьте примеров (node label.js)')
+  if (accTest < accTrain - 20) console.log('⚠️ похоже на переобучение — добавьте примеров (node main.js --label)')
 }
 
 // пересобрать ВСЕ записи в каталоге (удобно для уже накопленных раундов:
@@ -2333,14 +3512,72 @@ async function replayAll(root) {
   console.log(rows.join('\n'))
   try {
     const q = DIG ? new DIG.LabelQueue(LEARN_DIR) : null
-    if (q) step('В очереди на разметку: ' + q.size + ' глифов → node label.js')
+    if (q) step('В очереди на разметку: ' + q.size + ' глифов → node main.js --label')
   } catch (e) {}
   return ok
 }
 
+// один раунд: попытки, ротация IP, сохранение. Общий для обычного и Telegram-режима.
+async function captureRound(r, ctx) {
+  let rec = null, lastNetFail = null, lastNote = ''
+  for (let attempt = 1; attempt <= ATTEMPTS_PER_ROUND && !rec && !ctx.aborted; attempt++) {
+    if (attempt > 1 && (lastNetFail || ctx.consecutiveNetFails > 0) && ctx.rotationsUsed < MAX_ROTATIONS_ON_FAIL) {
+      ctx.rotationsUsed++
+      step('🔄 ротация IP (' + ctx.rotationsUsed + '/' + MAX_ROTATIONS_ON_FAIL + ')')
+      await rotateIp(); await sleep(2500)
+    } else if (attempt > 1) await sleep(1500)
+    else await sleep(1000 + Math.floor(Math.random() * 1000))
+
+    step('--- РАУНД ' + r + '/' + TARGET_ROUNDS + ' (попытка ' + attempt + ', IP ' + (currentRunIp || '?') + ') ---')
+    const res = await connectAndCapture('r' + r + 'a' + attempt)
+    lastNetFail = !!(res && !res.ok && NET_FAIL_RE.test(res.note || ''))
+    lastNote = res ? res.note : '?'
+
+    if (res && res.ok) {
+      ctx.consecutiveNetFails = 0; ctx.proxyFails = 0
+      const dir = path.join(REC_ROOT, 'round' + String(r).padStart(2, '0') + '_a' + attempt + '_' + STAMP)
+      const candidate = await saveRecord(dir, res.snap, 'РАУНД' + r, r)
+      if (candidate) {
+        const need = Math.max(CAP.minTiles, Math.ceil(candidate.tilesExpected * MIN_TILES_FRACTION))
+        if (candidate.tilesCount >= Math.min(need, candidate.tilesExpected)) rec = candidate
+        else step('РАУНД ' + r + ': мало плиток ' + candidate.tilesCount + '/' + candidate.tilesExpected + ' (нужно ' + need + ')')
+      }
+    } else {
+      step('раунд ' + r + ' попытка ' + attempt + ': ' + lastNote)
+      if (FATAL_RE.test(lastNote)) {
+        ctx.aborted = true
+        step('❌ ФАТАЛЬНО: ' + lastNote + ' — дальнейшие попытки бессмысленны')
+      } else if (PROXY_DEAD_RE.test(lastNote)) {
+        ctx.proxyFails++
+        if (ctx.proxyFails >= 2) { ctx.proxyDead = true; ctx.aborted = true; step('ПРОКСИ МЁРТВ') }
+      } else if (lastNetFail) {
+        if (currentRunIp) badIPs.add(currentRunIp)
+        ctx.consecutiveNetFails++
+        if (ctx.consecutiveNetFails >= 6) { ctx.aborted = true; step('6 сетевых фейлов подряд') }
+      } else ctx.consecutiveNetFails = 0
+    }
+  }
+  if (rec) {
+    ctx.results.push({ n: r, ok: true, rec })
+    step('РАУНД ' + r + ' ✅ ' + rec.cols + '×' + rec.rows + ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected +
+      ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ЦИФРЫ="' + rec.digits + '"' +
+      (rec.capFile ? ' → records/captchas/' + rec.capFile : ''))
+  } else if (!ctx.aborted) {
+    ctx.results.push({ n: r, ok: false, note: lastNote || 'fail' })
+    step('РАУНД ' + r + ' ❌ провален (' + (lastNote || 'fail') + ')')
+  }
+  if (r < TARGET_ROUNDS && !ctx.aborted) await sleep(PAUSE_BETWEEN_MS)
+  return rec
+}
+
+// обычный режим: просто собрать N раундов
+async function runClassic(ctx) {
+  for (let r = 1; r <= TARGET_ROUNDS && !ctx.aborted; r++) await captureRound(r, ctx)
+}
+
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.9.0 ===')
+  step('=== СТАРТ v3.9.1 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.label) { runLabelTool(); return }
@@ -2364,7 +3601,7 @@ async function main() {
   if (!CFG_PATH && !CLI.replay && !CLI.replayAll) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version + ' | прокси MC: ' + (PROXY.host || 'НЕТ') + ':' + PROXY.port)
-  step('ЦИФРЫ: локально (' + (DIG ? 'digits.js ok' : 'digits.js НЕ ЗАГРУЖЕН') + '), база ' + LEARN_DIR)
+  step('ЦИФРЫ: локальный распознаватель (встроен в main.js), база ' + LEARN_DIR)
   try {
     const st = DIG ? new DIG.GlyphStore(LEARN_DIR) : null
     const mdl = DIG ? DIG.MLP.load(LEARN_DIR) : null
@@ -2372,72 +3609,36 @@ async function main() {
     step('  размечено глифов: ' + (st ? st.size : 0) + ' ' + JSON.stringify(st ? st.counts() : {}) +
       ' | MLP: ' + (mdl ? 'есть' : 'нет (node main.js --train)') +
       ' | в очереди на разметку: ' + (q ? q.size : 0))
-    if (st && !st.size) step('  ⚠️ база пуста — цифры не распознаются. Соберите раунды, затем: node label.js')
+    if (st && !st.size) step('  ⚠️ база пуста — цифры не распознаются. Соберите раунды, затем: node main.js --label')
   } catch (e) { step('  база цифр: ' + e.message) }
   step('capture: minTiles=' + CAP.minTiles + ' stableMs=' + CAP.stableMs + ' timeout=' + (CAP.timeoutMs / 1000) + 'с needPrompt=' + CAP.needPrompt)
 
   currentRunIp = await rotateIp()
   step('IP забега: ' + (currentRunIp || '?'))
 
-  const results = []
-  const tGlobal = Date.now()
-  let rotationsUsed = 0, consecutiveNetFails = 0, proxyFails = 0, aborted = false
+  const ctx = { results: [], rotationsUsed: 0, consecutiveNetFails: 0, proxyFails: 0, proxyDead: false, aborted: false, tGlobal: Date.now() }
 
-  for (let r = 1; r <= TARGET_ROUNDS && !aborted; r++) {
-    let rec = null, lastNetFail = null, lastNote = ''
-    for (let attempt = 1; attempt <= ATTEMPTS_PER_ROUND && !rec && !aborted; attempt++) {
-      if (attempt > 1 && (lastNetFail || consecutiveNetFails > 0) && rotationsUsed < MAX_ROTATIONS_ON_FAIL) {
-        rotationsUsed++
-        step('🔄 ротация IP (' + rotationsUsed + '/' + MAX_ROTATIONS_ON_FAIL + ')')
-        await rotateIp(); await sleep(2500)
-      } else if (attempt > 1) await sleep(1500)
-      else await sleep(1000 + Math.floor(Math.random() * 1000))
-
-      step('--- РАУНД ' + r + '/' + TARGET_ROUNDS + ' (попытка ' + attempt + ', IP ' + (currentRunIp || '?') + ') ---')
-      const res = await connectAndCapture('r' + r + 'a' + attempt)
-      lastNetFail = !!(res && !res.ok && NET_FAIL_RE.test(res.note || ''))
-      lastNote = res ? res.note : '?'
-
-      if (res && res.ok) {
-        consecutiveNetFails = 0; proxyFails = 0
-        const dir = path.join(REC_ROOT, 'round' + String(r).padStart(2, '0') + '_a' + attempt + '_' + STAMP)
-        const candidate = await saveRecord(dir, res.snap, 'РАУНД' + r, r)
-        if (candidate) {
-          const need = Math.max(CAP.minTiles, Math.ceil(candidate.tilesExpected * MIN_TILES_FRACTION))
-          if (candidate.tilesCount >= Math.min(need, candidate.tilesExpected)) rec = candidate
-          else step('РАУНД ' + r + ': мало плиток ' + candidate.tilesCount + '/' + candidate.tilesExpected + ' (нужно ' + need + ')')
-        }
-      } else {
-        step('раунд ' + r + ' попытка ' + attempt + ': ' + lastNote)
-        if (FATAL_RE.test(lastNote)) {
-          aborted = true
-          step('❌ ФАТАЛЬНО: ' + lastNote + ' — дальнейшие попытки бессмысленны')
-        } else if (PROXY_DEAD_RE.test(lastNote)) {
-          proxyFails++
-          if (proxyFails >= 2) { proxyDead = true; aborted = true; step('ПРОКСИ МЁРТВ') }
-        } else if (lastNetFail) {
-          if (currentRunIp) badIPs.add(currentRunIp)
-          consecutiveNetFails++
-          if (consecutiveNetFails >= 6) { aborted = true; step('6 сетевых фейлов подряд') }
-        } else consecutiveNetFails = 0
-      }
-    }
-    if (rec) {
-      results.push({ n: r, ok: true, rec })
-      step('РАУНД ' + r + ' ✅ ' + rec.cols + '×' + rec.rows + ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected +
-        ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ЦИФРЫ="' + rec.digits + '"' +
-        (rec.capFile ? ' → records/captchas/' + rec.capFile : ''))
-    } else if (!aborted) {
-      results.push({ n: r, ok: false, note: lastNote || 'fail' })
-      step('РАУНД ' + r + ' ❌ провален (' + (lastNote || 'fail') + ')')
-    }
-    if (r < TARGET_ROUNDS && !aborted) await sleep(PAUSE_BETWEEN_MS)
+  if (TG.ready) {
+    step('TELEGRAM: ВКЛ — бот-разметчик (предзагрузка ' + TG.prefetch + ' картинк' + (TG.prefetch > 1 ? 'и' : 'а') +
+      ', chat_id=' + TG.chatId + ', автообучение ' + (TG.autoTrainEvery ? 'каждые ' + TG.autoTrainEvery + ' глифов' : 'выкл'))
+    const okTg = await runTelegramSession(ctx)
+    if (!okTg) { step('Telegram недоступен — переключаюсь в обычный режим (только сбор картинок)'); await runClassic(ctx) }
+  } else {
+    if (!TG.enabled) step('TELEGRAM: отключён конфигом (telegram.enabled=false) — обычный режим')
+    else if (!TG.token || /YOUR_/.test(TG.token)) step('TELEGRAM: не задан telegram.token — обычный режим (разметка через node main.js --label)')
+    else if (!TG.chatId || /YOUR_/.test(TG.chatId)) step('TELEGRAM: не задан telegram.chatId — обычный режим (напиши боту /start и узнай свой id у @userinfobot)')
+    else step('TELEGRAM: не готов — обычный режим')
+    await runClassic(ctx)
   }
 
-  const okList = results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.8.0) ===']
-  L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - tGlobal) / 1000) + 'с')
-  for (const x of results) {
+  printSummary(ctx)
+}
+
+function printSummary(ctx) {
+  const okList = ctx.results.filter(x => x.ok)
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.9.1) ===']
+  L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
+  for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
       ? 'OK ' + x.rec.cols + '×' + x.rec.rows + ' tiles=' + x.rec.tilesCount + '/' + x.rec.tilesExpected +
         ' ori=' + x.rec.ori + ' rot=' + x.rec.rotRule + (x.rec.permUsed ? ' PERM' : '') +
@@ -2451,16 +3652,16 @@ async function main() {
   try {
     const q = DIG ? new DIG.LabelQueue(LEARN_DIR) : null
     const st = DIG ? new DIG.GlyphStore(LEARN_DIR) : null
-    if (q && q.size) L.push('В очереди на разметку: ' + q.size + ' глифов → запустите: node label.js')
+    if (q && q.size) L.push('В очереди на разметку: ' + q.size + ' глифов → запустите: node main.js --label')
     if (st) L.push('База цифр: ' + st.size + ' глифов ' + JSON.stringify(st.counts()))
   } catch (e) {}
   step('готово.')
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.8.0', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.9.1', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
-      results: results.map(x => x.rec ? {
+      results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
         tiles: x.rec.tilesCount + '/' + x.rec.tilesExpected, holesFilled: x.rec.holesFilled,
         orientation: x.rec.ori, rotationRule: x.rec.rotRule, permUsed: x.rec.permUsed,
@@ -2491,5 +3692,8 @@ module.exports = {
   assembleWallSmart, captchaLikeness,
   extractFrameInfo, findMapIdDeep, getMapIdFromPacket, inkMaskWall, ocr,
   yawSpread, maxGridGap, wallDist, wallDot, GLYPH_OPTS, LEARN_DIR, DIG,
-  selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord, runTrain, replayAll, replayDir
+  selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord,
+  runTrain, runLabel: runLabelTool, replayAll, replayDir, captureRound, runClassic, trainModel,
+  TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, AsyncQueue, glyphStripPng,
+  labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary
 }
