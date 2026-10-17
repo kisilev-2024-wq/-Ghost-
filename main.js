@@ -1,5 +1,35 @@
-// VERSION: 3.10.0
+// VERSION: 3.11.0
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ======================= ЧТО НОВОГО В v3.11.0 (YOLO API) =======================
+// Y1. ПОДКЛЮЧЁН YOLO-API — основной распознаватель капчи FunTime.
+//     Источники: github.com/mmeerrkkaa/funtime-captcha-verifed (lib/localOCR.js)
+//     и тред yougame.biz/threads/368895 (YOLO12n, ~91% на FunTime).
+//     Контракт: POST multipart, поле "image" (PNG) ->
+//       {"success":true,"answer":"12345"}   (/recognize, публичный сервер)
+//       {"result":"12345"}                  (/solve, Flask-бэк из треда)
+//     Поддержаны оба формата + {text}/{digits}/{boxes:[{class}]} + голые цифры.
+//     Эндпоинты по умолчанию (по порядку):
+//       1) http://127.0.0.1:5000/recognize  — СВОЙ сервер (python yolo_server.py, 91%)
+//       2) http://212.22.70.39:5000/recognize — публичный бесплатный (~85%)
+//     Рабочий эндпоинт запоминается, при отказе — авто-fallback на следующий,
+//     после 6 ошибок подряд API перестаёт дёргаться (не тормозим раунды).
+//     HTML-страница вместо JSON отвергается (иначе «404» читался как цифры).
+// Y2. В чате бот теперь показывает ОБА ответа: «🌐 YOLO API: 48152» и
+//     «🤖 Локально: 48152», и предупреждает, если они расходятся.
+//     «+» подтверждает ответ бота (YOLO, если он ответил).
+//     Счётчик «10 подряд» по умолчанию считает ответ YOLO, а локальная модель
+//     всё равно учится на каждом вашем ответе (telegram.streakSource: auto|yolo|local).
+// Y3. yolo_server.py — готовый локальный сервер под вашу best.pt: /recognize,
+//     /solve, /health, прогон с понижением conf 0.8->0.25, подавление дублей
+//     по IoU, сортировка по x, --test для проверки модели без запуска сервера.
+// Y4. Команды: /yolo в чате (проверка API на текущей картинке),
+//     node main.js --yolo-test FILE.png (проверка из консоли).
+// Y5. Жёсткие ворота на маску (фикс «88888»): сплошные/пустые рамки и
+//     маска-«всё чернила» теперь ОТБРАСЫВАЮТСЯ, добавлены маски по порогу
+//     яркости (развёртка 40..190) и цветовым кластерам k-means.
+// Y6. Опция log.localTime=true — таймстампы в местном времени вместо UTC.
+// ====================================================================
 //
 // ======================= ЧТО НОВОГО В v3.10.0 (СЕГМЕНТАЦИЯ ЦИФР) =======================
 // D1. НОВЫЙ ПРИНЦИП ПОИСКА ЦИФР. Раньше: «фон = доминирующий цвет» -> связные
@@ -159,6 +189,7 @@ const CLI = {
   replayAll: typeof argVal('replay-all', '') === 'string' ? argVal('replay-all', '') : '',
   train: ARGV.includes('--train'),
   tgTest: ARGV.includes('--tg-test'),
+  yoloTest: typeof argVal('yolo-test', '') === 'string' ? argVal('yolo-test', '') : '',
   perms: ARGV.includes('--perms'),
   label: ARGV.includes('--label'),
   debug: ARGV.includes('--debug')
@@ -188,8 +219,14 @@ const SLOG = []
 let REC_ROOT = null
 let CAP_ROOT = null
 
+function logStamp() {
+  if (!LOG_LOCAL_TIME) return new Date().toISOString().slice(11, 19)
+  const d = new Date()
+  const p = n => String(n).padStart(2, '0')
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+}
 function step(s) {
-  const l = new Date().toISOString().slice(11, 19) + ' [step] ' + s
+  const l = logStamp() + ' [step] ' + s
   SLOG.push(l)
   console.log(l)
 }
@@ -308,6 +345,119 @@ const PROXY = {
 }
 const NICK_PREFIX = String(cfgGet(CFG, 'accounts.nickPrefix', 'Player')).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'Player'
 
+// ========================= YOLO API (распознавание капчи FunTime) =========================
+// Источники: github.com/mmeerrkkaa/funtime-captcha-verifed (lib/localOCR.js) и
+// тред yougame.biz/threads/368895 (YOLO12n, ~91% на FunTime).
+// Контракт: POST multipart/form-data, поле "image" (PNG) ->
+//   { "success": true, "answer": "12345" }   (публичный сервер /recognize)
+//   { "result": "12345" }                    (Flask-бэк из треда, /solve)
+// Публичный бесплатный сервер: http://212.22.70.39:5000/recognize (~85%)
+// Своя модель (91%): python yolo_server.py -> http://localhost:5000/recognize
+const YOLO_DEFAULT_URLS = [
+  'http://127.0.0.1:5000/recognize',       // свой локальный сервер (если запущен)
+  'http://212.22.70.39:5000/recognize'     // публичный бесплатный (из README плагина)
+]
+function yoloUrls() {
+  const out = []
+  const one = String(cfgGet(CFG, 'yolo.url', '') || '').trim()
+  if (one && /^https?:\/\//i.test(one)) out.push(one)
+  const list = cfgGet(CFG, 'yolo.urls', null)
+  if (Array.isArray(list)) for (const u of list) if (typeof u === 'string' && /^https?:\/\//i.test(u)) out.push(u.trim())
+  for (const u of YOLO_DEFAULT_URLS) if (out.indexOf(u) < 0) out.push(u)
+  return out
+}
+const YOLO = {
+  enabled: cfgGet(CFG, 'yolo.enabled', true) !== false,
+  urls: yoloUrls(),
+  field: String(cfgGet(CFG, 'yolo.field', 'image') || 'image'),
+  timeoutMs: Math.max(2000, Number(cfgGet(CFG, 'yolo.timeoutMs', 9000)) || 9000),
+  autoLabel: cfgGet(CFG, 'yolo.autoLabel', false) === true,
+  // сколько цифр ждём от API: из config, иначе DIGITS_EXPECTED (5 для funtime)
+  digitsCfg: Number(cfgGet(CFG, 'yolo.digits', 0)) || 0
+}
+const yoloWantDigits = () => YOLO.digitsCfg || DIGITS_EXPECTED || 5
+let yoloAlive = null      // запомненный рабочий url
+let yoloFails = 0
+const YOLO_MAX_FAILS = 6  // после серии ошибок перестаём дёргать API (экономим время раунда)
+
+function yoloLog(m) { step('[YOLO] ' + m) }
+// сброс запомненного рабочего эндпоинта и счётчика ошибок (для тестов и команды /yolo)
+function yoloReset() { yoloAlive = null; yoloFails = 0 }
+
+function multipart(fields, file) {
+  const b = '----mc' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+  const parts = []
+  for (const k of Object.keys(fields || {})) {
+    if (fields[k] === undefined || fields[k] === null) continue
+    parts.push(Buffer.from('--' + b + '\r\nContent-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(fields[k]) + '\r\n'))
+  }
+  if (file) {
+    parts.push(Buffer.from('--' + b + '\r\nContent-Disposition: form-data; name="' + file.field + '"; filename="' + file.name + '"\r\nContent-Type: ' + (file.type || 'application/octet-stream') + '\r\n\r\n'))
+    parts.push(Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data))
+    parts.push(Buffer.from('\r\n'))
+  }
+  parts.push(Buffer.from('--' + b + '--\r\n'))
+  return { body: Buffer.concat(parts), contentType: 'multipart/form-data; boundary=' + b }
+}
+
+// разбор ответа: поддерживаем все известные формы
+function parseYoloAnswer(text) {
+  const s = String(text || '')
+  if (/^\s*</.test(s) || /<\/?html|<body|<!doctype/i.test(s.slice(0, 500))) return { digits: '', rejected: true, raw: 'HTML вместо JSON: ' + s.slice(0, 120) }
+  let j = null
+  try { j = JSON.parse(s) } catch (e) {}
+  let raw = ''
+  if (j && typeof j === 'object') {
+    if (j.success === false) return { digits: '', rejected: true, raw: s.slice(0, 200) }
+    const d = j.data && typeof j.data === 'object' ? j.data : {}
+    const cand = [j.answer, j.result, j.text, j.digits, j.captcha, j.code, d.answer, d.result, d.text, d.digits]
+    for (const c of cand) if (c !== undefined && c !== null && String(c).trim()) { raw = String(c); break }
+    if (!raw && Array.isArray(j.boxes)) raw = j.boxes.map(b => b && (b.class !== undefined ? b.class : b.label)).join('')
+  }
+  if (!raw) raw = s
+  return { digits: raw.replace(/[^0-9]/g, ''), rejected: false, raw: s.slice(0, 200) }
+}
+
+async function yoloRecognize(png, label) {
+  if (!YOLO.enabled || !png || !png.length) return null
+  if (yoloFails >= YOLO_MAX_FAILS) {
+    if (yoloFails === YOLO_MAX_FAILS) { yoloLog('⚠️ ' + YOLO_MAX_FAILS + ' ошибок подряд — API больше не дёргаю в этой сессии (локальная модель продолжит)'); yoloFails++ }
+    return null
+  }
+  const order = yoloAlive ? [yoloAlive].concat(YOLO.urls.filter(u => u !== yoloAlive)) : YOLO.urls
+  // имя поля: сначала из конфига, потом запасной вариант (image <-> file)
+  const fields = [YOLO.field, YOLO.field === 'file' ? 'image' : 'file']
+  for (const url of order) {
+    for (const field of fields) {
+      const mp = multipart({}, { field, name: 'captcha.png', type: 'image/png', data: png })
+      let u
+      try { u = new URL(url) } catch (e) { continue }
+      const t0 = Date.now()
+      const r = await httpsRequest({
+        host: u.hostname, port: Number(u.port || (u.protocol === 'http:' ? 80 : 443)),
+        path: (u.pathname || '/') + (u.search || ''), method: 'POST',
+        headers: { 'Content-Type': mp.contentType, 'Accept': 'application/json', 'User-Agent': 'mc-captcha/3.11' },
+        body: mp.body, timeoutMs: YOLO.timeoutMs, secure: u.protocol !== 'http:'
+      })
+      const ms = Date.now() - t0
+      if (!r.ok) { yoloLog((label || '') + ' ' + u.host + ' [' + field + ']: ' + r.error + ' (' + ms + 'мс)'); continue }
+      const parsed = parseYoloAnswer(r.body ? r.body.toString('utf8') : '')
+      if (parsed.digits && parsed.digits.length >= 3) {
+        yoloAlive = url
+        yoloFails = 0
+        const want = yoloWantDigits()
+        const exact = parsed.digits.length === want
+        yoloLog((label || '') + ' ✅ ' + u.host + ' [' + field + '] -> "' + parsed.digits + '"' + (exact ? '' : ' ⚠️ длина ' + parsed.digits.length + ' вместо ' + want) + ' за ' + ms + 'мс')
+        return { digits: parsed.digits, exact, url, host: u.host, field, ms, status: r.status }
+      }
+      yoloLog((label || '') + ' ' + u.host + ' [' + field + ']: HTTP ' + r.status + ', ответ без цифр: ' + parsed.raw.slice(0, 120))
+    }
+  }
+  yoloFails++
+  yoloLog((label || '') + ' ❌ ни один YOLO-эндпоинт не ответил (ошибок подряд: ' + yoloFails + ') — работаем локальной моделью')
+  return null
+}
+
 // ========================= TELEGRAM (бот-разметчик) =========================
 // Прокси для Telegram берём из любого из ключей: socksUrl / apiProxy / proxy / socks5.
 // (в вашем конфиге он лежит в telegram.apiProxy)
@@ -339,6 +489,8 @@ const TG = {
   autoTrainEvery: Math.max(0, Number(cfgGet(CFG, 'telegram.autoTrainEvery', 20)) || 0),
   // сессия обучения идёт, пока ответы бота и человека не совпадут N раз ПОДРЯД
   targetStreak: Math.max(1, Number(cfgGet(CFG, 'telegram.targetStreak', 10)) || 10),
+  // чей ответ сравнивать с вашим: 'auto' = YOLO если ответил, иначе локальная модель
+  streakSource: String(cfgGet(CFG, 'telegram.streakSource', 'auto') || 'auto'),
   maxRounds: Math.max(1, Number(cfgGet(CFG, 'telegram.maxRounds', 500)) || 500),
   sendGlyphStrip: cfgGet(CFG, 'telegram.sendGlyphStrip', false) === true
 }
@@ -364,6 +516,9 @@ const DIG_AUGMENT = cfgGet(CFG, 'digits.augment', true) !== false
 // «замок стиля»: рабочая маска запоминается в learn/style.json и в следующих раундах
 // применяется сразу (экономит перебор ~50 стратегий)
 const STYLE_LOCK_MIN = Number(cfgGet(CFG, 'digits.styleLockMin', 100)) || 100
+// log.localTime=true — таймстампы в местном времени вместо UTC (по умолчанию UTC)
+const LOG_LOCAL_TIME = cfgGet(CFG, 'log.localTime', false) === true
+
 // перестановка колонок — аварийный режим (по умолчанию координаты авторитетны)
 const TRY_COL_PERMS = CLI.perms === true || cfgGet(CFG, 'capture.tryColPerms', false) === true
 // порог «швы плохие» — повод предупредить о возможной неверной раскладке
@@ -804,6 +959,67 @@ function maskDilate(m, W, H) {
 // открытие (эрозия+дилатация) убирает одиночные пиксели и дитеринг,
 // оставляя толстые штрихи цифр нетронутыми
 function maskOpen(m, W, H) { return maskDilate(maskErode(m, W, H), W, H) }
+// маска по порогу яркости палитры (развёртка порогов сильно повышает шанс попасть в цель)
+function maskLum(data, thr, below) {
+  const m = new Uint8Array(data.length)
+  for (let i = 0; i < data.length; i++) { const dark = LUM[data[i]] <= thr; m[i] = (below ? dark : !dark) ? 1 : 0 }
+  return m
+}
+// 2-кластерная сегментация цветов по RGB (k-means по гистограмме палитры):
+// на пёстром map-art фоне цифры часто образуют ОТДЕЛЬНЫЙ кластер, даже если
+// фон состоит из десятков цветов
+function maskClusters(data, k) {
+  const wc = histColors(data)
+  const pts = []
+  for (let v = 1; v < 256; v++) if (wc[v]) pts.push({ v, w: wc[v], r: PALETTE[v * 3], g: PALETTE[v * 3 + 1], b: PALETTE[v * 3 + 2] })
+  if (pts.length < 2) return null
+  // инициализация: самый частый + самый удалённый от него
+  const cents = []
+  pts.sort((a, b) => b.w - a.w)
+  cents.push([pts[0].r, pts[0].g, pts[0].b])
+  while (cents.length < k) {
+    let far = null, fd = -1
+    for (const p of pts) {
+      let dmin = 1e9
+      for (const c of cents) { const d = (p.r - c[0]) ** 2 + (p.g - c[1]) ** 2 + (p.b - c[2]) ** 2; if (d < dmin) dmin = d }
+      if (dmin * p.w > fd) { fd = dmin * p.w; far = p }
+    }
+    if (!far) break
+    cents.push([far.r, far.g, far.b])
+  }
+  let assign = new Map()
+  for (let it = 0; it < 8; it++) {
+    const sum = cents.map(() => [0, 0, 0, 0])
+    assign = new Map()
+    for (const p of pts) {
+      let bi = 0, bd = 1e18
+      for (let i = 0; i < cents.length; i++) {
+        const d = (p.r - cents[i][0]) ** 2 + (p.g - cents[i][1]) ** 2 + (p.b - cents[i][2]) ** 2
+        if (d < bd) { bd = d; bi = i }
+      }
+      assign.set(p.v, bi)
+      sum[bi][0] += p.r * p.w; sum[bi][1] += p.g * p.w; sum[bi][2] += p.b * p.w; sum[bi][3] += p.w
+    }
+    let moved = false
+    for (let i = 0; i < cents.length; i++) {
+      if (!sum[i][3]) continue
+      const nr = sum[i][0] / sum[i][3], ng = sum[i][1] / sum[i][3], nb = sum[i][2] / sum[i][3]
+      if (Math.abs(nr - cents[i][0]) + Math.abs(ng - cents[i][1]) + Math.abs(nb - cents[i][2]) > 1) moved = true
+      cents[i] = [nr, ng, nb]
+    }
+    if (!moved) break
+  }
+  // размеры кластеров: «цифровой» = не самый большой
+  const sizes = cents.map(() => 0)
+  for (const p of pts) sizes[assign.get(p.v)] += p.w
+  const out = []
+  for (let c = 0; c < cents.length; c++) {
+    const m = new Uint8Array(data.length)
+    for (let i = 0; i < data.length; i++) m[i] = assign.get(data[i]) === c ? 1 : 0
+    out.push({ mask: m, cluster: c, share: sizes[c] / data.length })
+  }
+  return out
+}
 function maskCount(m) { let n = 0; for (let i = 0; i < m.length; i++) n += m[i]; return n }
 
 // --- полоса строк с цифрами ---
@@ -913,25 +1129,47 @@ function scoreBoxes(boxes, mask, W, H, y0, y1, expected) {
   const my = cy.reduce((a, b) => a + b, 0) / n
   const sy = Math.sqrt(cy.reduce((a, b) => a + (b - my) * (b - my), 0) / n)
 
+  // ЖЁСТКИЕ ВОРОТА: ДП всегда даёт геометрически красивую нарезку, поэтому
+  // без этих проверок побеждает маска-мусор (сплошные или пустые рамки).
+  // Именно так получались предсказания вида «88888»: все 5 глифов одинаковые.
+  const fills = boxes.map(b => b.area / (b.w * b.h))
+  const medFill = fills.slice().sort((a, b) => a - b)[Math.floor(n / 2)]
+  if (medFill > 0.86) return -1e9      // рамка залита целиком — это не цифра
+  if (medFill < 0.045) return -1e9     // рамка почти пустая
+  const inkTotal0 = maskCount(mask)
+  if (inkTotal0 / (W * H) > 0.7) return -1e9   // маска «всё есть чернила» — бесполезна
+  if (inkTotal0 < 40) return -1e9
+
   let s = 0
-  s += 34 * Math.max(0, 1 - spread(hs))                 // одинаковая высота
-  s += 22 * Math.max(0, 1 - spread(ws))                 // одинаковая ширина
-  s += 22 * Math.max(0, 1 - sg / Math.max(1, mg))       // равномерные промежутки
-  s += 14 * Math.max(0, 1 - sy / Math.max(1, medH * 0.5)) // на одной строке
+  s += 26 * Math.max(0, 1 - spread(hs))                 // одинаковая высота
+  s += 18 * Math.max(0, 1 - spread(ws))                 // одинаковая ширина
+  s += 18 * Math.max(0, 1 - sg / Math.max(1, mg))       // равномерные промежутки
+  s += 12 * Math.max(0, 1 - sy / Math.max(1, medH * 0.5)) // на одной строке
   let okAspect = 0, okFill = 0, inkIn = 0
   for (const b of boxes) {
     const asp = b.w / b.h
     if (asp >= 0.2 && asp <= 1.4) okAspect++
     const f = b.area / (b.w * b.h)
-    if (f >= 0.08 && f <= 0.85) okFill++
+    if (f >= 0.08 && f <= 0.8) okFill++
     inkIn += b.area
   }
-  s += 12 * (okAspect / n) + 10 * (okFill / n)
+  s += 14 * (okAspect / n) + 26 * (okFill / n)          // качество заполнения — важнее
+  // штраф за «одинаковость» глифов: 5 разных цифр обязаны отличаться
+  {
+    let pairs = 0, diffSum = 0
+    const norms = boxes.map(b => {
+      let a = 0; for (let y = b.mnY; y <= b.mxY; y++) for (let x = b.mnX; x <= b.mxX; x++) a += mask[y * W + x]
+      return a / Math.max(1, b.w * b.h)
+    })
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { diffSum += Math.abs(norms[i] - norms[j]); pairs++ }
+    const meanDiff = pairs ? diffSum / pairs : 0
+    if (meanDiff < 0.004) s -= 40
+  }
   const boxArea = boxes.reduce((a, b) => a + b.w * b.h, 0)
   const totalInk = maskCount(mask)
   const densIn = inkIn / Math.max(1, boxArea)
   const densOut = Math.max(0, totalInk - inkIn) / Math.max(1, H * W - boxArea)
-  s += 18 * Math.min(1, Math.max(0, (densIn / Math.max(1e-6, densOut) - 1) / 4))   // контраст к фону
+  s += 34 * Math.min(1, Math.max(0, (densIn / Math.max(1e-6, densOut) - 1) / 3))   // контраст к фону
   // ГЛАВНЫЙ ШТРАФ: «грязная» маска (шум по всему полю) не годится, даже если
   // нарезка на 5 частей удалась — чернила должны лежать ВНУТРИ рамок цифр.
   const outsideFrac = Math.max(0, totalInk - inkIn) / (H * W)
@@ -956,6 +1194,12 @@ function buildMask(name, data, W, H) {
   else if (base === 'otsu-light') m = maskOtsu(data, W, H, true)
   else if (/^localbg\d+$/.test(base)) m = maskLocalBg(data, W, H, Number(base.slice(7)))
   else if (/^color\d+$/.test(base)) m = maskOneColor(data, W, H, Number(base.slice(5)))
+  else if (/^lum[<>]\d+$/.test(base)) m = maskLum(data, Number(base.slice(4)), base[3] === '<')
+  else if (/^cluster\d+_\d+$/.test(base)) {
+    const k = Number(base[7]), ci = Number(base.slice(9))
+    const cls = maskClusters(data, k)
+    if (cls && cls[ci]) m = cls[ci].mask
+  }
   if (!m) return null
   if (op === 'open') m = maskOpen(m, W, H)
   else if (op === 'close') m = maskClose(m, W, H)
@@ -1007,6 +1251,16 @@ function autoSegment(data, W, H, expected, opts) {
   tryMask('otsu-light', maskInvert(mo))
   // 3) локальный фон по тайлам
   for (const tile of [64, 128]) tryMask('localbg' + tile, maskLocalBg(data, W, H, tile))
+  // 3b) развёртка порога яркости (тёмные и светлые цифры на любом фоне)
+  for (const thr of [40, 70, 100, 130, 160, 190]) {
+    tryMask('lum<' + thr, maskLum(data, thr, true))
+    tryMask('lum>' + thr, maskLum(data, thr, false))
+  }
+  // 3c) цветовые кластеры (пёстрый фон -> цифры отдельным кластером)
+  for (const k of [2, 3]) {
+    const cls = maskClusters(data, k)
+    if (cls) for (const c of cls) if (c.share > 0.005 && c.share < 0.7) tryMask('cluster' + k + '_' + c.cluster, c.mask, { share: Math.round(c.share * 1000) / 1000 })
+  }
   // 4) каждый цвет палитры по отдельности (цифры часто одного цвета)
   const colors = []
   for (let v = 0; v < 256; v++) if (wc[v] / total >= 0.002 && wc[v] / total <= 0.35) colors.push({ v, c: wc[v] })
@@ -1029,6 +1283,57 @@ function autoSegment(data, W, H, expected, opts) {
   return results
 }
 
+// --- ОЧИСТКА маски внутри рамки цифры ---
+// Рамки сегментация находит верно, но на реальной капче внутри них остаётся
+// шум/дитеринг фона — и признак описывал шум вместо цифры (симптом: MLP
+// train 84% / holdout 10%, предсказания вида «88888»). Чистим:
+//   1) морфологическое открытие (убирает одиночные пиксели и тонкий дитеринг),
+//   2) выбрасываем связные компоненты мельче порога (остаются только штрихи),
+//   3) пересчитываем плотный bbox по очищенной маске.
+function cleanBoxMask(mask, W, H, b, opts) {
+  opts = opts || {}
+  const pad = opts.pad == null ? 1 : opts.pad
+  const x0 = Math.max(0, b.mnX - pad), x1 = Math.min(W - 1, b.mxX + pad)
+  const y0 = Math.max(0, b.mnY - pad), y1 = Math.min(H - 1, b.mxY + pad)
+  const w = x1 - x0 + 1, h = y1 - y0 + 1
+  if (w < 3 || h < 3) return { mask, bbox: b, kept: 1, removed: 0, before: 0, after: 0 }
+  const reg = new Uint8Array(w * h)
+  let before = 0
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = mask[(y0 + y) * W + x0 + x]; reg[y * w + x] = v; if (v) before++ }
+  if (!before) return { mask, bbox: b, kept: 0, removed: 0, before: 0, after: 0 }
+  // 1) открытие
+  let r2 = maskDilate(maskErode(reg, w, h), w, h)
+  // если открытие всё стёрло (тонкие штрихи) — берём оригинал региона
+  let after = 0
+  for (let i = 0; i < r2.length; i++) after += r2[i]
+  if (after < before * 0.25) { r2 = reg; after = before }
+  // 2) убираем мелкие компоненты (шум), оставляем только крупные штрихи
+  const minArea = Math.max(opts.minArea || 8, Math.round(w * h * 0.012))
+  const comps = components8(r2, w, h)
+  const clean = new Uint8Array(w * h)
+  let kept = 0, removed = 0, keptPx = 0
+  for (const c of comps) {
+    if (c.a >= minArea) { for (const i of c.px) clean[i] = 1; kept++; keptPx += c.a } else removed++
+  }
+  if (keptPx < before * 0.1) { for (let i = 0; i < clean.length; i++) clean[i] = r2[i]; keptPx = after }
+  // 3) пишем обратно в полноразмерную маску и считаем плотный bbox
+  const out = new Uint8Array(W * H)
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!clean[y * w + x]) continue
+    out[(y0 + y) * W + x0 + x] = 1
+    if (x0 + x < mnX) mnX = x0 + x
+    if (x0 + x > mxX) mxX = x0 + x
+    if (y0 + y < mnY) mnY = y0 + y
+    if (y0 + y > mxY) mxY = y0 + y
+  }
+  if (mxX < mnX) return { mask, bbox: b, kept: 0, removed, before, after: 0 }
+  return {
+    mask: out, kept, removed, before, after: keptPx,
+    bbox: { mnX, mxX, mnY, mxY, w: mxX - mnX + 1, h: mxY - mnY + 1, area: keptPx }
+  }
+}
+
 // --- нормализация с СОХРАНЕНИЕМ пропорций (растяжение ломает тонкие цифры) ---
 function normalizeGlyphAR(mask, W, H, b) {
   const out = new Float32Array(GW * GH)
@@ -1042,7 +1347,9 @@ function normalizeGlyphAR(mask, W, H, b) {
       const sx0 = b.mnX + Math.floor(gx * bw / nw), sx1 = Math.max(sx0 + 1, b.mnX + Math.floor((gx + 1) * bw / nw))
       let s = 0, t = 0
       for (let y = sy0; y < sy1 && y <= b.mxY; y++) for (let x = sx0; x < sx1 && x <= b.mxX; x++) { s += mask[y * W + x]; t++ }
-      out[(oy + gy) * GW + (ox + gx)] = t ? s / t : 0
+      const v = t ? s / t : 0
+      // подавляем «полупрозрачный» шум: остатки дитеринга дают 0.1-0.3 и мешают k-NN
+      out[(oy + gy) * GW + (ox + gx)] = Math.max(0, Math.min(1, (v - 0.25) / 0.55))
     }
   }
   return out
@@ -1054,10 +1361,18 @@ function extractDigitsSmart(data, W, H, expected, opts) {
   if (!all.length) return { glyphs: [], strategies: [], strategy: null, score: -1 }
   const best = all[0]
   const glyphs = []
+  const cleanInfo = []
   for (let i = 0; i < best.boxes.length; i++) {
-    const b = best.boxes[i]
-    if (!b) continue
-    const norm = normalizeGlyphAR(best.mask, W, H, b)
+    const b0 = best.boxes[i]
+    if (!b0) continue
+    // чистим маску внутри рамки и пересчитываем плотный bbox
+    let b = b0, useMask = best.mask
+    if (opts.clean !== false) {
+      const cl = cleanBoxMask(best.mask, W, H, b0, opts)
+      if (cl && cl.after > 0) { b = cl.bbox; useMask = cl.mask }
+      cleanInfo.push({ raw: b0.w + 'x' + b0.h, clean: b.w + 'x' + b.h, inkBefore: cl ? cl.before : null, inkAfter: cl ? cl.after : null, noise: cl ? cl.removed : 0 })
+    }
+    const norm = normalizeGlyphAR(useMask, W, H, b)
     let sum = 0
     for (let k = 0; k < norm.length; k++) sum += norm[k]
     const stroke = sum / (GW * GH)
@@ -1072,7 +1387,7 @@ function extractDigitsSmart(data, W, H, expected, opts) {
   }
   return {
     glyphs, strategy: best.name, score: best.score, band: best.band, boxes: best.boxes,
-    mask: best.mask, inkFrac: best.inkFrac, extra: best.extra, fastPath: !!best.fastPath,
+    mask: best.mask, inkFrac: best.inkFrac, extra: best.extra, fastPath: !!best.fastPath, cleanInfo,
     tried: all.length, preferred: opts.prefer || null,
     strategies: all.slice(0, 8).map(s => ({ name: s.name, score: s.score, inkFrac: s.inkFrac, extra: s.extra, fallback: s.fallback }))
   }
@@ -1180,7 +1495,7 @@ function b64ToF32(s) {
   return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)
 }
 
-const FEAT_VERSION = 2   // v2: нормализация с сохранением пропорций + умная сегментация
+const FEAT_VERSION = 3   // v3: очистка маски от шума + подавление дитеринга в признаке
 const MAX_PER_CLASS = 400
 
 // ---- аугментация нормализованного глифа (20×28) ----
@@ -1242,6 +1557,7 @@ class GlyphStore {
     this.samples = []
     this.skippedVersion = 0
     this.augment = !(opts && opts.augment === false)   // digits.augment=false отключает варианты
+    this.useScale = !(opts && opts.scale === false)     // digits.knnScale=false отключает нормировку измерений
     this.load()
   }
   // Аугментация НЕ плодит примеры в базе (это ломает голосование k-NN, превращая его в 1-NN),
@@ -1307,10 +1623,35 @@ class GlyphStore {
   // sep   — во сколько раз ближайший «чужой» пример дальше ближайшего «своего»
   //         (главный признак: у верно распознанной цифры sep обычно десятки);
   // trust — итоговая уверенность, которую сравниваем с порогом.
+  // масштабные коэффициенты по измерениям: без них «шумные» координаты признака
+  // вносят основной вклад в расстояние и k-NN сравнивает шум вместо формы
+  ensureScale() {
+    if (this._scaleN === this.samples.length && this._scale) return this._scale
+    const n = this.samples.length
+    const mean = new Float64Array(FEAT_DIM)
+    for (const s of this.samples) for (let i = 0; i < FEAT_DIM; i++) mean[i] += s.feat[i]
+    if (n) for (let i = 0; i < FEAT_DIM; i++) mean[i] /= n
+    const sd = new Float64Array(FEAT_DIM)
+    for (const s of this.samples) for (let i = 0; i < FEAT_DIM; i++) { const d = s.feat[i] - mean[i]; sd[i] += d * d }
+    let sumSd = 0
+    for (let i = 0; i < FEAT_DIM; i++) { sd[i] = n > 1 ? Math.sqrt(sd[i] / (n - 1)) : 1; sumSd += sd[i] }
+    const avg = sumSd / FEAT_DIM
+    const scale = new Float64Array(FEAT_DIM)
+    for (let i = 0; i < FEAT_DIM; i++) scale[i] = 1 / Math.max(sd[i], avg * 0.25, 1e-3)
+    this._scale = scale
+    this._scaleN = n
+    return scale
+  }
   classify(feat, k) {
     if (!this.samples.length) return null
     k = Math.min(k || KNN_K, this.samples.length)
-    const l2 = f => { let d = 0; for (let i = 0; i < FEAT_DIM; i++) { const t = feat[i] - f[i]; d += t * t } return Math.sqrt(d) }
+    const sc = this.useScale ? this.ensureScale() : null
+    const l2 = f => {
+      let d = 0
+      if (sc) { for (let i = 0; i < FEAT_DIM; i++) { const t = (feat[i] - f[i]) * sc[i]; d += t * t } }
+      else { for (let i = 0; i < FEAT_DIM; i++) { const t = feat[i] - f[i]; d += t * t } }
+      return Math.sqrt(d)
+    }
     // 1) грубый отбор по оригиналам (быстро)
     const rough = this.samples.map((s, i) => ({ i, d: l2(s.feat), digit: s.digit }))
     rough.sort((a, b) => a.d - b.d)
@@ -1579,7 +1920,8 @@ function enqueueGlyphs(queue, needLabel, meta) {
   return {
     GW, GH, ZONES, FEAT_DIM, CONF_OK, CONF_QUEUE,
     components8, splitComponent, subComponent, normalizeGlyph, buildFeatures,
-    extractGlyphs, extractDigitsSmart, autoSegment, buildMask, normalizeGlyphAR, scoreBoxes, maskOpen, maskErode, maskDilate,
+    extractGlyphs, extractDigitsSmart, autoSegment, buildMask, normalizeGlyphAR, scoreBoxes, maskOpen, maskErode, maskDilate, cleanBoxMask,
+    maskLum, maskClusters,
     dpSegment, bestBand, maskDominant, maskOtsu, maskLocalBg, maskOneColor, maskClose, maskInvert,
     dominantRow, digitScore, asciiArt,
     pngGray, pngRgba, pngFromNorm, pngFromMask,
@@ -3256,7 +3598,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.10.0: геометрия сборки ===')
+  console.log('=== SELFTEST v3.11.0: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -3662,6 +4004,58 @@ async function selftest() {
       (rec ? ' | счёт: ' + rec.candidates.map(c => c.wall + '=' + c.score).join(', ') : ''))
   }
 
+  // ---- YOLO API: клиент, оба формата ответа, мусорные ответы, fallback ----
+  console.log('--- YOLO API (мок-сервер, без интернета) ---')
+  {
+    const http = require('http')
+    const PORT = 0
+    const srv = http.createServer((rq, rs) => {
+      const b = []
+      rq.on('data', c => b.push(c))
+      rq.on('end', () => {
+        const buf = Buffer.concat(b), s = buf.toString('latin1')
+        const j = o => { rs.writeHead(200, { 'Content-Type': 'application/json' }); rs.end(JSON.stringify(o)) }
+        const field = (s.match(/name="([^"]+)"; filename=/) || [])[1] || null
+        if (rq.url.indexOf('/recognize') === 0) return j({ success: true, answer: '48152', field, conf: 0.6, ms: 90 })
+        if (rq.url.indexOf('/solve') === 0) return j({ result: '13579' })
+        if (rq.url.indexOf('/html') === 0) { rs.writeHead(200, { 'Content-Type': 'text/html' }); rs.end('<html><body>404</body></html>'); return }
+        if (rq.url.indexOf('/bad') === 0) return j({ success: false, error: 'no boxes' })
+        j({ success: false, error: 'route?' })
+      })
+    })
+    await new Promise(r => srv.listen(PORT, '127.0.0.1', r))
+    const port = srv.address().port
+    const savedUrls = YOLO.urls.slice(), savedAlive = yoloAlive
+    const g = makeSyntheticDigits(4, 3, '48152', 555)
+    const png = colorPng(g.img, g.W, g.H, 1)
+    const checks = []
+
+    yoloReset(); YOLO.urls = ['http://127.0.0.1:' + port + '/recognize']
+    let r1 = await yoloRecognize(png, 'st1')
+    checks.push(['формат {success,answer} + поле image', !!r1 && r1.digits === '48152' && r1.field === 'image'])
+
+    yoloReset(); YOLO.urls = ['http://127.0.0.1:' + port + '/solve']
+    let r2 = await yoloRecognize(png, 'st2')
+    checks.push(['формат {result} (Flask из треда)', !!r2 && r2.digits === '13579'])
+
+    yoloReset(); YOLO.urls = ['http://127.0.0.1:' + port + '/html']
+    let r3 = await yoloRecognize(png, 'st3')
+    checks.push(['HTML-страница НЕ принимается за цифры', r3 === null])
+
+    yoloReset(); YOLO.urls = ['http://127.0.0.1:' + port + '/bad']
+    let r4 = await yoloRecognize(png, 'st4')
+    checks.push(['success:false -> нет ответа', r4 === null])
+
+    yoloReset(); YOLO.urls = ['http://127.0.0.1:1/recognize', 'http://127.0.0.1:' + port + '/recognize']
+    let r5 = await yoloRecognize(png, 'st5')
+    checks.push(['fallback на следующий URL', !!r5 && r5.digits === '48152'])
+
+    srv.close()
+    YOLO.urls = savedUrls
+    yoloReset()
+    for (const [name, ok] of checks) { if (!ok) fails++; console.log('  ' + (ok ? '\u2705' : '\u274c') + ' ' + name) }
+  }
+
   // ---- TELEGRAM-СЕССИЯ: обучение до N совпадений подряд (локальный мок, без интернета) ----
   console.log('--- Telegram-сессия: предсказание + обучение до N совпадений подряд ---')
   {
@@ -3684,7 +4078,9 @@ async function selftest() {
           let cap = ''
           if (i >= 0) { const a = s.indexOf('\r\n\r\n', i) + 4, e2 = s.indexOf('\r\n--', a); cap = buf.slice(a, e2).toString('utf8') }
           j({ ok: true, result: { message_id: ++msgId } })
-          const rm = cap.match(/Раунд (\d+)/)
+          // отвечаем только на фото САМОЙ капчи (не на полосу глифов)
+          if (cap.indexOf('\u{1F5BC}') !== 0) return
+          const rm = cap.match(/[Рр]аунд (\d+)/)
           const rnd = rm ? Number(rm[1]) : photos
           pending.push({ update_id: 5000 + (++replyNo), message: { message_id: ++msgId, chat: { id: 1 }, text: truth[(rnd - 1) % truth.length], date: 0 } })
           return
@@ -3772,7 +4168,7 @@ function replayDir(dir) {
 // ========================= TELEGRAM: ТРАНСПОРТ =========================
 function tgLogFile() { return path.join(LEARN_DIR, 'telegram.log') }
 function tgLog(msg) {
-  const line = new Date().toISOString().slice(11, 19) + ' [TG] ' + msg
+  const line = logStamp() + ' [TG] ' + msg
   try { fs.mkdirSync(LEARN_DIR, { recursive: true }); fs.appendFileSync(tgLogFile(), line + '\n') } catch (e) {}
   step('[TG] ' + msg)
 }
@@ -4097,7 +4493,7 @@ async function runTelegramSession(ctx, captureFn) {
   let model = DIG.MLP.load(LEARN_DIR)
   const q = new AsyncQueue(TG.prefetch)
   const st = {
-    offset: 0, pending: [], stop: false, rounds: 0, labeled: 0, newLabels: 0, skipped: 0,
+    offset: 0, pending: [], stop: false, rounds: 0, labeled: 0, newLabels: 0, skipped: 0, yoloHits: 0,
     streak: 0, bestStreak: 0, matches: 0, mismatches: 0, incomplete: 0,
     lastModelInfo: null, doneByStreak: false, me: null
   }
@@ -4122,11 +4518,13 @@ async function runTelegramSession(ctx, captureFn) {
   tgLog('бот @' + (me.result && me.result.username) + ' (id ' + (me.result && me.result.id) + ') | chat_id=' + TG.chatId +
     ' | транспорт=' + (tgTransport === 'direct' ? 'direct' : (tgTransport && tgTransport.name)))
   tgLog('база цифр: ' + store.size + ' ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет'))
+  tgLog('YOLO API: ' + (YOLO.enabled ? 'ВКЛ, порядок: ' + YOLO.urls.join(' → ') : 'ВЫКЛ') +
+    ' | счётчик «подряд» считает: ' + TG.streakSource)
   tgLog('цифр в капче: ' + DIGITS_EXPECTED + ' | цель: ' + TG.targetStreak + ' совпадений подряд | лимит раундов: ' + TG.maxRounds)
 
   await tgApi('getUpdates', { offset: -1, timeout: 0 })   // сброс старых апдейтов
 
-  await tgSendText('🟢 Бот запущен (v3.10.0)\n' +
+  await tgSendText('🟢 Бот запущен (v3.11.0)\n' +
     'В капче всегда ' + DIGITS_EXPECTED + ' цифр. Цель обучения: ' + TG.targetStreak + ' совпадений подряд.\n' +
     'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её создадут)') + '\n\n' +
     'Я присылаю картинку и СВОЁ ПРЕДСКАЗАНИЕ. Вы отвечаете правильными цифрами:\n' +
@@ -4166,6 +4564,7 @@ async function runTelegramSession(ctx, captureFn) {
         const item = await q.shift()
         if (!item) break
         const { round, rec } = item
+        let botAnswer = '', botSrc = 'нет'
 
         if (!rec) {
           await tgSendText('⚠️ Раунд ' + round + ': картинка не собралась (стена не найдена или мало плиток). Еду дальше.')
@@ -4183,17 +4582,29 @@ async function runTelegramSession(ctx, captureFn) {
         try { png = fs.readFileSync(rec.pngFile) } catch (e) { try { png = fs.readFileSync(rec.pngFile2x) } catch (e2) {} }
         if (!png) { await tgSendText('⚠️ Раунд ' + round + ': не удалось прочитать картинку с диска'); continue }
 
+        // ответ бота = YOLO (85-91%), если он ответил; иначе локальная модель
+        const yoloDigits = rec.yolo && rec.yolo.digits ? String(rec.yolo.digits) : ''
+        const yoloOk = yoloDigits.length === DIGITS_EXPECTED
+        const srcMode = TG.streakSource
+        if (srcMode === 'yolo') botAnswer = yoloOk ? yoloDigits : ''
+        else if (srcMode === 'local') botAnswer = complete ? pred : ''
+        else botAnswer = yoloOk ? yoloDigits : (complete ? pred : '')
+        botSrc = (yoloOk && botAnswer === yoloDigits) ? 'YOLO' : (botAnswer ? 'локально' : 'нет')
+        const disagree = yoloOk && complete && yoloDigits !== pred
+
         const segLine = rec.segStrategy
           ? ('🧩 Маска: ' + rec.segStrategy + ' (балл ' + rec.segScore + ')')
           : '🧩 Сегментация: запасной метод'
         const cap = '🖼 Раунд ' + round + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows + ' · seam ' + rec.seamCost + '\n' +
-          '🤖 Предсказание: ' + (pred || '—') + '  (уверенность ' + avgConf + ')\n' +
+          '🌐 YOLO API: ' + (yoloDigits ? yoloDigits + (yoloOk ? '' : ' ⚠️не 5 цифр') + '  (' + rec.yolo.host + ', ' + rec.yolo.ms + 'мс)' : 'нет ответа') + '\n' +
+          '🤖 Локально: ' + (pred || '—') + '  (уверенность ' + avgConf + ', база ' + store.size + ')\n' +
+          (disagree ? '⚠️ YOLO и локальная модель расходятся — сверьте глазами\n' : '') +
           '🔤 Найдено цифр: ' + items.length + ' из ' + DIGITS_EXPECTED +
           (items.length === DIGITS_EXPECTED ? '' : '  ⚠️ НЕ ВСЕ — пришлите /skip') + '\n' +
           segLine + '\n' +
-          '🎯 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + '\n\n' +
+          '🎯 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + ' (считаем ответ: ' + botSrc + ')\n\n' +
           (items.length === DIGITS_EXPECTED
-            ? 'Ответьте ' + DIGITS_EXPECTED + ' цифрами (или «+», если предсказание верное)'
+            ? 'Ответьте «+», если «' + (botAnswer || '?') + '» верно, либо пришлите свои ' + DIGITS_EXPECTED + ' цифр'
             : 'Цифры нашлись не все — ответьте /skip (я запишу проблему в лог) или /glyphs')
         const sent = await tgSendPhoto(png, cap)
         if (!sent.ok) { tgLog('не отправил фото раунда ' + round + ': ' + (sent.description || '')); continue }
@@ -4223,11 +4634,13 @@ async function runTelegramSession(ctx, captureFn) {
           if (low === '/help' || low === '/help@' + botName) {
             await tgSendText('Пришлите ' + DIGITS_EXPECTED + ' цифр — это истина, она идёт в обучение.\n' +
               '«+» — моё предсказание верное\n/skip — пропустить картинку\n/glyphs — показать вырезанные глифы\n' +
-              '/status — база, точность, счётчик совпадений\n/train — обучить MLP сейчас\n/stop — остановить')
+              '/status — база, точность, счётчик совпадений\n/yolo — проверить YOLO API на этой картинке\n' +
+              '/train — обучить MLP сейчас\n/stop — остановить')
             continue
           }
           if (low === '/status' || low === '/status@' + botName) {
             await tgSendText('📊 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + ' (рекорд ' + st.bestStreak + ')\n' +
+              'YOLO API: ' + (YOLO.enabled ? ((yoloAlive || 'не отвечал') + ' | угадал ' + (st.yoloHits || 0) + ' раз') : 'выключен') + '\n' +
               'Совпало: ' + st.matches + ' | не совпало: ' + st.mismatches + ' | неполных картинок: ' + st.incomplete + '\n' +
               'Раундов: ' + st.rounds + ' | размечено глифов: ' + st.labeled + ' | пропущено: ' + st.skipped + '\n' +
               'База: ' + store.size + ' ' + JSON.stringify(store.counts()) + '\n' +
@@ -4240,6 +4653,21 @@ async function runTelegramSession(ctx, captureFn) {
             if (strip) await tgSendPhoto(strip, 'Глифы раунда ' + round + ' (слева направо). Предсказание: ' +
               items.map((it, i) => (i + 1) + ') ' + (it.guess === null || it.guess === undefined ? '?' : it.guess) + '·' + it.conf).join('  '))
             else await tgSendText('Глифов нет — вырезать нечего. Похоже, нужно поправить пороги (digits.minGlyphH / maxGlyphH)')
+            continue
+          }
+          if (low === '/yolo' || low === '/yolo@' + botName) {
+            if (!YOLO.enabled) { await tgSendText('🌐 YOLO API выключен (yolo.enabled=false) — работаем локальной моделью'); continue }
+            await tgSendText('🌐 Проверяю YOLO API на картинке раунда ' + round + '…')
+            yoloReset()
+            const t0 = Date.now()
+            const rr = await yoloRecognize(png, 'команда /yolo')
+            const rep = rr
+              ? ('✅ YOLO ответил: «' + rr.digits + '»' + (rr.exact ? '' : ' ⚠️ не ' + DIGITS_EXPECTED + ' цифр') +
+                 '\nСервер: ' + rr.host + ' (' + rr.field + '), ' + rr.ms + 'мс\nЛокальная модель: «' + (pred || '—') + '»')
+              : '❌ YOLO API не ответил за ' + Math.round((Date.now() - t0) / 1000) + 'с.\nПроверялись: ' + YOLO.urls.join('\n') +
+                '\n\nРаботаем локальной моделью. Свой сервер: python yolo_server.py'
+            await tgSendText(rep)
+            tgLog('/yolo: ' + (rr ? 'ответ «' + rr.digits + '» от ' + rr.host : 'нет ответа'))
             continue
           }
           if (low === '/train' || low === '/train@' + botName) {
@@ -4269,12 +4697,13 @@ async function runTelegramSession(ctx, captureFn) {
           // ---------- цифры ----------
           let digits = ''
           if (text === '+' || low === 'да' || low === 'ok' || low === 'верно' || low === 'y') {
-            if (!complete) {
-              await tgSendText('⚠️ Не могу подтвердить: предсказание неполное («' + (pred || 'нет') + '», вырезано ' +
-                items.length + ' из ' + DIGITS_EXPECTED + ').\nПришлите ' + DIGITS_EXPECTED + ' цифр вручную или /glyphs')
+            if (!botAnswer) {
+              await tgSendText('⚠️ Подтверждать нечего: ни YOLO, ни локальная модель не дали ' + DIGITS_EXPECTED +
+                ' цифр (локально «' + (pred || 'нет') + '», найдено ' + items.length + ' из ' + DIGITS_EXPECTED +
+                ').\nПришлите цифры вручную или /glyphs')
               continue
             }
-            digits = pred
+            digits = botAnswer
           } else {
             digits = text.replace(/[^0-9]/g, '')
           }
@@ -4285,9 +4714,10 @@ async function runTelegramSession(ctx, captureFn) {
           }
 
           // ---------- сравнение с предсказанием + обучение ----------
-          const match = complete && pred === digits
+          const match = !!botAnswer && botAnswer === digits
           if (match) { st.streak++; st.matches++ } else { st.mismatches++; st.streak = 0 }
           if (!complete) st.incomplete++
+          if (yoloOk && yoloDigits === digits) st.yoloHits = (st.yoloHits || 0) + 1
           st.bestStreak = Math.max(st.bestStreak, st.streak)
 
           // ответ человека = истина → в базу (даже если бот угадал)
@@ -4300,11 +4730,13 @@ async function runTelegramSession(ctx, captureFn) {
             st.variants = (st.variants || 0) + (res.variants || res.n)
             const dropped = dropQueueRound(round)
             rep = (match
-              ? '✅ СОВПАЛО! Я: ' + pred + ' = Вы: ' + digits
-              : '❌ Я сказал «' + pred + '», верно «' + digits + '»' + (complete ? '' : ' (предсказание неполное)')) +
+              ? '✅ СОВПАЛО! Я (' + botSrc + '): ' + botAnswer + ' = Вы: ' + digits
+              : '❌ Я (' + botSrc + ') сказал «' + (botAnswer || '—') + '», верно «' + digits + '»' +
+                (yoloOk && yoloDigits !== digits ? '  [YOLO тоже ошибся: ' + yoloDigits + ']' : '')) +
               '\n🎯 Подряд: ' + st.streak + '/' + TG.targetStreak + (st.bestStreak > st.streak ? ' (рекорд ' + st.bestStreak + ')' : '') +
               '\n📚 Размечено ' + res.n + ' цифр (с аугментацией ' + (res.variants || res.n) + ' примеров) → база ' + store.size + (dropped ? ' (из очереди убрано ' + dropped + ')' : '')
-            tgLog('раунд ' + round + ': ' + (match ? 'СОВПАЛО' : 'НЕ СОВПАЛО') + ' бот="' + pred + '" человек="' + digits +
+            tgLog('раунд ' + round + ': ' + (match ? 'СОВПАЛО' : 'НЕ СОВПАЛО') + ' бот(' + botSrc + ')="' + botAnswer +
+              '" локально="' + pred + '" yolo="' + yoloDigits + '" человек="' + digits +
               '" streak=' + st.streak + '/' + TG.targetStreak + ' размечено=' + res.n + ' база=' + store.size)
           } else {
             st.streak = 0
@@ -4654,6 +5086,15 @@ async function captureRound(r, ctx) {
       const tSave = Date.now()
       const candidate = await saveRecord(dir, res.snap, 'РАУНД' + r, r, { light: FAST_MODE && FAST.lightFiles })
       ctx.lastTimings = { net: netMs, save: Date.now() - tSave }
+      // YOLO API: основной распознаватель (85-91%), локальная модель учится на ответах
+      if (candidate && YOLO.enabled) {
+        try {
+          const png = fs.readFileSync(candidate.pngFile)
+          const t0 = Date.now()
+          candidate.yolo = await yoloRecognize(png, 'РАУНД' + r)
+          ctx.lastTimings.yolo = Date.now() - t0
+        } catch (e) { dbg('yolo err ' + e.message) }
+      }
       if (candidate) {
         const need = Math.max(CAP.minTiles, Math.ceil(candidate.tilesExpected * MIN_TILES_FRACTION))
         if (candidate.tilesCount >= Math.min(need, candidate.tilesExpected)) rec = candidate
@@ -4677,7 +5118,9 @@ async function captureRound(r, ctx) {
   if (rec) {
     ctx.results.push({ n: r, ok: true, rec })
     step('РАУНД ' + r + ' ✅ ' + rec.cols + '×' + rec.rows + ' tiles=' + rec.tilesCount + '/' + rec.tilesExpected +
-      ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost + ' ПРЕДСКАЗАНИЕ="' + (rec.prediction || '') + '"' +
+      ' ori=' + rec.ori + ' rot=' + rec.rotRule + ' seam=' + rec.seamCost +
+      ' YOLO="' + (rec.yolo ? rec.yolo.digits : '-') + '"' +
+      ' ЛОКАЛЬНО="' + (rec.prediction || '') + '"' +
       (rec.capFile ? ' → records/captchas/' + rec.capFile : ''))
   } else if (!ctx.aborted) {
     ctx.results.push({ n: r, ok: false, note: lastNote || 'fail' })
@@ -4694,10 +5137,22 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.10.0 ===')
+  step('=== СТАРТ v3.11.0 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
+  if (CLI.yoloTest) {
+    const f = CLI.yoloTest
+    if (!fs.existsSync(f)) { step('файл не найден: ' + f); process.exit(1) }
+    step('YOLO-тест файла ' + f + ' (' + fs.statSync(f).size + ' байт)')
+    step('эндпоинты: ' + YOLO.urls.join(' → '))
+    const t0 = Date.now()
+    const r = await yoloRecognize(fs.readFileSync(f), 'тест')
+    if (r) step('✅ ответ: «' + r.digits + '» от ' + r.host + ' [' + r.field + '] за ' + r.ms + 'мс (всего ' + (Date.now() - t0) + 'мс)')
+    else step('❌ ни один эндпоинт не ответил. Поднимите свой: python yolo_server.py')
+    setTimeout(() => process.exit(r ? 0 : 1), 300)
+    return
+  }
   if (CLI.label) { runLabelTool(); return }
   if (CLI.train) { runTrain(); return }
 
@@ -4719,6 +5174,7 @@ async function main() {
   if (!CFG_PATH && !CLI.replay && !CLI.replayAll) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version + ' | прокси MC: ' + (PROXY.host || 'НЕТ') + ':' + PROXY.port)
+  step('YOLO API: ' + (YOLO.enabled ? 'ВКЛ → ' + YOLO.urls.join(' → ') + ' (поле "' + YOLO.field + '", таймаут ' + YOLO.timeoutMs + 'мс)' : 'ВЫКЛ (yolo.enabled=false)'))
   step('ЦИФРЫ: локальный распознаватель (встроен в main.js), база ' + LEARN_DIR)
   try {
     const st = DIG ? new DIG.GlyphStore(LEARN_DIR) : null
@@ -4759,13 +5215,13 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.10.0) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.11.0) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
       ? 'OK ' + x.rec.cols + '×' + x.rec.rows + ' tiles=' + x.rec.tilesCount + '/' + x.rec.tilesExpected +
         ' ori=' + x.rec.ori + ' rot=' + x.rec.rotRule + (x.rec.permUsed ? ' PERM' : '') +
-        ' seam=' + x.rec.seamCost + ' ПРЕДСКАЗАНИЕ="' + (x.rec.prediction || '') + '"' +
+        ' seam=' + x.rec.seamCost + ' YOLO="' + (x.rec.yolo ? x.rec.yolo.digits : '-') + '" ЛОКАЛЬНО="' + (x.rec.prediction || '') + '"' +
         (x.rec.needLabel ? ' [на разметку:' + x.rec.needLabel + ']' : '') +
         (x.rec.capFile ? ' [captchas/' + x.rec.capFile + ']' : '')
       : 'FAIL (' + (x.note || '') + ')'))
@@ -4782,14 +5238,15 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.10.0', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.11.0', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
         tiles: x.rec.tilesCount + '/' + x.rec.tilesExpected, holesFilled: x.rec.holesFilled,
         orientation: x.rec.ori, rotationRule: x.rec.rotRule, permUsed: x.rec.permUsed,
         seamCost: x.rec.seamCost, score: x.rec.score, dot: x.rec.dot, dist: x.rec.dist,
-        digits: x.rec.digits, digitsAll: x.rec.digitsAll, prediction: x.rec.prediction, needLabel: x.rec.needLabel,
+        digits: x.rec.digits, digitsAll: x.rec.digitsAll, prediction: x.rec.prediction,
+        yolo: x.rec.yolo ? { digits: x.rec.yolo.digits, host: x.rec.yolo.host, ms: x.rec.yolo.ms } : null, needLabel: x.rec.needLabel,
         candidates: (x.rec.candidates || []).map(c => ({ wall: c.wall, score: c.score })),
         file: x.rec.capFile, dir: x.rec.dir
       } : { round: x.n, ok: false, note: x.note })
@@ -4817,6 +5274,7 @@ module.exports = {
   yawSpread, maxGridGap, wallDist, wallDot, GLYPH_OPTS, LEARN_DIR, DIG,
   selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord,
   runTrain, runLabel: runLabelTool, replayAll, replayDir, captureRound, runClassic, trainModel,
+  YOLO, yoloRecognize, parseYoloAnswer, multipart, yoloReset,
   DIGITS_EXPECTED, finishSession, refreshPrediction,
   TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, runTgTest, parseSocksUrl, tgTransports, AsyncQueue, glyphStripPng,
   labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary
