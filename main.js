@@ -1,5 +1,65 @@
-// VERSION: 3.11.0
+// VERSION: 3.12.0
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ============ ЧТО ИСПРАВЛЕНО В v3.12.0 (по вашему логу 13:01–19:54) ============
+// G1. ГЛАВНОЕ: СЕГМЕНТАЦИЯ РЕЗАЛА НЕ ЦИФРЫ — И ЭТО ОТРАВЛЯЛО БАЗУ.
+//     Лог 17:38–17:46: каждый раунд «цифр=5/5», размечено 5, база выросла до 270,
+//     но MLP дала 84% train / 10% holdout и предсказания «88888», «44444»,
+//     «50000», «33333». Диагноз: рамки находились, а внутри них был фон/шум —
+//     признаки описывали шум, модель его запоминала. 270 примеров впустую.
+//     Теперь:
+//       (а) «вырожденная» нарезка ловится на месте: если >=60% пар кропов почти
+//           идентичны — segDegenerate=true, В БАЗУ ТАКОЕ НЕ ПИШЕТСЯ, в чат идёт
+//           🧨 с инструкцией, в лог — подробная строка;
+//       (б) равномерная нарезка (ДП не нашёл ровно 5 сегментов и порезал «на
+//           глазок») штрафуется на 55 баллов — раньше именно она выигрывала и
+//           давала симптом «5/5 + 88888»;
+//       (в) ОФЛАЙН-ТЮНИНГ: node main.js --autotune [--apply] перебирает все ~50
+//           стратегий масок на УЖЕ СОХРАНЁННЫХ картинках и выбирает ту, у которой
+//           лучшая честная точность (leave-one-image-out k-NN) по ВАШИМ ответам.
+//           Новых подключений к серверу не нужно.
+//       (г) node main.js --diag — по картинке показывает топ-10 стратегий, рисует
+//           рамки (DIAG_boxes_*.png) и печатает ASCII-кропы: сразу видно, цифра
+//           внутри или шум. В чате то же самое делает команда /diag.
+// G2. ОТВЕТЫ ЧЕЛОВЕКА СОХРАНЯЮТСЯ (learn/answers.jsonl): раунд, цифры, каталог,
+//     какая маска была, что ответил YOLO/локальная модель. Это «золотая» разметка,
+//     на ней работают --autotune и --apply (пересбор базы офлайн). Ответ пишется
+//     ДАЖЕ если вырезать глифы не удалось — картинка всё равно ценна.
+// G3. СТАРЫЕ ОТВЕТЫ ИМПОРТИРУЮТСЯ ИЗ ЛОГА:
+//       node main.js --import-answers learn\telegram.log
+//     Парсер понимает «раунд 3: ответ «40242» (update_id=785300514)» и ЗАЩИЩАЕТСЯ
+//     от «призрачных» апдейтов: если update_id уже встречался в прошлой сессии —
+//     ответ отбрасывается. В вашем логе 14:04:41 раунд 1 получил «59131» с
+//     update_id=785300455 — это апдейт из сессии 13:46 (там он был ответом на
+//     раунд 5), т.е. картинка была размечена ЧУЖИМИ цифрами.
+// G4. «картинка не собралась» БЕЗ ПРИЧИНЫ. Лог 19:51–19:54: три раунда по 48–52с,
+//     «сеть 0.0с + сборка 0.0с», ни одного фото — и ни слова о причине в
+//     telegram.log. Теперь причина (lastNote: таймаут / прокси / нет стен / мало
+//     плиток) пишется в лог и приходит в чат, вместе с «ПРОКСИ МЁРТВ» и IP.
+// G5. /glyphs дополнительно шлёт ASCII-превью кропов текстом — его можно
+//     скопировать и показать, даже если картинка в чате ничего не объясняет.
+// ====================================================================
+//
+// ============ ЧТО ИСПРАВЛЕНО В v3.11.1 (по вашему логу 18:48) ============
+// F1. «ПРИЗРАЧНЫЙ /stop». Telegram хранит неподтверждённые апдейты: прошлая
+//     сессия получила /stop (update_id=785300572), но не успела подтвердить
+//     offset — и новая сессия получила его снова, завершившись на первом же
+//     раунде. Теперь: (а) при старте offset выставляется ПО РЕЗУЛЬТАТУ
+//     сброса старых апдейтов, (б) сообщения с date старше старта сессии
+//     игнорируются и это пишется в лог («игнорирую старое сообщение»).
+// F2. СТАРАЯ MLP ПОДМЕШИВАЛА БРЕД. В логе: «база цифр: 0 {} | MLP загружена»
+//     и «предсказание "27857"» при пустой базе — это model.json, обученная на
+//     признаках прошлой версии (fv=2). Размерность совпадала, поэтому модель
+//     грузилась и выдавала уверенный мусор (0.65). Теперь в model.json пишется
+//     fv, и модель чужой версии НЕ загружается + понятное предупреждение
+//     в лог и в чат. Старые примеры glyphs.jsonl так же отсеиваются (fv).
+// F3. [YOLO] НЕ БЫЛО ВИДНО В ЛоГЕ. yoloLog писал только в общий лог, поэтому
+//     в learn/telegram.log нельзя было понять, отвечал ли API. Теперь дублируется
+//     в telegram.log, а в строке раунда печатается: YOLO="..." | локально="..."
+//     | ответ бота=... (источник).
+// F4. Мёртвый YOLO-эндпоинт больше не тормозит раунды: после 2 отказов URL
+//     пропускается до конца сессии (раньше каждый раунд ждал полный таймаут).
+// ====================================================================
 //
 // ======================= ЧТО НОВОГО В v3.11.0 (YOLO API) =======================
 // Y1. ПОДКЛЮЧЁН YOLO-API — основной распознаватель капчи FunTime.
@@ -192,7 +252,18 @@ const CLI = {
   yoloTest: typeof argVal('yolo-test', '') === 'string' ? argVal('yolo-test', '') : '',
   perms: ARGV.includes('--perms'),
   label: ARGV.includes('--label'),
-  debug: ARGV.includes('--debug')
+  debug: ARGV.includes('--debug'),
+  // офлайн-настройка сегментации по уже сохранённым картинкам и ответам человека.
+  // ВАЖНО: argVal возвращает '' когда флага нет, поэтому «typeof === 'string'»
+  // всегда true — признак берём ТОЛЬКО из ARGV.includes, а значение отдельно.
+  autotune: ARGV.includes('--autotune'),
+  autotuneDir: (typeof argVal('autotune', '') === 'string' && argVal('autotune', '') !== '') ? argVal('autotune', '') : '',
+  importAnswers: ARGV.includes('--import-answers')
+    ? ((typeof argVal('import-answers', '') === 'string' && argVal('import-answers', '') !== '') ? argVal('import-answers', '') : path.join('learn', 'telegram.log'))
+    : '',
+  apply: ARGV.includes('--apply'),
+  diag: ARGV.includes('--diag'),
+  diagDir: (typeof argVal('diag', '') === 'string' && argVal('diag', '') !== '') ? argVal('diag', '') : ''
 }
 
 // ========================= КОНСТАНТЫ ЗАБЕГА =========================
@@ -378,11 +449,16 @@ const YOLO = {
 const yoloWantDigits = () => YOLO.digitsCfg || DIGITS_EXPECTED || 5
 let yoloAlive = null      // запомненный рабочий url
 let yoloFails = 0
+const yoloUrlFails = {}   // сколько раз каждый url не ответил (чтобы не ждать таймаут заново)
 const YOLO_MAX_FAILS = 6  // после серии ошибок перестаём дёргать API (экономим время раунда)
 
-function yoloLog(m) { step('[YOLO] ' + m) }
+function yoloLog(m) {
+  step('[YOLO] ' + m)
+  // дублируем в telegram.log — иначе в логе сессии не видно, отвечал ли API
+  try { fs.mkdirSync(LEARN_DIR, { recursive: true }); fs.appendFileSync(tgLogFile(), logStamp() + ' [YOLO] ' + m + '\n') } catch (e) {}
+}
 // сброс запомненного рабочего эндпоинта и счётчика ошибок (для тестов и команды /yolo)
-function yoloReset() { yoloAlive = null; yoloFails = 0 }
+function yoloReset() { yoloAlive = null; yoloFails = 0; for (const k of Object.keys(yoloUrlFails)) delete yoloUrlFails[k] }
 
 function multipart(fields, file) {
   const b = '----mc' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
@@ -428,6 +504,8 @@ async function yoloRecognize(png, label) {
   // имя поля: сначала из конфига, потом запасной вариант (image <-> file)
   const fields = [YOLO.field, YOLO.field === 'file' ? 'image' : 'file']
   for (const url of order) {
+    if ((yoloUrlFails[url] || 0) >= 2) { dbg('[YOLO] пропускаю ' + url + ' (2 отказа подряд в этой сессии)'); continue }
+    let urlFailed = false
     for (const field of fields) {
       const mp = multipart({}, { field, name: 'captcha.png', type: 'image/png', data: png })
       let u
@@ -440,18 +518,21 @@ async function yoloRecognize(png, label) {
         body: mp.body, timeoutMs: YOLO.timeoutMs, secure: u.protocol !== 'http:'
       })
       const ms = Date.now() - t0
-      if (!r.ok) { yoloLog((label || '') + ' ' + u.host + ' [' + field + ']: ' + r.error + ' (' + ms + 'мс)'); continue }
+      if (!r.ok) { yoloLog((label || '') + ' ' + u.host + ' [' + field + ']: ' + r.error + ' (' + ms + 'мс)'); urlFailed = true; continue }
       const parsed = parseYoloAnswer(r.body ? r.body.toString('utf8') : '')
       if (parsed.digits && parsed.digits.length >= 3) {
         yoloAlive = url
         yoloFails = 0
+        yoloUrlFails[url] = 0
         const want = yoloWantDigits()
         const exact = parsed.digits.length === want
         yoloLog((label || '') + ' ✅ ' + u.host + ' [' + field + '] -> "' + parsed.digits + '"' + (exact ? '' : ' ⚠️ длина ' + parsed.digits.length + ' вместо ' + want) + ' за ' + ms + 'мс')
         return { digits: parsed.digits, exact, url, host: u.host, field, ms, status: r.status }
       }
       yoloLog((label || '') + ' ' + u.host + ' [' + field + ']: HTTP ' + r.status + ', ответ без цифр: ' + parsed.raw.slice(0, 120))
+      urlFailed = true
     }
+    if (urlFailed) yoloUrlFails[url] = (yoloUrlFails[url] || 0) + 1
   }
   yoloFails++
   yoloLog((label || '') + ' ❌ ни один YOLO-эндпоинт не ответил (ошибок подряд: ' + yoloFails + ') — работаем локальной моделью')
@@ -1223,8 +1304,12 @@ function autoSegment(data, W, H, expected, opts) {
     const seg = dpSegment(mask, W, band.y0, band.y1, expected)
     if (!seg) return
     const boxes = tightBoxes(mask, W, seg.segs, band.y0, band.y1)
-    const score = scoreBoxes(boxes, mask, W, H, band.y0, band.y1, expected)
-    results.push({ name, mask, band, segs: seg.segs, boxes, score, inkFrac: Math.round(frac * 10000) / 10000, dpCost: seg.cost, fallback: !!seg.fallback, extra: extra || null })
+    const score0 = scoreBoxes(boxes, mask, W, H, band.y0, band.y1, expected)
+    // РАВНОМЕРНАЯ НАРЕЗКА (dp не смог найти ровно N сегментов) — рамки ставятся
+    // «на глазок» по ширине, а не по цифрам. Именно она давала «цифр=5/5» и
+    // предсказания «88888»: все 5 кропов почти одинаковые. Штрафуем жёстко.
+    const score = seg.fallback ? score0 - 55 : score0
+    results.push({ name, mask, band, segs: seg.segs, boxes, score, score0, inkFrac: Math.round(frac * 10000) / 10000, dpCost: seg.cost, fallback: !!seg.fallback, extra: extra || null })
   }
 
   // 0) «замок стиля»: если прошлые раунды уже нашли рабочую маску — пробуем её первой
@@ -1385,10 +1470,28 @@ function extractDigitsSmart(data, W, H, expected, opts) {
       norm, feat, mask: best.mask, W, H, index: i
     })
   }
+  // ДЕГЕНЕРАЦИЯ: все кропы почти одинаковые («88888», «44444», «50000» в реальном
+  // логе) — значит рамки стоят не на цифрах. Такую разметку НЕЛЬЗЯ класть в базу:
+  // модель запоминает шум (симптом: train 84% / holdout 10%).
+  let samePairs = 0, totPairs = 0
+  for (let i = 0; i < glyphs.length; i++) {
+    for (let j = i + 1; j < glyphs.length; j++) {
+      totPairs++
+      let d = 0
+      const a = glyphs[i].norm, b = glyphs[j].norm
+      for (let t = 0; t < a.length; t++) { const x = a[t] - b[t]; d += x * x }
+      if (Math.sqrt(d) < 1.2) samePairs++
+    }
+  }
+  const sameFrac = totPairs ? samePairs / totPairs : 0
+  const degenerate = totPairs >= 4 && sameFrac >= 0.6
+  const strokes = glyphs.map(g => g.stroke).sort((a, b) => a - b)
+  const medStroke = strokes.length ? strokes[Math.floor(strokes.length / 2)] : 0
   return {
     glyphs, strategy: best.name, score: best.score, band: best.band, boxes: best.boxes,
     mask: best.mask, inkFrac: best.inkFrac, extra: best.extra, fastPath: !!best.fastPath, cleanInfo,
-    tried: all.length, preferred: opts.prefer || null,
+    tried: all.length, preferred: opts.prefer || null, fallback: !!best.fallback,
+    sameFrac: Math.round(sameFrac * 100) / 100, degenerate, medStroke,
     strategies: all.slice(0, 8).map(s => ({ name: s.name, score: s.score, inkFrac: s.inkFrac, extra: s.extra, fallback: s.fallback }))
   }
 }
@@ -1826,12 +1929,14 @@ class MLP {
     return X.length ? Math.round(1000 * ok / X.length) / 10 : 0
   }
   toJSON() {
-    return { v: 1, nIn: this.nIn, nHid: this.nHid, nOut: this.nOut, trained: new Date().toISOString(),
+    return { v: 1, fv: FEAT_VERSION, nIn: this.nIn, nHid: this.nHid, nOut: this.nOut, trained: new Date().toISOString(),
       W1: Buffer.from(this.W1.buffer).toString('base64'), b1: Buffer.from(this.b1.buffer).toString('base64'),
       W2: Buffer.from(this.W2.buffer).toString('base64'), b2: Buffer.from(this.b2.buffer).toString('base64') }
   }
   static fromJSON(o) {
     if (!o || o.nIn !== FEAT_DIM) return null
+    // модель, обученная на признаках другой версии, выдаёт уверенный бред — не грузим
+    if ((o.fv || 1) !== FEAT_VERSION) return null
     const m = new MLP(o.nIn, o.nHid, o.nOut)
     const rd = (s, n) => { const b = Buffer.from(s, 'base64'); const a = new Float64Array(b.buffer, b.byteOffset, b.byteLength / 8); return a.length === n ? a : null }
     const W1 = rd(o.W1, m.W1.length), b1 = rd(o.b1, m.b1.length), W2 = rd(o.W2, m.W2.length), b2 = rd(o.b2, m.b2.length)
@@ -1844,7 +1949,13 @@ class MLP {
     try {
       const p = path.join(dir, 'model.json')
       if (!fs.existsSync(p)) return null
-      return MLP.fromJSON(JSON.parse(fs.readFileSync(p, 'utf8')))
+      const o = JSON.parse(fs.readFileSync(p, 'utf8'))
+      const m = MLP.fromJSON(o)
+      if (!m && o && (o.fv || 1) !== FEAT_VERSION) {
+        MLP._stale = true
+        MLP._staleFv = o.fv || 1
+      }
+      return m
     } catch (e) { return null }
   }
   save(dir) {
@@ -1922,7 +2033,7 @@ function enqueueGlyphs(queue, needLabel, meta) {
     components8, splitComponent, subComponent, normalizeGlyph, buildFeatures,
     extractGlyphs, extractDigitsSmart, autoSegment, buildMask, normalizeGlyphAR, scoreBoxes, maskOpen, maskErode, maskDilate, cleanBoxMask,
     maskLum, maskClusters,
-    dpSegment, bestBand, maskDominant, maskOtsu, maskLocalBg, maskOneColor, maskClose, maskInvert,
+    dpSegment, tightBoxes, bestBand, maskDominant, maskOtsu, maskLocalBg, maskOneColor, maskClose, maskInvert,
     dominantRow, digitScore, asciiArt,
     pngGray, pngRgba, pngFromNorm, pngFromMask,
     GlyphStore, LabelQueue, MLP, recognize, enqueueGlyphs, f32ToB64, b64ToF32,
@@ -2870,6 +2981,576 @@ function getMapIdFromPacket(p) {
   return null
 }
 
+// =================== ОФЛАЙН: ОТВЕТЫ ЧЕЛОВЕКА + САМОТЮНИНГ СЕГМЕНТАЦИИ ===================
+// ДИАГНОЗ ПО РЕАЛЬНОМУ ЛОГУ (сессия 17:38–17:46, 54 раунда):
+//   «цифр=5/5» каждый раунд, разметка шла, база выросла до 270 — но
+//   MLP: 84% train / 10% holdout, предсказания «88888», «44444», «50000», «33333».
+//   Вывод: рамки находятся, а ВНУТРИ них не цифра (маска-стратегия не подходит
+//   к настоящей капче). Признаки описывают шум → модель запоминает шум.
+//   Никакое количество новых раундов это не исправит: сначала надо понять,
+//   КАКАЯ стратегия даёт настоящие кропы. Делается офлайн, на уже сохранённых
+//   картинках (records/roundNN_*/ORIGINAL_raw.bin) и уже известных ответах.
+//
+// Ответы человека теперь сохраняются в learn/answers.jsonl — это «золотая»
+// разметка: 5 цифр на картинку. Старые ответы можно импортировать прямо из
+// лога: node main.js --import-answers learn\telegram.log
+// Тюнинг:            node main.js --autotune            (перебор ~50 стратегий)
+// Тюнинг + пересбор базы: node main.js --autotune --apply
+function answersFile() { return path.join(LEARN_DIR, 'answers.jsonl') }
+
+function appendAnswer(o) {
+  try {
+    fs.mkdirSync(LEARN_DIR, { recursive: true })
+    fs.appendFileSync(answersFile(), JSON.stringify(o) + '\n')
+    return true
+  } catch (e) { dbg('answers append err ' + e.message); return false }
+}
+
+function loadAnswers() {
+  const out = []
+  try {
+    if (!fs.existsSync(answersFile())) return out
+    for (const ln of fs.readFileSync(answersFile(), 'utf8').split('\n')) {
+      const s = ln.trim(); if (!s) continue
+      try { const o = JSON.parse(s); if (o && /^\d{3,}$/.test(String(o.answer))) out.push(o) } catch (e) {}
+    }
+  } catch (e) {}
+  return out
+}
+
+// ---- разбор telegram.log: «17:38:59 [TG] раунд 3: ответ «40242» (update_id=785300514)» ----
+function parseAnswersFromLog(text) {
+  const out = []
+  const seenUpdate = new Map()   // update_id -> номер сессии (ловим «призрачные» повторы)
+  let session = 0
+  const lines = String(text).split(/\r?\n/)
+  for (const ln of lines) {
+    if (/\[TG\]\s*(транспорт:|бот @)/.test(ln) && /транспорт:/.test(ln)) session++
+    const tm = ln.match(/(\d{2}):(\d{2}):(\d{2})/)
+    const sec = tm ? (Number(tm[1]) * 3600 + Number(tm[2]) * 60 + Number(tm[3])) : null
+    const m = ln.match(/раунд\s+(\d+):\s*ответ\s*[«"](\d{3,8})[»"](?:\s*\(update_id=(\d+)\))?/)
+    if (!m) continue
+    const round = Number(m[1]), answer = m[2], uid = m[3] ? Number(m[3]) : null
+    if (uid !== null) {
+      if (seenUpdate.has(uid) && seenUpdate.get(uid) !== session) {
+        out.push({ round, answer, sec, session, uid, replayed: true, skipped: 'тот же update_id уже был в сессии ' + seenUpdate.get(uid) })
+        continue
+      }
+      seenUpdate.set(uid, session)
+    }
+    if (answer.length !== DIGITS_EXPECTED) { out.push({ round, answer, sec, session, uid, skipped: 'не ' + DIGITS_EXPECTED + ' цифр' }); continue }
+    out.push({ round, answer, sec, session, uid })
+  }
+  return out
+}
+
+function importAnswersFromFile(file) {
+  if (!fs.existsSync(file)) { step('❌ файл не найден: ' + file); return { ok: false, added: 0 } }
+  const parsed = parseAnswersFromLog(fs.readFileSync(file, 'utf8'))
+  const good = parsed.filter(p => !p.skipped)
+  const bad = parsed.filter(p => p.skipped)
+  const have = new Set(loadAnswers().map(a => [a.round, a.sec, a.answer, a.src || ''].join('|')))
+  let added = 0
+  for (const p of good) {
+    const key = [p.round, p.sec, p.answer, 'log'].join('|')
+    if (have.has(key)) continue
+    have.add(key)
+    if (appendAnswer({ round: p.round, answer: p.answer, sec: p.sec, session: p.session, uid: p.uid, src: 'log', ts: new Date().toISOString() })) added++
+  }
+  step('📥 импортировано ответов из лога: ' + added + ' (всего найдено ' + good.length + ', уже было ' + (good.length - added) + ')')
+  if (bad.length) step('   пропущено ' + bad.length + ': ' + bad.slice(0, 6).map(b => 'раунд ' + b.round + ' «' + b.answer + '» — ' + b.skipped).join('; '))
+  if (bad.some(b => b.replayed)) step('   ⚠️ среди пропущенных есть «призрачные» ответы (повтор update_id из прошлой сессии) — они отравили бы обучение, хорошо что отброшены')
+  return { ok: true, added, total: loadAnswers().length }
+}
+
+// ---- картинки раундов с диска ----
+function stampOfDir(name) {
+  const m = String(name).match(/(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}[^_]*)/)
+  if (!m) return null
+  const t = Date.parse(m[1].replace(/-(\d{2})-(\d{2})$/, ':$1:$2'))
+  return isNaN(t) ? null : t
+}
+
+function listRoundDirs(root) {
+  const out = []
+  try {
+    if (!fs.existsSync(root)) return out
+    for (const d of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue
+      const m = d.name.match(/^round(\d+)_a(\d+)_(.+)$/)
+      if (!m) continue
+      const dir = path.join(root, d.name)
+      if (!fs.existsSync(path.join(dir, 'ORIGINAL_raw.bin'))) continue
+      out.push({ dir, name: d.name, round: Number(m[1]), attempt: Number(m[2]), stamp: m[3], t: stampOfDir(d.name) })
+    }
+  } catch (e) {}
+  out.sort((a, b) => (a.t || 0) - (b.t || 0) || a.name.localeCompare(b.name))
+  return out
+}
+
+function loadRawImage(dir) {
+  try {
+    const data = fs.readFileSync(path.join(dir, 'ORIGINAL_raw.bin'))
+    let W = 0, H = 0
+    for (const f of ['layout.json', 'assembly_debug.json']) {
+      try {
+        const o = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))
+        const cols = o.cols || (o.grid && o.grid.cols), rows = o.rows || (o.grid && o.grid.rows)
+        if (o.W && o.H) { W = o.W; H = o.H; break }
+        if (cols && rows) { W = cols * 128; H = rows * 128; break }
+      } catch (e) {}
+    }
+    if (!W || !H) {
+      // подбор по объёму: капча всегда 4×3 плитки = 512×384
+      for (const [w, h] of [[512, 384], [384, 512], [512, 512], [256, 384], [384, 384]]) if (w * h === data.length) { W = w; H = h; break }
+    }
+    if (!W || !H || W * H !== data.length) return null
+    return { data: new Uint8Array(data.buffer, data.byteOffset, data.length), W, H }
+  } catch (e) { return null }
+}
+
+// ---- кропы конкретной стратегии (ровно expected штук) ----
+function cropsFromSegResult(res, W, H, expected) {
+  if (!res || !res.boxes || res.boxes.length !== expected) return null
+  const out = []
+  for (const b0 of res.boxes) {
+    if (!b0) return null
+    let b = b0, m = res.mask
+    try {
+      const cl = DIG.cleanBoxMask(res.mask, W, H, b0, {})
+      if (cl && cl.after > 0) { b = cl.bbox; m = cl.mask }
+    } catch (e) {}
+    if (!b || b.w < 3 || b.h < 5 || b.area <= 0) return null
+    const norm = DIG.normalizeGlyphAR(m, W, H, b)
+    let sum = 0; for (let k = 0; k < norm.length; k++) sum += norm[k]
+    const stroke = sum / (DIG.GW * DIG.GH)
+    out.push({
+      bbox: b, norm, stroke: Math.round(stroke * 1000) / 1000,
+      fill: Math.round(b.area / (b.w * b.h) * 1000) / 1000,
+      feat: DIG.buildFeatures(norm, { aspect: b.w / b.h, fill: b.area / (b.w * b.h), stroke })
+    })
+  }
+  return out
+}
+
+// ---- leave-one-IMAGE-out k-NN: честная оценка «узнаю ли я цифру по кропу» ----
+function looImageAccuracy(groups, k) {
+  const all = []
+  groups.forEach((g, gi) => g.items.forEach(it => all.push({ gi, feat: it.feat, digit: it.digit })))
+  if (all.length < 12) return null
+  const D = all[0].feat.length
+  const mean = new Float64Array(D)
+  for (const s of all) for (let i = 0; i < D; i++) mean[i] += s.feat[i]
+  for (let i = 0; i < D; i++) mean[i] /= all.length
+  const sd = new Float64Array(D)
+  for (const s of all) for (let i = 0; i < D; i++) { const d = s.feat[i] - mean[i]; sd[i] += d * d }
+  let sumSd = 0
+  for (let i = 0; i < D; i++) { sd[i] = Math.sqrt(sd[i] / Math.max(1, all.length - 1)); sumSd += sd[i] }
+  const avg = sumSd / D
+  const sc = new Float64Array(D)
+  for (let i = 0; i < D; i++) sc[i] = 1 / Math.max(sd[i], avg * 0.25, 1e-3)
+  let ok = 0
+  for (let qi = 0; qi < all.length; qi++) {
+    const q = all[qi]
+    const ds = []
+    for (let si = 0; si < all.length; si++) {
+      const s = all[si]
+      if (s.gi === q.gi) continue
+      let d = 0
+      for (let i = 0; i < D; i++) { const t = (q.feat[i] - s.feat[i]) * sc[i]; d += t * t }
+      ds.push({ d, digit: s.digit })
+    }
+    if (!ds.length) continue
+    ds.sort((a, b) => a.d - b.d)
+    const votes = {}
+    for (const n of ds.slice(0, Math.min(k, ds.length))) votes[n.digit] = (votes[n.digit] || 0) + 1 / (1 + n.d)
+    let bd = -1, bv = null
+    for (const key in votes) if (bv === null || votes[key] > bv) { bv = votes[key]; bd = Number(key) }
+    if (bd === q.digit) ok++
+  }
+  return { acc: Math.round(1000 * ok / all.length) / 10, n: all.length, images: groups.length }
+}
+
+// сопоставление «ответ из лога» → «каталог раунда»: номер раунда + время.
+// Локальное время лога и UTC в имени каталога различаются на неизвестный сдвиг,
+// поэтому сдвиг оценивается по моде всех пар (самокалибровка).
+function matchAnswersToDirs(answers, dirs) {
+  const byRound = new Map()
+  const byName = new Map()
+  for (const d of dirs) {
+    if (!byRound.has(d.round)) byRound.set(d.round, [])
+    byRound.get(d.round).push(d)
+    byName.set(d.name, d)
+  }
+  // 0) точное совпадение: ответы из живой сессии знают имя каталога
+  const exact = [], rest = []
+  const usedExact = new Set()
+  for (const a of answers) {
+    const d = a.dir ? byName.get(a.dir) : null
+    if (d && !usedExact.has(d.dir)) { usedExact.add(d.dir); exact.push({ answer: a, dir: d }) }
+    else rest.push(a)
+  }
+  const pairs = []
+  for (const a of rest) {
+    const cands = byRound.get(Number(a.round)) || []
+    for (const d of cands) {
+      let delta = null
+      if (a.ts) { const at = Date.parse(a.ts); if (!isNaN(at) && d.t) delta = (d.t - at) / 1000 }
+      else if (a.sec !== null && a.sec !== undefined && d.t) {
+        const dt = new Date(d.t)
+        delta = (dt.getUTCHours() * 3600 + dt.getUTCMinutes() * 60 + dt.getUTCSeconds()) - a.sec
+        if (delta > 43200) delta -= 86400
+        if (delta < -43200) delta += 86400
+      }
+      if (delta === null) continue
+      pairs.push({ a, d, delta })
+    }
+  }
+  let offset = 0
+  if (pairs.length) {
+    const hist = new Map()
+    for (const p of pairs) { const b = Math.round(p.delta / 900) * 900; hist.set(b, (hist.get(b) || 0) + 1) }
+    let best = null, bn = -1
+    for (const [b, n] of hist) if (n > bn) { bn = n; best = b }
+    offset = best || 0
+  }
+  const usedDir = new Set(exact.map(e => e.dir.dir)), out = exact.slice()
+  const near = pairs.filter(p => Math.abs(p.delta - offset) <= 1800).sort((x, y) => Math.abs(x.delta - offset) - Math.abs(y.delta - offset))
+  for (const p of near) {
+    if (usedDir.has(p.d.dir)) continue
+    usedDir.add(p.d.dir)
+    out.push({ answer: p.a, dir: p.d })
+  }
+  // если время сопоставить не удалось (нет ни ts, ни sec) — берём по номеру раунда
+  if (out.length === exact.length) {
+    for (const a of rest) {
+      const cands = (byRound.get(Number(a.round)) || []).filter(d => !usedDir.has(d.dir))
+      if (!cands.length) continue
+      usedDir.add(cands[0].dir)
+      out.push({ answer: a, dir: cands[0] })
+    }
+  }
+  return { matched: out, offsetSec: offset, exact: exact.length, byTime: out.length - exact.length }
+}
+
+// картинка-контакт лист: строки = картинки, столбцы = 5 кропов стратегии
+function contactSheetPng(rowsOfCrops) {
+  try {
+    const rows = (rowsOfCrops || []).filter(r => r && r.length)
+    if (!rows.length) return null
+    const cw = DIG.GW * 3 + 6, ch = DIG.GH * 3 + 6
+    const W = Math.max.apply(null, rows.map(r => r.length)) * cw + 6, H = rows.length * ch + 6
+    return DIG.pngRgba(W, H, 1, (x, y) => {
+      const ri = Math.floor((y - 3) / ch), ci = Math.floor((x - 3) / cw)
+      if (ri < 0 || ri >= rows.length) return [255, 255, 255]
+      const c = rows[ri][ci]
+      if (!c) return [255, 255, 255]
+      const gx = Math.floor(((x - 3) % cw - 1) / 3), gy = Math.floor(((y - 3) % ch - 1) / 3)
+      if (gx < 0 || gy < 0 || gx >= DIG.GW || gy >= DIG.GH) return [235, 235, 235]
+      const v = Math.max(0, Math.min(1, Number(c.norm[gy * DIG.GW + gx]) || 0))
+      const g = Math.round(255 * (1 - v))
+      return [g, g, g]
+    })
+  } catch (e) { return null }
+}
+
+// ASCII-превью кропов — можно скопировать ПРЯМО В ЧАТ (не нужен файл)
+function asciiRow(crops) {
+  if (!crops || !crops.length) return '(нет)'
+  const lines = []
+  for (let y = 0; y < DIG.GH; y++) {
+    let s = '|'
+    for (const c of crops) {
+      const row = DIG.asciiArt(c.norm, DIG.GW, DIG.GH).split('\n')[y] || ''
+      s += row.replace(/^\||\|$/g, '') + '|'
+    }
+    lines.push(s)
+  }
+  return lines.join('\n')
+}
+
+async function runAutotune(rootDir, opts) {
+  opts = opts || {}
+  const root = rootDir && typeof rootDir === 'string' ? rootDir : (REC_ROOT || path.join(__dirname, 'records'))
+  step('🔧 АВТОТЮНИНГ СЕГМЕНТАЦИИ (офлайн) | каталог: ' + root)
+  const dirs = listRoundDirs(root)
+  if (!dirs.length) {
+    step('❌ в ' + root + ' нет каталогов roundNN_aN_* с ORIGINAL_raw.bin — нечего настраивать.')
+    step('   Сначала соберите раунды: node main.js (или node main.js --rounds 10)')
+    return { ok: false, reason: 'no dirs' }
+  }
+  const answers = loadAnswers()
+  if (!answers.length) {
+    step('❌ нет ни одного ответа человека (learn/answers.jsonl пуст).')
+    step('   Импортируйте из лога:  node main.js --import-answers learn\\telegram.log')
+    step('   (в логе нужны строки «раунд N: ответ «12345»»)')
+    return { ok: false, reason: 'no answers', dirs: dirs.length }
+  }
+  const mt = matchAnswersToDirs(answers, dirs)
+  step('📚 ответов в базе: ' + answers.length + ' | картинок раундов: ' + dirs.length + ' | сопоставлено: ' + mt.matched.length +
+    (mt.matched.length ? ' (по имени каталога: ' + (mt.exact || 0) + ', по времени: ' + (mt.byTime || 0) +
+      (mt.byTime ? ', сдвиг времени ' + Math.round(mt.offsetSec / 60) + ' мин' : '') + ')' : ''))
+  if (mt.matched.length < 4) {
+    step('❌ сопоставлено меньше 4 пар «картинка+ответ» — тюнинг невозможен.')
+    step('   Проверьте, что ответы импортированы из того же прогона, что и каталоги records/.')
+    return { ok: false, reason: 'too few pairs', pairs: mt.matched.length }
+  }
+
+  // ---- собираем кропы ВСЕХ стратегий для каждой картинки ----
+  const pairs = mt.matched.slice(0, opts.maxImages || 120)
+  const perStrategy = new Map()   // name -> [{items:[{feat,digit}], key}]
+  const images = []
+  let t0 = Date.now()
+  for (const p of pairs) {
+    const img = loadRawImage(p.dir.dir)
+    if (!img) { step('   ⚠️ не прочитался ORIGINAL_raw.bin: ' + p.dir.name); continue }
+    const digits = String(p.answer.answer)
+    if (digits.length !== DIGITS_EXPECTED) continue
+    let all = []
+    try { all = DIG.autoSegment(img.data, img.W, img.H, DIGITS_EXPECTED, {}) || [] } catch (e) { step('   autoSegment err: ' + e.message); continue }
+    if (!all.length) { step('   ⚠️ ни одна стратегия не дала ' + DIGITS_EXPECTED + ' рамок: ' + p.dir.name); continue }
+    images.push({ name: p.dir.name, digits, W: img.W, H: img.H, data: img.data, results: all })
+    for (const res of all) {
+      const crops = cropsFromSegResult(res, img.W, img.H, DIGITS_EXPECTED)
+      if (!crops) continue
+      if (!perStrategy.has(res.name)) perStrategy.set(res.name, [])
+      perStrategy.get(res.name).push({
+        key: p.dir.name, digits,
+        items: crops.map((c, i) => ({ feat: c.feat, digit: Number(digits[i]), norm: c.norm, bbox: c.bbox, stroke: c.stroke, fill: c.fill })),
+        score: res.score, fallback: !!res.fallback, inkFrac: res.inkFrac
+      })
+    }
+  }
+  if (!images.length) { step('❌ не удалось извлечь кропы ни с одной картинки'); return { ok: false, reason: 'no crops' } }
+  step('🖼 картинок обработано: ' + images.length + ' | стратегий-кандидатов: ' + perStrategy.size + ' (' + ((Date.now() - t0) / 1000).toFixed(1) + 'с)')
+
+  // ---- оценка каждой стратегии: LOO k-NN + «сколько раз её выбрал бы автоподбор» ----
+  const pickCount = new Map()
+  for (const im of images) {
+    const best = im.results.slice().sort((a, b) => b.score - a.score)[0]
+    if (best) pickCount.set(best.name, (pickCount.get(best.name) || 0) + 1)
+  }
+  const rows = []
+  t0 = Date.now()
+  for (const [name, groups] of perStrategy) {
+    if (groups.length < Math.max(4, Math.floor(images.length * 0.5))) continue
+    let bestAcc = null
+    for (const k of [1, 3, 5]) {
+      const r = looImageAccuracy(groups, k)
+      if (r && (!bestAcc || r.acc > bestAcc.acc)) bestAcc = Object.assign({ k }, r)
+    }
+    if (!bestAcc) continue
+    const strokes = []
+    const fills = []
+    for (const g of groups) for (const it of g.items) { strokes.push(it.stroke); fills.push(it.fill) }
+    strokes.sort((a, b) => a - b); fills.sort((a, b) => a - b)
+    const med = a => a.length ? a[Math.floor(a.length / 2)] : 0
+    // «одинаковость» кропов внутри картинки — главный симптом мусорной маски
+    let samePairs = 0, totPairs = 0
+    for (const g of groups) {
+      for (let i = 0; i < g.items.length; i++) for (let j = i + 1; j < g.items.length; j++) {
+        totPairs++
+        let d = 0
+        for (let t = 0; t < DIG.GW * DIG.GH; t++) { const x = g.items[i].norm[t] - g.items[j].norm[t]; d += x * x }
+        if (Math.sqrt(d) < 1.2) samePairs++
+      }
+    }
+    rows.push({
+      strategy: name, acc: bestAcc.acc, k: bestAcc.k, images: groups.length,
+      avgScore: Math.round(groups.reduce((a, g) => a + (g.score || 0), 0) / groups.length * 10) / 10,
+      pickedByAuto: pickCount.get(name) || 0,
+      medStroke: med(strokes), medFill: med(fills),
+      sameFrac: totPairs ? Math.round(100 * samePairs / totPairs) : 0,
+      groups
+    })
+  }
+  rows.sort((a, b) => b.acc - a.acc || b.images - a.images)
+  step('⏱ оценка стратегий: ' + ((Date.now() - t0) / 1000).toFixed(1) + 'с')
+  if (!rows.length) { step('❌ ни одна стратегия не набрала достаточно картинок'); return { ok: false, reason: 'no rows' } }
+
+  const current = readStyle()
+  console.log('')
+  console.log('=== ТОП-15 СТРАТЕГИЙ МАСКИ (точность = leave-one-image-out k-NN на ВАШИХ ответах) ===')
+  console.log('  точн%  k  картинок  балл  выбиралась авто  одинак.кропы  штрих  заполн  стратегия')
+  for (const r of rows.slice(0, 15)) {
+    console.log('  ' + String(r.acc).padStart(5) + '  ' + String(r.k).padStart(1) + '  ' + String(r.images).padStart(8) +
+      '  ' + String(r.avgScore).padStart(5) + '  ' + String(r.pickedByAuto).padStart(13) +
+      '  ' + String(r.sameFrac + '%').padStart(11) + '  ' + String(r.medStroke).padStart(6) + '  ' + String(r.medFill).padStart(7) +
+      '   ' + r.strategy + (current && current.strategy === r.strategy ? '   ← ЗАМОК СТИЛЯ (текущая)' : ''))
+  }
+  const best = rows[0]
+  const autoPick = rows.slice().sort((a, b) => b.pickedByAuto - a.pickedByAuto)[0]
+  console.log('')
+  console.log('🏆 ЛУЧШАЯ: ' + best.strategy + ' → ' + best.acc + '% (k=' + best.k + ', картинок ' + best.images + ')')
+  console.log('   Автоподбор сейчас чаще всего выбирает: ' + (autoPick ? autoPick.strategy + ' → ' + autoPick.acc + '%' : '—'))
+  if (best.acc < 40) {
+    console.log('⚠️ Даже лучшая стратегия даёт ' + best.acc + '% — похоже, проблема НЕ в маске,')
+    console.log('   а в сборке картинки (плитки сложены неверно) или цифры не того цвета/контраста.')
+    console.log('   Пришлите мне learn/autotune_report.json и ASCII-превью ниже.')
+  } else if (best.acc >= 70) {
+    console.log('✅ ' + best.acc + '% — на этой маске обучение будет работать. Зафиксируйте: --autotune --apply')
+  }
+
+  // ---- контактные листы (глазами проверить, что в кропах действительно цифры) ----
+  try {
+    for (const r of rows.slice(0, 3)) {
+      const png = contactSheetPng(r.groups.slice(0, 12).map(g => g.items))
+      if (png) {
+        const f = path.join(LEARN_DIR, 'autotune_sheet_' + r.strategy.replace(/[^a-z0-9_.+-]/gi, '_') + '.png')
+        fs.writeFileSync(f, png)
+        step('🖼 контактный лист «' + r.strategy + '» (' + r.acc + '%): ' + f)
+      }
+    }
+  } catch (e) { dbg('sheet err ' + e.message) }
+
+  // ---- ASCII-превью кропов лучшей и текущей стратегии (можно скопировать в чат) ----
+  const showFor = [best.strategy]
+  if (current && current.strategy && current.strategy !== best.strategy) showFor.push(current.strategy)
+  if (autoPick && autoPick.strategy && showFor.indexOf(autoPick.strategy) < 0) showFor.push(autoPick.strategy)
+  const preview = {}
+  for (const name of showFor.slice(0, 3)) {
+    const row = rows.find(r => r.strategy === name)
+    if (!row) continue
+    const sample = row.groups.slice(0, 3)
+    console.log('')
+    console.log('--- КРОПЫ стратегии «' + name + '» (' + row.acc + '%), слева направо 5 цифр; подпись = правильный ответ ---')
+    for (const g of sample) {
+      console.log('[' + g.key + '] верно: ' + g.digits)
+      console.log(asciiRow(g.items))
+    }
+    preview[name] = sample.map(g => ({ dir: g.key, digits: g.digits, ascii: asciiRow(g.items) }))
+  }
+
+  // ---- отчёт + фиксация стиля ----
+  try {
+    fs.mkdirSync(LEARN_DIR, { recursive: true })
+    const report = {
+      generated: new Date().toISOString(), root, images: images.length, pairs: mt.matched.length,
+      offsetSec: mt.offsetSec, best: { strategy: best.strategy, acc: best.acc, k: best.k },
+      autoPick: autoPick ? { strategy: autoPick.strategy, acc: autoPick.acc, pickedByAuto: autoPick.pickedByAuto } : null,
+      currentStyle: current ? current.strategy : null,
+      table: rows.slice(0, 30).map(r => ({ strategy: r.strategy, acc: r.acc, k: r.k, images: r.images, avgScore: r.avgScore, pickedByAuto: r.pickedByAuto, sameFrac: r.sameFrac, medStroke: r.medStroke, medFill: r.medFill })),
+      preview
+    }
+    fs.writeFileSync(path.join(LEARN_DIR, 'autotune_report.json'), JSON.stringify(report, null, 2))
+    step('📄 отчёт: ' + path.join(LEARN_DIR, 'autotune_report.json'))
+  } catch (e) { step('отчёт не записан: ' + e.message) }
+
+  if (opts.apply) {
+    // 1) замок стиля на лучшую стратегию
+    try {
+      fs.mkdirSync(LEARN_DIR, { recursive: true })
+      fs.writeFileSync(path.join(LEARN_DIR, 'style.json'), JSON.stringify({
+        strategy: best.strategy, score: best.avgScore, extra: { source: 'autotune', acc: best.acc, k: best.k },
+        rounds: 0, sameAsBefore: current && current.strategy === best.strategy,
+        locked: true, updated: new Date().toISOString()
+      }, null, 2))
+      step('🔒 learn/style.json → стратегия «' + best.strategy + '» (замок, точность ' + best.acc + '%)')
+    } catch (e) { step('style.json не записан: ' + e.message) }
+    // 2) пересбор базы цифр из тех же картинок (мгновенно, без сервера)
+    try {
+      const gf = path.join(LEARN_DIR, 'glyphs.jsonl')
+      if (fs.existsSync(gf)) fs.copyFileSync(gf, gf + '.bak_' + Date.now())
+      const store = new DIG.GlyphStore(LEARN_DIR, { augment: DIG_AUGMENT })
+      store.samples = []
+      try { fs.writeFileSync(gf, '') } catch (e) {}
+      let n = 0
+      for (const g of best.groups) for (const it of g.items) {
+        try { store.add(it.digit, it.feat, { src: 'autotune:' + g.key, aspect: it.bbox.w / Math.max(1, it.bbox.h) }); n++ } catch (e) {}
+      }
+      step('📚 база пересобрана лучшей стратегией: ' + n + ' примеров (старая сохранена в glyphs.jsonl.bak_*)')
+      const tr = trainModel(store)
+      if (tr.ok) step('🧠 MLP: ' + tr.accTrain + '% train / ' + tr.accTest + '% holdout (' + tr.samples + ' примеров) — ожидаемо ≈' + best.acc + '%')
+      else step('🧠 MLP не обучена: ' + tr.reason)
+    } catch (e) { step('пересбор базы не удался: ' + e.message) }
+  } else {
+    step('ℹ️ ничего не менял. Чтобы применить лучшую стратегию: node main.js --autotune --apply')
+  }
+  return { ok: true, best: best.strategy, acc: best.acc, images: images.length, rows: rows.slice(0, 15) }
+}
+
+// ---- ДИАГНОСТИКА ОДНОЙ КАРТИНКИ: что именно режет сегментация ----
+// node main.js --diag              → самый свежий раунд в records/
+// node main.js --diag records\round07_a1_...   → конкретный каталог
+function runDiag(target) {
+  const root = REC_ROOT || path.join(__dirname, 'records')
+  let dir = null
+  if (target && fs.existsSync(target)) dir = fs.statSync(target).isDirectory() ? target : path.dirname(target)
+  if (!dir) {
+    const dirs = listRoundDirs(root)
+    if (!dirs.length) { step('❌ в ' + root + ' нет каталогов roundNN_aN_* с ORIGINAL_raw.bin'); return }
+    dir = dirs[dirs.length - 1].dir
+  }
+  step('🔎 ДИАГНОСТИКА: ' + dir)
+  const img = loadRawImage(dir)
+  if (!img) { step('❌ не удалось прочитать ORIGINAL_raw.bin (нет файла или размер не сходится с layout.json)'); return }
+  step('   размер собранной картинки: ' + img.W + '×' + img.H + ' (' + img.data.length + ' байт)')
+  fs.writeFileSync(path.join(dir, 'DIAG_color.png'), colorPng(img.data, img.W, img.H, 2))
+  step('   цветная копия: ' + path.join(dir, 'DIAG_color.png'))
+
+  const answers = loadAnswers()
+  const num = (path.basename(dir).match(/^round(\d+)/) || [])[1]
+  const known = answers.filter(a => String(a.round) === String(num ? Number(num) : ''))
+  step('   известный ответ человека: ' + (known.length ? known.map(a => '«' + a.answer + '»').join(', ') : 'НЕТ (импортируйте: --import-answers learn\\telegram.log)'))
+
+  const style = readStyle()
+  step('   замок стиля: ' + (style ? style.strategy + (style.locked ? ' (autotune)' : '') : 'нет'))
+
+  let all = []
+  try { all = DIG.autoSegment(img.data, img.W, img.H, DIGITS_EXPECTED, {}) || [] } catch (e) { step('❌ autoSegment: ' + e.message); return }
+  step('   стратегий перебрано: ' + all.length)
+  if (!all.length) {
+    step('❌ НИ ОДНА стратегия не дала ровно ' + DIGITS_EXPECTED + ' рамок. Значит маска/полоса не находится вовсе.')
+    step('   Пришлите мне DIAG_color.png и этот вывод.')
+    return
+  }
+  console.log('')
+  console.log('=== ТОП-10 СТРАТЕГИЙ НА ЭТОЙ КАРТИНКЕ ===')
+  console.log('  балл   черн.%  полоса     одинак.кропы  штрих  заполн  стратегия')
+  const shown = all.slice(0, 10)
+  for (const res of shown) {
+    const crops = cropsFromSegResult(res, img.W, img.H, DIGITS_EXPECTED)
+    let same = '?', stroke = '?', fill = '?'
+    if (crops) {
+      let sp = 0, tp = 0
+      for (let i = 0; i < crops.length; i++) for (let j = i + 1; j < crops.length; j++) {
+        tp++
+        let d = 0
+        for (let t = 0; t < DIG.GW * DIG.GH; t++) { const x = crops[i].norm[t] - crops[j].norm[t]; d += x * x }
+        if (Math.sqrt(d) < 1.2) sp++
+      }
+      same = Math.round(100 * sp / Math.max(1, tp)) + '%'
+      const st = crops.map(c => c.stroke).sort((a, b) => a - b)
+      const fl = crops.map(c => c.fill).sort((a, b) => a - b)
+      stroke = st[Math.floor(st.length / 2)]
+      fill = fl[Math.floor(fl.length / 2)]
+    }
+    console.log('  ' + String(res.score).padStart(6) + '  ' + String(Math.round(res.inkFrac * 1000) / 10).padStart(5) +
+      '  ' + (res.band ? (res.band.y0 + '-' + res.band.y1).padStart(9) : '        ?') +
+      '  ' + String(same).padStart(11) + '  ' + String(stroke).padStart(6) + '  ' + String(fill).padStart(7) +
+      '   ' + res.name + (res.fallback ? '  [РАВНОМЕРНАЯ НАРЕЗКА — рамки не по цифрам!]' : ''))
+  }
+  // картинки с рамками для трёх лучших стратегий + ASCII-превью (можно вставить в чат)
+  for (const res of shown.slice(0, 3)) {
+    try {
+      const png = debugSegmentationPng({ data: img.data, W: img.W, H: img.H }, res.boxes, res.band)
+      if (png) fs.writeFileSync(path.join(dir, 'DIAG_boxes_' + res.name.replace(/[^a-z0-9_.+-]/gi, '_') + '.png'), png)
+    } catch (e) {}
+    const crops = cropsFromSegResult(res, img.W, img.H, DIGITS_EXPECTED)
+    if (!crops) continue
+    console.log('')
+    console.log('--- «' + res.name + '» балл ' + res.score + ' — ЧТО Я ВИЖУ (ASCII, слева направо) ---')
+    console.log(asciiRow(crops))
+    try {
+      const sheet = contactSheetPng([crops.map(c => ({ norm: c.norm }))])
+      if (sheet) fs.writeFileSync(path.join(dir, 'DIAG_crops_' + res.name.replace(/[^a-z0-9_.+-]/gi, '_') + '.png'), sheet)
+    } catch (e) {}
+  }
+  console.log('')
+  step('✅ файлы диагностики лежат в ' + dir + ' (DIAG_color.png, DIAG_boxes_*.png, DIAG_crops_*.png)')
+  step('   Скопируйте в чат ASCII-блоки выше — по ним видно, цифра в кропе или шум.')
+}
+
 // ========================= ЗАПИСЬ РАУНДА =========================
 function readStyle() {
   try {
@@ -3193,6 +3874,12 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
       feat: it.glyph ? it.glyph.feat : null
     })),
     segPath: best.segPath, segStrategy: best.seg ? best.seg.strategy : null, segScore: best.seg ? best.seg.score : null,
+    // диагностика качества нарезки: degenerate=true → кропы одинаковые («88888»),
+    // такую разметку нельзя класть в базу (см. runAutotune / --diag)
+    segDegenerate: best.seg ? !!best.seg.degenerate : false,
+    segSameFrac: best.seg && best.seg.sameFrac != null ? best.seg.sameFrac : null,
+    segFallback: best.seg ? !!best.seg.fallback : null,
+    segMedStroke: best.seg && best.seg.medStroke != null ? best.seg.medStroke : null,
     pngFile: path.join(outDir, 'ORIGINAL_CAPTCHA_x1.png'),
     pngFile2x: path.join(outDir, 'ORIGINAL_CAPTCHA.png'),
     candidates: stats.map(s => ({ wall: s.w.tag, score: s.score, breakdown: s.breakdown })),
@@ -3598,7 +4285,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.11.0: геометрия сборки ===')
+  console.log('=== SELFTEST v3.12.0: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -4128,6 +4815,187 @@ async function selftest() {
     if (!ok && st) console.log('     ⚠️ ожидали: doneByStreak=true, bestStreak>=' + 3 + ', размечено>=' + 15 + ', финальное сообщение 🎓')
   }
 
+  // ============ v3.12.0: ответы человека, импорт из лога, офлайн-тюнинг ============
+  console.log('--- v3.12.0: парсинг CLI-флагов (офлайн-режимы не должны включаться сами) ---')
+  {
+    // регрессия: argVal возвращает '' когда флага нет, поэтому проверка
+    // «typeof === 'string'» давала CLI.autotune=true ВСЕГДА → обычный запуск
+    // node main.js уходил бы в офлайн-тюнинг вместо сбора капчи.
+    const srcSelf = fs.readFileSync(__filename, 'utf8')
+    const a = srcSelf.indexOf('const ARGV = process.argv.slice(2)')
+    const b = srcSelf.indexOf('\n}\n', srcSelf.indexOf('diagDir:')) + 3
+    const cases = [
+      { argv: [], want: { autotune: false, diag: false, importAnswers: '', apply: false } },
+      { argv: ['--autotune'], want: { autotune: true } },
+      { argv: ['--autotune', 'records'], want: { autotune: true, autotuneDir: 'records' } },
+      { argv: ['--diag'], want: { diag: true, diagDir: '' } },
+      { argv: ['--diag', 'records/round01'], want: { diag: true, diagDir: 'records/round01' } },
+      { argv: ['--import-answers'], want: { importAnswers: 'log' } },
+      { argv: ['--autotune', '--apply'], want: { autotune: true, apply: true } },
+      { argv: ['--rounds', '5'], want: { autotune: false, diag: false, apply: false, importAnswers: '' } }
+    ]
+    let cliBad = 0
+    for (const c of cases) {
+      const CLIx = new Function('process', 'path', srcSelf.slice(a, b) + '; return CLI')(
+        { argv: ['node', 'main.js'].concat(c.argv) }, path)
+      for (const k in c.want) {
+        const w = c.want[k], got = CLIx[k]
+        const okk = (w === 'log') ? /telegram\.log$/.test(String(got)) : (got === w)
+        if (!okk) { cliBad++; console.log('     ❌ ' + (c.argv.join(' ') || '(без флагов)') + ': ' + k + '=' + JSON.stringify(got) + ' (жду ' + JSON.stringify(w) + ')') }
+      }
+    }
+    if (cliBad) fails++
+    console.log('  ' + (cliBad ? '\u274c' : '\u2705') + ' CLI: ' + cases.length + ' кейсов, расхождений ' + cliBad)
+  }
+
+  console.log('--- v3.12.0: команды с аргументами («/glyphs 82502» из лога 13:12) ---')
+  {
+    // регрессия: сообщение «/glyphs 82502» не находило обработчик и молча
+    // проваливалось в «пришлите ровно 5 цифр» — человек трижды слал /glyphs
+    const botName = 'mainccbot'
+    const parse = t => {
+      const low = t.toLowerCase()
+      const m = low.match(/^\/([a-z]+)(@[a-z0-9_]+)?([\s\S]*)$/)
+      return { cmd: m ? '/' + m[1] : '', ok: !!m && (!m[2] || m[2] === '@' + botName), arg: m ? String(m[3] || '').trim() : '' }
+    }
+    const cases = [
+      { t: '/glyphs', cmd: '/glyphs', arg: '' },
+      { t: '/glyphs 82502', cmd: '/glyphs', arg: '82502' },
+      { t: '/glyphs@MainCCbot', cmd: '/glyphs', arg: '' },
+      { t: '/diag', cmd: '/diag', arg: '' },
+      { t: '/skip не вижу цифр', cmd: '/skip', arg: 'не вижу цифр' },
+      { t: '/stop@MainCCbot', cmd: '/stop', arg: '' },
+      { t: '82502', cmd: '', arg: '' },
+      { t: '+', cmd: '', arg: '' }
+    ]
+    let bad = 0
+    for (const c of cases) {
+      const r = parse(c.t)
+      const good = r.cmd === c.cmd && (c.arg === '' || r.arg === c.arg) && (c.cmd === '' || r.ok)
+      if (!good) { bad++; console.log('     ❌ «' + c.t + '» → cmd="' + r.cmd + '" arg="' + r.arg + '" ok=' + r.ok) }
+    }
+    // цифры из аргумента должны доставаться так же, как из обычного сообщения
+    const digs = '/glyphs 82502'.match(/^\/([a-z]+)(@[a-z0-9_]+)?([\s\S]*)$/)[3].replace(/[^0-9]/g, '')
+    if (digs !== '82502') { bad++; console.log('     ❌ цифры из аргумента: "' + digs + '"') }
+    if (bad) fails++
+    console.log('  ' + (bad ? '\u274c' : '\u2705') + ' команды с аргументами: ' + cases.length + ' кейсов, ошибок ' + bad)
+  }
+
+  console.log('--- v3.12.0: разбор ответов из telegram.log ---')
+  {
+    const log = [
+      '17:38:29 [TG] транспорт: tg-proxy(1.2.3.4:8000)',
+      '17:38:34 [TG] раунд 1: фото отправлено (message_id=2777) цифр=5/5',
+      '17:38:59 [TG] раунд 1: ответ «40242» (update_id=785300514)',
+      '17:39:05 [TG] раунд 2: ответ «88073» (update_id=785300515)',
+      '17:39:13 [TG] раунд 3: ответ «8695» (update_id=785300516)',
+      '17:39:21 [TG] раунд 4: ответ «/skip» (update_id=785300517)',
+      '14:04:36 [TG] транспорт: tg-proxy(1.2.3.4:8000)',
+      '14:04:41 [TG] раунд 1: ответ «59131» (update_id=785300515)',
+      '14:05:03 [TG] раунд 4: ответ «59209» (update_id=785300518)'
+    ].join('\n')
+    const parsed = parseAnswersFromLog(log)
+    const good = parsed.filter(p => !p.skipped)
+    const replayed = parsed.filter(p => p.replayed)
+    const short = parsed.filter(p => p.skipped && /не 5 цифр/.test(p.skipped))
+    const ok = good.length === 3 && replayed.length === 1 && short.length === 1 &&
+      good.some(g => g.round === 1 && g.answer === '40242' && g.session === 1) &&
+      good.some(g => g.round === 4 && g.answer === '59209' && g.session === 2) &&
+      replayed[0].round === 1 && replayed[0].session === 2
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' парсер: принято ' + good.length + ' (жду 3), «призраков» ' + replayed.length +
+      ' (жду 1), отброшено по длине ' + short.length + ' (жду 1), сессий ' + (parsed.length ? Math.max.apply(null, parsed.map(p => p.session)) : 0))
+    if (!ok) console.log('     ⚠️ ' + JSON.stringify(parsed))
+  }
+
+  console.log('--- v3.12.0: answers.jsonl + сопоставление с каталогами ---')
+  {
+    const dirs = [
+      { dir: '/x/round01_a1_2026-10-17T14-38-29-000Z', name: 'round01_a1_2026-10-17T14-38-29-000Z', round: 1, attempt: 1, stamp: '2026-10-17T14-38-29-000Z', t: Date.parse('2026-10-17T14:38:29Z') },
+      { dir: '/x/round02_a1_2026-10-17T14-38-29-000Z', name: 'round02_a1_2026-10-17T14-38-29-000Z', round: 2, attempt: 1, stamp: '2026-10-17T14-38-29-000Z', t: Date.parse('2026-10-17T14:38:41Z') },
+      { dir: '/x/round01_a1_2026-10-17T11-04-36-000Z', name: 'round01_a1_2026-10-17T11-04-36-000Z', round: 1, attempt: 1, stamp: '2026-10-17T11-04-36-000Z', t: Date.parse('2026-10-17T11:04:36Z') }
+    ]
+    // локальное время в логе 17:38 = UTC 14:38 (сдвиг +3ч) — парсер должен сам его найти
+    const answers = [
+      { round: 1, answer: '40242', sec: 17 * 3600 + 38 * 60 + 59, session: 1 },
+      { round: 2, answer: '88073', sec: 17 * 3600 + 39 * 60 + 5, session: 1 }
+    ]
+    const mt = matchAnswersToDirs(answers, dirs)
+    const ok = mt.matched.length === 2 &&
+      mt.matched.some(m => m.answer.answer === '40242' && /14-38-29/.test(m.dir.name)) &&
+      mt.matched.some(m => m.answer.answer === '88073' && /round02/.test(m.dir.name)) &&
+      Math.abs(Math.abs(mt.offsetSec) - 3 * 3600) < 1800
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' сопоставление: пар ' + mt.matched.length + '/2, сдвиг ' + Math.round(mt.offsetSec / 60) + ' мин (жду ≈180), ' +
+      'каталоги: ' + mt.matched.map(m => m.dir.name.slice(0, 8)).join(','))
+    if (!ok) console.log('     ⚠️ ' + JSON.stringify(mt.matched.map(m => ({ a: m.answer.answer, d: m.dir.name }))))
+  }
+
+  console.log('--- v3.12.0: штраф за равномерную нарезку + детектор «одинаковых кропов» ---')
+  {
+    // 1) на «плоской» картинке (шум без цифр) кропы обязаны выродиться
+    const W = 512, H = 384
+    let s = 4242
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff }
+    const flat = new Uint8Array(W * H)
+    for (let i = 0; i < flat.length; i++) flat[i] = rnd() < 0.5 ? 34 : 118
+    const rFlat = DIG.extractDigitsSmart(flat, W, H, 5, {})
+    const okFlat = !!rFlat && (!rFlat.glyphs.length || rFlat.degenerate === true)
+    // 2) на настоящих цифрах вырождения быть не должно
+    const g = makeSyntheticDigits(4, 3, '12345', 909)
+    const rGood = DIG.extractDigitsSmart(g.img, g.W, g.H, 5, {})
+    const okGood = !!rGood && rGood.glyphs.length === 5 && rGood.degenerate === false && rGood.sameFrac < 0.6
+    // 3) равномерная нарезка штрафуется (fallback → балл ниже, чем у честной)
+    const mask = new Uint8Array(W * H)
+    for (let y = 100; y < 280; y++) for (let x = 40; x < 470; x++) mask[y * W + x] = 1   // сплошная полоса: ДП не найдёт 5 сегментов по чернилам
+    const segFb = DIG.dpSegment(mask, W, 100, 279, 5)
+    const boxesFb = DIG.tightBoxes(mask, W, segFb.segs, 100, 279)
+    const raw = DIG.scoreBoxes(boxesFb, mask, W, H, 100, 279, 5)
+    const penalized = (segFb.fallback ? raw - 55 : raw)
+    const okPenalty = !segFb.fallback || penalized < raw
+    const ok = okFlat && okGood && okPenalty
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' шум→degenerate=' + (rFlat ? rFlat.degenerate : '?') + ' (жду true) | цифры→' +
+      (rGood ? rGood.glyphs.length + '/5, sameFrac=' + rGood.sameFrac + ', degenerate=' + rGood.degenerate : 'сбой') +
+      ' (жду 5/5, <0.6, false) | fallback=' + (segFb.fallback) + ' балл ' + raw + '→' + penalized)
+    if (!ok) console.log('     ⚠️ okFlat=' + okFlat + ' okGood=' + okGood + ' okPenalty=' + okPenalty)
+  }
+
+  console.log('--- v3.12.0: ОФЛАЙН-ТЮНИНГ (--autotune) на синтетических раундах ---')
+  {
+    // готовим «records»: 6 раундов с настоящими цифрами + ответы человека
+    const root = path.join(REC_ROOT || __dirname, 'selftest_autotune')
+    try { fs.rmSync(root, { recursive: true, force: true }) } catch (e) {}
+    const truth = ['12345', '67890', '24680', '13579', '11223', '98765']
+    const stamp = new Date(Date.now() - 3600e3).toISOString().replace(/[:.]/g, '-').replace('T', 'T')
+    const answers = []
+    for (let i = 0; i < truth.length; i++) {
+      const g = makeSyntheticDigits(4, 3, truth[i], 5150 + i * 137)
+      const dir = path.join(root, 'round' + String(i + 1).padStart(2, '0') + '_a1_' + stamp)
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'ORIGINAL_raw.bin'), Buffer.from(g.img))
+      fs.writeFileSync(path.join(dir, 'layout.json'), JSON.stringify({ W: g.W, H: g.H, cols: 4, rows: 3 }, null, 2))
+      answers.push({ round: i + 1, answer: truth[i], ts: new Date(Date.now() - 3600e3 + i * 60e3).toISOString(), src: 'selftest', dir: path.basename(dir) })
+    }
+    const savedAnswers = answersFile()
+    try { fs.mkdirSync(LEARN_DIR, { recursive: true }) } catch (e) {}
+    fs.writeFileSync(savedAnswers, answers.map(a => JSON.stringify(a)).join('\n') + '\n')
+    let at = null, atErr = null
+    try { at = await runAutotune(root, {}) } catch (e) { atErr = e }
+    const ok = !atErr && at && at.ok && at.images >= 4 && at.acc >= 60
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' autotune: ' + (atErr ? 'ошибка ' + atErr.message :
+      (at ? 'лучшая маска «' + at.best + '» → ' + at.acc + '% на ' + at.images + ' картинках' : 'нет результата')))
+    if (!ok && at) console.log('     ⚠️ ожидали точность ≥60%, топ: ' + (at.rows || []).slice(0, 5).map(r => r.strategy + '=' + r.acc + '%').join(', '))
+    // отчёт на диске
+    const rep = path.join(LEARN_DIR, 'autotune_report.json')
+    const okRep = fs.existsSync(rep)
+    if (!okRep) fails++
+    console.log('  ' + (okRep ? '✅' : '❌') + ' отчёт autotune_report.json записан')
+    try { fs.rmSync(root, { recursive: true, force: true }) } catch (e) {}
+    try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
+  }
+
   LEARN_DIR = learnWas
   if (!CLI.debug) {
     for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest']) {
@@ -4493,8 +5361,8 @@ async function runTelegramSession(ctx, captureFn) {
   let model = DIG.MLP.load(LEARN_DIR)
   const q = new AsyncQueue(TG.prefetch)
   const st = {
-    offset: 0, pending: [], stop: false, rounds: 0, labeled: 0, newLabels: 0, skipped: 0, yoloHits: 0,
-    streak: 0, bestStreak: 0, matches: 0, mismatches: 0, incomplete: 0,
+    offset: 0, pending: [], startedAt: 0, stop: false, rounds: 0, labeled: 0, newLabels: 0, skipped: 0, yoloHits: 0,
+    streak: 0, bestStreak: 0, matches: 0, mismatches: 0, incomplete: 0, degenerate: 0,
     lastModelInfo: null, doneByStreak: false, me: null
   }
 
@@ -4518,19 +5386,35 @@ async function runTelegramSession(ctx, captureFn) {
   tgLog('бот @' + (me.result && me.result.username) + ' (id ' + (me.result && me.result.id) + ') | chat_id=' + TG.chatId +
     ' | транспорт=' + (tgTransport === 'direct' ? 'direct' : (tgTransport && tgTransport.name)))
   tgLog('база цифр: ' + store.size + ' ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет'))
+  if (!model && DIG.MLP._stale) {
+    tgLog('⚠️ найдена model.json от старой версии признаков (fv=' + DIG.MLP._staleFv + ', сейчас fv=' + DIG.FEAT_VERSION +
+      ') — НЕ загружена, иначе давала бы уверенный бред. Обучите заново: /train или node main.js --train')
+  }
   tgLog('YOLO API: ' + (YOLO.enabled ? 'ВКЛ, порядок: ' + YOLO.urls.join(' → ') : 'ВЫКЛ') +
     ' | счётчик «подряд» считает: ' + TG.streakSource)
   tgLog('цифр в капче: ' + DIGITS_EXPECTED + ' | цель: ' + TG.targetStreak + ' совпадений подряд | лимит раундов: ' + TG.maxRounds)
 
-  await tgApi('getUpdates', { offset: -1, timeout: 0 })   // сброс старых апдейтов
+  // Сброс старых апдейтов: Telegram хранит неподтверждённые сообщения, и без этого
+  // новая сессия получала вчерашний /stop и сразу завершалась (реальный баг из лога:
+  // «ответ «/stop» (update_id=785300572)» — тот же id, что в прошлой сессии).
+  st.startedAt = Math.floor(Date.now() / 1000)
+  const flush = await tgApi('getUpdates', { offset: -1, timeout: 0 })
+  if (flush && flush.ok && Array.isArray(flush.result) && flush.result.length) {
+    const lastId = flush.result[flush.result.length - 1].update_id
+    st.offset = lastId + 1
+    tgLog('сброшено старых апдейтов: ' + flush.result.length + ', offset установлен в ' + st.offset)
+  } else {
+    tgLog('старых апдейтов нет')
+  }
 
-  await tgSendText('🟢 Бот запущен (v3.11.0)\n' +
+  await tgSendText('🟢 Бот запущен (v3.12.0)\n' +
     'В капче всегда ' + DIGITS_EXPECTED + ' цифр. Цель обучения: ' + TG.targetStreak + ' совпадений подряд.\n' +
     'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её создадут)') + '\n\n' +
     'Я присылаю картинку и СВОЁ ПРЕДСКАЗАНИЕ. Вы отвечаете правильными цифрами:\n' +
     '• ' + '4'.repeat(DIGITS_EXPECTED) + ' — свои цифры (они и есть истина, идут в обучение)\n' +
     '• «+» — моё предсказание верное\n' +
-    '• /skip — пропустить · /glyphs — что я вырезал · /status · /train · /stop')
+    '• /skip — пропустить · /glyphs — что я вырезал · /diag — диагностика нарезки\n' +
+    '• /status · /train · /yolo · /stop')
 
   // ---------- производитель: снимает раунды вперёд ----------
   const producer = (async () => {
@@ -4567,7 +5451,15 @@ async function runTelegramSession(ctx, captureFn) {
         let botAnswer = '', botSrc = 'нет'
 
         if (!rec) {
-          await tgSendText('⚠️ Раунд ' + round + ': картинка не собралась (стена не найдена или мало плиток). Еду дальше.')
+          // причина провала обязательна в telegram.log: иначе видно только
+          // «подготовлен за 52с (сеть 0.0с + сборка 0.0с)» и непонятно, что случилось
+          const why = (ctx.lastNote || ctx.lastFail || 'нет данных')
+          tgLog('раунд ' + round + ': ❌ картинка не собралась — ' + why +
+            ' (попыток ' + (ctx.lastAttempts || '?') + ', IP ' + (currentRunIp || '?') +
+            (ctx.proxyDead ? ', ПРОКСИ МЁРТВ' : '') + (ctx.aborted ? ', сбор прерван' : '') + ')')
+          await tgSendText('⚠️ Раунд ' + round + ': картинка не собралась.\nПричина: ' + why +
+            '\nПрокси: ' + (PROXY.host || '—') + (ctx.proxyDead ? ' (МЁРТВ — смените IP/прокси)' : '') +
+            '\nПолный лог: records/report_*.txt. Еду дальше.')
           continue
         }
 
@@ -4593,8 +5485,16 @@ async function runTelegramSession(ctx, captureFn) {
         const disagree = yoloOk && complete && yoloDigits !== pred
 
         const segLine = rec.segStrategy
-          ? ('🧩 Маска: ' + rec.segStrategy + ' (балл ' + rec.segScore + ')')
+          ? ('🧩 Маска: ' + rec.segStrategy + ' (балл ' + rec.segScore +
+             (rec.segFallback ? ', нарезка равномерная ⚠️' : '') + ')')
           : '🧩 Сегментация: запасной метод'
+        // если кропы одинаковые — маска режет НЕ цифры; учиться на таком нельзя
+        const degLine = rec.segDegenerate
+          ? ('🧨 КРОПЫ ОДИНАКОВЫЕ (' + Math.round((rec.segSameFrac || 0) * 100) + '% пар) — я режу не цифры.\n' +
+             '   В базу это не пойдёт. Пришлите /diag, затем на ПК:\n' +
+             '   node main.js --import-answers learn\\telegram.log\n' +
+             '   node main.js --autotune --apply\n')
+          : ''
         const cap = '🖼 Раунд ' + round + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows + ' · seam ' + rec.seamCost + '\n' +
           '🌐 YOLO API: ' + (yoloDigits ? yoloDigits + (yoloOk ? '' : ' ⚠️не 5 цифр') + '  (' + rec.yolo.host + ', ' + rec.yolo.ms + 'мс)' : 'нет ответа') + '\n' +
           '🤖 Локально: ' + (pred || '—') + '  (уверенность ' + avgConf + ', база ' + store.size + ')\n' +
@@ -4602,15 +5502,19 @@ async function runTelegramSession(ctx, captureFn) {
           '🔤 Найдено цифр: ' + items.length + ' из ' + DIGITS_EXPECTED +
           (items.length === DIGITS_EXPECTED ? '' : '  ⚠️ НЕ ВСЕ — пришлите /skip') + '\n' +
           segLine + '\n' +
+          degLine +
           '🎯 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + ' (считаем ответ: ' + botSrc + ')\n\n' +
           (items.length === DIGITS_EXPECTED
             ? 'Ответьте «+», если «' + (botAnswer || '?') + '» верно, либо пришлите свои ' + DIGITS_EXPECTED + ' цифр'
             : 'Цифры нашлись не все — ответьте /skip (я запишу проблему в лог) или /glyphs')
         const sent = await tgSendPhoto(png, cap)
         if (!sent.ok) { tgLog('не отправил фото раунда ' + round + ': ' + (sent.description || '')); continue }
-        tgLog('раунд ' + round + ': фото + предсказание "' + pred + '" отправлены (message_id=' +
-          (sent.result && sent.result.message_id) + ') цифр=' + items.length + '/' + DIGITS_EXPECTED +
-          ' уверенность=' + avgConf + ' streak=' + st.streak + ' база=' + store.size)
+        tgLog('раунд ' + round + ': фото отправлено (message_id=' + (sent.result && sent.result.message_id) + ')' +
+          ' цифр=' + items.length + '/' + DIGITS_EXPECTED +
+          ' | YOLO="' + (yoloDigits || 'нет ответа') + '"' +
+          ' | локально="' + pred + '" (уверенность ' + avgConf + ')' +
+          ' | ответ бота=' + (botAnswer || '—') + ' (' + botSrc + ')' +
+          ' | streak=' + st.streak + ' база=' + store.size)
         if (TG.sendGlyphStrip && items.length) {
           const strip = glyphStripPng(items)
           if (strip) await tgSendPhoto(strip, 'Что я вырезал (раунд ' + round + ', слева направо)')
@@ -4626,36 +5530,111 @@ async function runTelegramSession(ctx, captureFn) {
           const botName = ((st.me && st.me.username) || '').toLowerCase()
           tgLog('раунд ' + round + ': ответ «' + text.slice(0, 60) + '» (update_id=' + msg.update_id + ')')
 
-          if (low === '/stop' || low === '/stop@' + botName) {
+          // Команда может прийти С АРГУМЕНТОМ: «/glyphs 82502», «/skip не вижу цифр».
+          // Раньше такое сообщение не находило обработчик и молча проваливалось в
+          // «пришлите ровно 5 цифр» (реальный лог 13:12:22 — «/glyphs 82502» без ответа).
+          const cmdM = low.match(/^\/([a-z]+)(@[a-z0-9_]+)?([\s\S]*)$/)
+          const cmd = cmdM ? '/' + cmdM[1] : ''
+          const cmdOk = !!cmdM && (!cmdM[2] || cmdM[2] === '@' + botName)
+          const cmdArg = cmdM ? String(cmdM[3] || '').trim() : ''
+          // текст, из которого достаём цифры: обычно само сообщение, но для
+          // «/glyphs 82502» — аргумент команды (человек хотел и посмотреть, и ответить)
+          let argText = text
+
+          if (cmdOk && cmd === '/stop') {
             st.stop = true; ctx.aborted = true
             await finishSession(st, store, '⏹ Остановлено по команде')
             break
           }
-          if (low === '/help' || low === '/help@' + botName) {
+          if (cmdOk && cmd === '/help') {
             await tgSendText('Пришлите ' + DIGITS_EXPECTED + ' цифр — это истина, она идёт в обучение.\n' +
               '«+» — моё предсказание верное\n/skip — пропустить картинку\n/glyphs — показать вырезанные глифы\n' +
+              '/diag — диагностика нарезки (какая маска, что в кропах, топ стратегий)\n' +
               '/status — база, точность, счётчик совпадений\n/yolo — проверить YOLO API на этой картинке\n' +
               '/train — обучить MLP сейчас\n/stop — остановить')
             continue
           }
-          if (low === '/status' || low === '/status@' + botName) {
+          if (cmdOk && cmd === '/status') {
             await tgSendText('📊 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + ' (рекорд ' + st.bestStreak + ')\n' +
               'YOLO API: ' + (YOLO.enabled ? ((yoloAlive || 'не отвечал') + ' | угадал ' + (st.yoloHits || 0) + ' раз') : 'выключен') + '\n' +
               'Совпало: ' + st.matches + ' | не совпало: ' + st.mismatches + ' | неполных картинок: ' + st.incomplete + '\n' +
-              'Раундов: ' + st.rounds + ' | размечено глифов: ' + st.labeled + ' | пропущено: ' + st.skipped + '\n' +
+              'Раундов: ' + st.rounds + ' | размечено глифов: ' + st.labeled + ' | пропущено: ' + st.skipped +
+                (st.degenerate ? ' | 🧨 выродившаяся нарезка: ' + st.degenerate : '') + '\n' +
               'База: ' + store.size + ' ' + JSON.stringify(store.counts()) + '\n' +
               'MLP: ' + (model ? 'есть' : 'нет') + (st.lastModelInfo ? ' — ' + st.lastModelInfo : '') + '\n' +
               'Очередь ручной разметки: ' + (new DIG.LabelQueue(LEARN_DIR)).size)
             continue
           }
-          if (low === '/glyphs' || low === '/glyphs@' + botName) {
+          if (cmdOk && cmd === '/glyphs') {
             const strip = glyphStripPng(items)
             if (strip) await tgSendPhoto(strip, 'Глифы раунда ' + round + ' (слева направо). Предсказание: ' +
               items.map((it, i) => (i + 1) + ') ' + (it.guess === null || it.guess === undefined ? '?' : it.guess) + '·' + it.conf).join('  '))
             else await tgSendText('Глифов нет — вырезать нечего. Похоже, нужно поправить пороги (digits.minGlyphH / maxGlyphH)')
+            // ASCII-превью кропов текстом: его можно скопировать и показать человеку,
+            // даже если картинка в чате выглядит непонятно
+            try {
+              const norms = items.map(it => ({ norm: it.feat ? it.feat.subarray(0, DIG.GW * DIG.GH) : null })).filter(x => x.norm)
+              if (norms.length) await tgSendText('Что я вижу (ASCII, раунд ' + round + '):\n```\n' + asciiRow(norms) + '\n```')
+            } catch (e) {}
+            tgLog('/glyphs раунд ' + round + ': отправлено ' + items.length + ' кропов' + (cmdArg ? ' + аргумент «' + cmdArg.slice(0, 20) + '»' : ''))
+            // «/glyphs 82502» — человек сразу дал и ответ: идём размечать, не continue
+            const argDigits = cmdArg.replace(/[^0-9]/g, '')
+            if (argDigits.length === DIGITS_EXPECTED) { argText = argDigits; tgLog('раунд ' + round + ': цифры из аргумента /glyphs → «' + argDigits + '»') }
+            else continue
+          }
+          if (cmdOk && cmd === '/diag') {
+            // полная диагностика сегментации: файлы + топ стратегий + ASCII кропы
+            await tgSendText('🔎 Готовлю диагностику раунда ' + round + '…')
+            const lines = []
+            lines.push('🧩 ДИАГНОСТИКА раунда ' + round)
+            lines.push('стратегия: ' + (rec.segStrategy || 'запасной метод') + ' | балл: ' + rec.segScore +
+              ' | путь: ' + (rec.segPath || '?'))
+            lines.push('одинаковых кропов: ' + Math.round((rec.segSameFrac || 0) * 100) + '% пар' +
+              (rec.segDegenerate ? '  🧨 ВЫРОЖДЕНИЕ — маска режет не цифры' : ''))
+            lines.push('равномерная нарезка (рамки «на глазок»): ' + (rec.segFallback ? 'ДА ⚠️' : 'нет'))
+            lines.push('плотность штриха (медиана): ' + rec.segMedStroke + ' | чернил на картинке: ' + rec.inkDensity)
+            lines.push('каталог: ' + (rec.dir || '?'))
+            lines.push('')
+            lines.push('Топ стратегий на этой картинке (балл / черн.% / одинак.кропы):')
+            try {
+              const img = loadRawImage(rec.dir)
+              if (img) {
+                const all = DIG.autoSegment(img.data, img.W, img.H, DIGITS_EXPECTED, {}) || []
+                for (const r2 of all.slice(0, 8)) {
+                  const cr = cropsFromSegResult(r2, img.W, img.H, DIGITS_EXPECTED)
+                  let sf = '—'
+                  if (cr) {
+                    let sp = 0, tp = 0
+                    for (let i = 0; i < cr.length; i++) for (let j = i + 1; j < cr.length; j++) {
+                      tp++
+                      let d = 0
+                      for (let t = 0; t < DIG.GW * DIG.GH; t++) { const x = cr[i].norm[t] - cr[j].norm[t]; d += x * x }
+                      if (Math.sqrt(d) < 1.2) sp++
+                    }
+                    sf = Math.round(100 * sp / Math.max(1, tp)) + '%'
+                  }
+                  lines.push('  ' + String(r2.score).padStart(6) + '  ' + String(Math.round(r2.inkFrac * 1000) / 10).padStart(5) +
+                    '  ' + String(sf).padStart(5) + '   ' + r2.name + (r2.fallback ? ' [равномерная]' : ''))
+                }
+                // ASCII лучшей стратегии — видно, цифра в кропе или шум
+                const bestRes = all[0]
+                const cr = bestRes ? cropsFromSegResult(bestRes, img.W, img.H, DIGITS_EXPECTED) : null
+                if (cr) { lines.push(''); lines.push('Кропы лучшей стратегии «' + bestRes.name + '»:'); lines.push(asciiRow(cr)) }
+                for (const r2 of all.slice(0, 2)) {
+                  try {
+                    const p2 = debugSegmentationPng({ data: img.data, W: img.W, H: img.H }, r2.boxes, r2.band)
+                    if (p2) { fs.writeFileSync(path.join(rec.dir, 'DIAG_tg_' + r2.name.replace(/[^a-z0-9_.+-]/gi, '_') + '.png'), p2); await tgSendPhoto(p2, 'Рамки стратегии «' + r2.name + '» (раунд ' + round + ')') }
+                  } catch (e) {}
+                }
+              } else lines.push('  (не удалось прочитать ORIGINAL_raw.bin из ' + rec.dir + ')')
+            } catch (e) { lines.push('  ошибка: ' + e.message) }
+            const txt = lines.join('\n')
+            await tgSendText(txt.length > 3800 ? txt.slice(0, 3800) + '\n…(обрезано)' : txt)
+            tgLog('/diag раунд ' + round + ': стратегия=' + (rec.segStrategy || '?') + ' одинаковых=' +
+              Math.round((rec.segSameFrac || 0) * 100) + '% degenerate=' + !!rec.segDegenerate)
             continue
           }
-          if (low === '/yolo' || low === '/yolo@' + botName) {
+          if (cmdOk && cmd === '/yolo') {
             if (!YOLO.enabled) { await tgSendText('🌐 YOLO API выключен (yolo.enabled=false) — работаем локальной моделью'); continue }
             await tgSendText('🌐 Проверяю YOLO API на картинке раунда ' + round + '…')
             yoloReset()
@@ -4670,7 +5649,7 @@ async function runTelegramSession(ctx, captureFn) {
             tgLog('/yolo: ' + (rr ? 'ответ «' + rr.digits + '» от ' + rr.host : 'нет ответа'))
             continue
           }
-          if (low === '/train' || low === '/train@' + botName) {
+          if (cmdOk && cmd === '/train') {
             const r = trainModel(store)
             if (!r.ok) { await tgSendText('⚠️ ' + r.reason + '. Нужно ≥20 примеров.'); continue }
             model = r.mlp
@@ -4679,15 +5658,20 @@ async function runTelegramSession(ctx, captureFn) {
             tgLog('/train: ' + st.lastModelInfo)
             continue
           }
-          if (items.length !== DIGITS_EXPECTED && !/^\//.test(low) && text.replace(/[^0-9]/g, '').length !== DIGITS_EXPECTED) {
+          if (items.length !== DIGITS_EXPECTED && !/^\//.test(low) && argText.replace(/[^0-9]/g, '').length !== DIGITS_EXPECTED) {
             await tgSendText('⚠️ На этой картинке я нашёл ' + items.length + ' цифр из ' + DIGITS_EXPECTED +
               ' — размечать нечего. Пришлите /skip, чтобы перейти к следующей.\n' +
               'Для диагностики: файл debug_segmentation.png в папке раунда (на нём рамки, которые я нашёл).')
             tgLog('раунд ' + round + ': найдено ' + items.length + ' цифр из ' + DIGITS_EXPECTED + ' — жду /skip')
             continue
           }
-          if (low === '/skip' || low === '/skip@' + botName) {
+          if (cmdOk && cmd === '/skip') {
             st.skipped++
+            if (cmdArg) {
+              appendAnswer({ round, answer: null, ts: new Date().toISOString(), src: 'skip', dir: rec.dir ? path.basename(rec.dir) : null,
+                note: cmdArg.slice(0, 200), digits: items.length, seg: { strategy: rec.segStrategy || null, degenerate: !!rec.segDegenerate } })
+              tgLog('раунд ' + round + ': /skip с пояснением «' + cmdArg.slice(0, 60) + '» (записано в answers.jsonl)')
+            }
             await tgSendText('⏭ Раунд ' + round + ' пропущен. Счётчик совпадений сброшен (' + st.streak + ' → 0)')
             st.streak = 0
             answered = true
@@ -4696,7 +5680,7 @@ async function runTelegramSession(ctx, captureFn) {
 
           // ---------- цифры ----------
           let digits = ''
-          if (text === '+' || low === 'да' || low === 'ok' || low === 'верно' || low === 'y') {
+          if (argText === '+' || low === 'да' || low === 'ok' || low === 'верно' || low === 'y') {
             if (!botAnswer) {
               await tgSendText('⚠️ Подтверждать нечего: ни YOLO, ни локальная модель не дали ' + DIGITS_EXPECTED +
                 ' цифр (локально «' + (pred || 'нет') + '», найдено ' + items.length + ' из ' + DIGITS_EXPECTED +
@@ -4705,7 +5689,7 @@ async function runTelegramSession(ctx, captureFn) {
             }
             digits = botAnswer
           } else {
-            digits = text.replace(/[^0-9]/g, '')
+            digits = argText.replace(/[^0-9]/g, '')
           }
           if (!digits) { await tgSendText('Не понял. Пришлите ровно ' + DIGITS_EXPECTED + ' цифр (например 48152), «+», /skip или /help'); continue }
           if (digits.length !== DIGITS_EXPECTED) {
@@ -4720,9 +5704,27 @@ async function runTelegramSession(ctx, captureFn) {
           if (yoloOk && yoloDigits === digits) st.yoloHits = (st.yoloHits || 0) + 1
           st.bestStreak = Math.max(st.bestStreak, st.streak)
 
-          // ответ человека = истина → в базу (даже если бот угадал)
+          // ответ человека = истина → в базу (даже если бот угадал).
+          // НО: если кропы выродились (все 5 почти одинаковые — «88888»), в базу
+          // такое класть НЕЛЬЗЯ: признаки описывают шум, модель запоминает шум
+          // (реальный лог: train 84% / holdout 10%, 270 примеров впустую).
           const recFresh = Object.assign({}, rec, { digitItems: items })
-          const res = labelRoundWithDigits(store, recFresh, round, digits)
+          const degenerate = !!rec.segDegenerate
+          const res = degenerate
+            ? { ok: false, reason: 'кропы одинаковые (' + Math.round((rec.segSameFrac || 0) * 100) + '% пар) — маска не по цифрам', degenerate: true }
+            : labelRoundWithDigits(store, recFresh, round, digits)
+          if (degenerate) tgLog('раунд ' + round + ': ⚠️ ОТКАЗ от разметки — сегментация выродилась (стратегия ' +
+            (rec.segStrategy || '?') + ', балл ' + rec.segScore + ', одинаковых пар ' + Math.round((rec.segSameFrac || 0) * 100) +
+            '%). Ответ «' + digits + '» сохранён в answers.jsonl для --autotune.')
+          // ЗОЛОТАЯ РАЗМЕТКА: ответ человека сохраняем ВСЕГДА (даже если вырезать
+          // глифы не удалось) — по нему офлайн подбирается маска: --autotune
+          appendAnswer({
+            round, answer: digits, ts: new Date().toISOString(), src: 'tg',
+            dir: rec.dir ? path.basename(rec.dir) : null, capFile: rec.capFile || null,
+            labeled: res.ok ? res.n : 0, reason: res.ok ? null : res.reason,
+            bot: botAnswer || null, botSrc, yolo: yoloDigits || null, local: pred || null,
+            seg: { strategy: rec.segStrategy || null, score: rec.segScore || null, path: rec.segPath || null }
+          })
           let rep
           if (res.ok) {
             st.labeled += res.n
@@ -4740,8 +5742,16 @@ async function runTelegramSession(ctx, captureFn) {
               '" streak=' + st.streak + '/' + TG.targetStreak + ' размечено=' + res.n + ' база=' + store.size)
           } else {
             st.streak = 0
-            rep = '⚠️ Разметить не удалось: ' + res.reason + ' (вырезано ' + items.length + ' из ' + DIGITS_EXPECTED +
-              '). Пришлите /glyphs — посмотрим, что я режу не так. Счётчик сброшен.'
+            st.degenerate = (st.degenerate || 0) + (res.degenerate ? 1 : 0)
+            rep = '⚠️ Разметить не удалось: ' + res.reason + ' (вырезано ' + items.length + ' из ' + DIGITS_EXPECTED + ').\n' +
+              (res.degenerate
+                ? '🧨 Маска режет НЕ цифры: все ' + DIGITS_EXPECTED + ' кропов почти одинаковые. Дальше учиться бессмысленно — база будет мусорной.\n' +
+                  'Что сделать: пришлите /diag (я покажу, что именно вырезал), затем на ПК:\n' +
+                  '  node main.js --import-answers learn\\telegram.log\n' +
+                  '  node main.js --autotune --apply\n' +
+                  'Автоподбор переберёт ~50 масок на уже сохранённых картинках и выберет ту, где цифры действительно узнаются.'
+                : 'Пришлите /glyphs — посмотрим, что я режу не так.') +
+              '\nСчётчик сброшен.'
             tgLog('раунд ' + round + ': разметка не удалась (' + res.reason + '), вырезано ' + items.length + ' из ' + DIGITS_EXPECTED)
           }
 
@@ -4835,6 +5845,12 @@ async function tgWaitMessage(st) {
       if (!msg) continue
       if (String(msg.chat && msg.chat.id) !== String(TG.chatId)) {
         tgLog('игнорирую сообщение из чата ' + (msg.chat && msg.chat.id) + ' (нужен ' + TG.chatId + ')')
+        continue
+      }
+      // вторая линия защиты от «призраков»: сообщение старше старта сессии не обрабатываем
+      if (st.startedAt && msg.date && msg.date < st.startedAt - 30) {
+        tgLog('игнорирую старое сообщение (date=' + msg.date + ', сессия началась ' + st.startedAt + '): «' +
+          String(msg.text || '').slice(0, 40) + '»')
         continue
       }
       msg.update_id = u.update_id
@@ -5126,6 +6142,10 @@ async function captureRound(r, ctx) {
     ctx.results.push({ n: r, ok: false, note: lastNote || 'fail' })
     step('РАУНД ' + r + ' ❌ провален (' + (lastNote || 'fail') + ')')
   }
+  // причина провала — для telegram.log (иначе в чате «картинка не собралась» без деталей)
+  ctx.lastNote = rec ? '' : (lastNote || 'не удалось собрать стену/плитки')
+  ctx.lastAttempts = ATTEMPTS_PER_ROUND
+  ctx.lastFail = rec ? '' : (lastNote || 'fail')
   if (!ctx.aborted) await sleep(FAST_MODE ? FAST.pauseBetween : PAUSE_BETWEEN_MS)
   return rec
 }
@@ -5137,7 +6157,7 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.11.0 ===')
+  step('=== СТАРТ v3.12.0 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
@@ -5155,6 +6175,20 @@ async function main() {
   }
   if (CLI.label) { runLabelTool(); return }
   if (CLI.train) { runTrain(); return }
+
+  // офлайн-разбор уже сохранённых картинок (без подключения к серверу)
+  if (CLI.importAnswers) {
+    const r = importAnswersFromFile(CLI.importAnswers)
+    step('всего ответов в learn/answers.jsonl: ' + r.total)
+    setTimeout(() => process.exit(r.ok ? 0 : 1), 200)
+    return
+  }
+  if (CLI.diag) { runDiag(CLI.diagDir || ''); setTimeout(() => process.exit(0), 200); return }
+  if (CLI.autotune) {
+    const r = await runAutotune(CLI.autotuneDir, { apply: CLI.apply })
+    setTimeout(() => process.exit(r && r.ok ? 0 : 1), 200)
+    return
+  }
 
   if (CLI.replayAll) {
     const n = await replayAll(CLI.replayAll)
@@ -5184,6 +6218,8 @@ async function main() {
       ' | MLP: ' + (mdl ? 'есть' : 'нет (node main.js --train)') +
       ' | в очереди на разметку: ' + (q ? q.size : 0))
     if (st && !st.size) step('  ⚠️ база пуста — цифры не распознаются. Соберите раунды, затем: node main.js --label')
+    if (!mdl && DIG && DIG.MLP._stale) step('  ⚠️ model.json от старых признаков (fv=' + DIG.MLP._staleFv + ' ≠ ' + DIG.FEAT_VERSION + ') — проигнорирована, нужно --train заново')
+    if (st && st.skippedVersion) step('  ⚠️ пропущено ' + st.skippedVersion + ' примеров старой версии признаков (несовместимы)')
   } catch (e) { step('  база цифр: ' + e.message) }
   step('capture: minTiles=' + CAP.minTiles + ' stableMs=' + CAP.stableMs + ' timeout=' + (CAP.timeoutMs / 1000) + 'с needPrompt=' + CAP.needPrompt)
 
@@ -5215,7 +6251,7 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.11.0) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.12.0) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
@@ -5238,7 +6274,7 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.11.0', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.11.1', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
@@ -5277,5 +6313,9 @@ module.exports = {
   YOLO, yoloRecognize, parseYoloAnswer, multipart, yoloReset,
   DIGITS_EXPECTED, finishSession, refreshPrediction,
   TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, runTgTest, parseSocksUrl, tgTransports, AsyncQueue, glyphStripPng,
-  labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary
+  labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary,
+  // v3.12.0: офлайн-тюнинг сегментации и «золотая» разметка ответов
+  answersFile, appendAnswer, loadAnswers, parseAnswersFromLog, importAnswersFromFile,
+  listRoundDirs, loadRawImage, matchAnswersToDirs, cropsFromSegResult, looImageAccuracy,
+  contactSheetPng, asciiRow, runAutotune, runDiag, stampOfDir
 }
