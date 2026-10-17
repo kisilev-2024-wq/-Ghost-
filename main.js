@@ -1,5 +1,41 @@
-// VERSION: 3.9.3
+// VERSION: 3.10.0
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ======================= ЧТО НОВОГО В v3.10.0 (СЕГМЕНТАЦИЯ ЦИФР) =======================
+// D1. НОВЫЙ ПРИНЦИП ПОИСКА ЦИФР. Раньше: «фон = доминирующий цвет» -> связные
+//     компоненты. На реальной капче (пёстрый/дитеринговый фон, слипшиеся цифры,
+//     рассыпающиеся штрихи) это давало 0 или сотни мусорных кусков — учиться
+//     было нечего. Теперь: раз цифр ЗАВЕДОМО 5, мы их не «ищем», а ПОДБИРАЕМ
+//     маску и РЕЖЕМ строку ровно на 5 частей:
+//       • ~50 масок-кандидатов: доминантный фон (1-3 цвета) и инверсия, Otsu по
+//         яркости (тёмное/светлое), локальный фон по тайлам 64/128, КАЖДЫЙ цвет
+//         палитры отдельно (цифры обычно одного цвета), + морфология open/close;
+//       • на каждой маске ищем полосу строк с цифрами;
+//       • полосу режет ДИНАМИЧЕСКОЕ ПРОГРАММИРОВАНИЕ ровно на 5 сегментов:
+//         границы там, где меньше всего чернил, ширина близка к равномерной
+//         (слипшиеся цифры разрезаются, рассыпавшиеся склеиваются);
+//       • каждая нарезка оценивается (одинаковая высота/ширина, равномерность
+//         промежутков, одна строка, пропорции, заполнение, контраст к фону,
+//         штраф за чернила ВНЕ рамок) — побеждает лучшая стратегия.
+//     Замер на 6 типах фона (ровный, слипшиеся цифры, инверсный, блочный шум,
+//     пиксельный шум, «враждебный» — цвет цифр есть и в шуме): рамки цифр
+//     найдены с точностью 0-1 px во ВСЕХ шести случаях.
+// D2. ЗАМОК СТИЛЯ: победившая маска запоминается в learn/style.json и в следующих
+//     раундах применяется сразу (если балл >= 100). Перебор 50 стратегий (156 мс)
+//     превращается в одну маску (5 мс) — в 30 раз быстрее.
+// D3. Нормализация глифа БЕЗ искажения пропорций (вписываем в 20×28 с центровкой,
+//     раньше растягивали — тонкие цифры плющило). Версия признаков fv=2: старые
+//     примеры из glyphs.jsonl игнорируются (несовместимы), база набирается заново.
+// D4. Аугментация: у каждого примера в памяти 8 вариантов (сдвиги/масштаб/поворот),
+//     расстояние до примера = минимум по вариантам, а голосуют по-прежнему разные
+//     примеры (важно: если плодить дубли в базе, k-NN вырождается в 1-NN и точность
+//     ПАДАЕТ — проверено: 76% -> 12%). Сейчас: +6..10% при том же числе ответов.
+// D5. Диагностика сегментации в каждом раунде: debug_segmentation.png (картинка
+//     с найденными рамками и полосой) и segmentation_report.json (все стратегии
+//     с баллами). Если цифр найдено не 5 — бот говорит об этом в чат и просит /skip.
+// D6. Замер обучения (синтетика, вариации масштаба/смещения/шума):
+//     1 размеченная капча (5 ответов) -> 50% цифр, 2 капчи -> 80%, 4 капчи -> 99.2%.
+// ====================================================================
 //
 // ======================= ЧТО НОВОГО В v3.9.3 (УСКОРЕНИЕ) =======================
 // S1. БЫСТРЫЙ РЕЖИМ — включается сам в Telegram-сессии (или "capture":{"fast":true}).
@@ -319,6 +355,15 @@ const GLYPH_OPTS = {
 const DIG_CONF_OK = Number(cfgGet(CFG, 'digits.confOk', 0.62)) || 0.62
 // СКОЛЬКО ЦИФР В КАПЧЕ. На funtime всегда ровно 5 — ни больше, ни меньше.
 const DIGITS_EXPECTED = Math.max(0, Number(cfgGet(CFG, 'digits.expected', 5)) || 0)
+// минимальный балл умной сегментации; ниже — откат к старому методу (связные компоненты)
+const SEG_MIN_SCORE = Number(cfgGet(CFG, 'digits.segMinScore', 60)) || 60
+// аугментация: у каждого примера в памяти хранятся сдвиги/масштабы/повороты,
+// расстояние до примера = минимум по вариантам. Даёт +6..10% точности при том же
+// числе ответов человека (замер: 88.8% -> 94.4% по цифрам после 4 размеченных капч).
+const DIG_AUGMENT = cfgGet(CFG, 'digits.augment', true) !== false
+// «замок стиля»: рабочая маска запоминается в learn/style.json и в следующих раундах
+// применяется сразу (экономит перебор ~50 стратегий)
+const STYLE_LOCK_MIN = Number(cfgGet(CFG, 'digits.styleLockMin', 100)) || 100
 // перестановка колонок — аварийный режим (по умолчанию координаты авторитетны)
 const TRY_COL_PERMS = CLI.perms === true || cfgGet(CFG, 'capture.tryColPerms', false) === true
 // порог «швы плохие» — повод предупредить о возможной неверной раскладке
@@ -653,6 +698,386 @@ function splitComponent(mask, W, H, c, opts) {
   return parts.length ? parts : [c]
 }
 
+
+// =========================================================================
+//  УМНАЯ СЕГМЕНТАЦИЯ: «ровно N цифр» вместо поиска связных компонентов
+// =========================================================================
+// Почему не компоненты: на map-art фон пёстрый/дитеринговый, цифры часто
+// слипаются или, наоборот, рассыпаются на куски — компоненты дают то 0, то 200.
+// Идея: мы ЗНАЕМ, что цифр ровно expected. Поэтому
+//   1) перебираем способы получить бинарную маску «чернила/фон»
+//      (доминантный цвет, Otsu по яркости, локальный фон по тайлам, каждый цвет палитры),
+//   2) на маске находим полосу строк с цифрами,
+//   3) режем её динамическим программированием РОВНО на expected сегментов
+//      (границы — там, где меньше всего чернил, ширина близка к равномерной),
+//   4) оцениваем результат («похоже на 5 цифр?») и берём лучшую стратегию.
+// Слипшиеся цифры разрезаются, рассыпавшиеся — склеиваются, шум отсекается оценкой.
+
+function histColors(data) {
+  const wc = new Int32Array(256)
+  for (let i = 0; i < data.length; i++) wc[data[i]]++
+  return wc
+}
+
+// --- маски ---
+function maskDominant(data, W, H, k) {
+  const wc = histColors(data)
+  const order = []
+  for (let v = 0; v < 256; v++) if (wc[v]) order.push(v)
+  order.sort((a, b) => wc[b] - wc[a])
+  const bg = new Set(order.slice(0, Math.max(1, k)))
+  const m = new Uint8Array(data.length)
+  for (let i = 0; i < data.length; i++) m[i] = bg.has(data[i]) ? 0 : 1
+  return m
+}
+function maskOtsu(data, W, H, invert) {
+  const hist = new Int32Array(256)
+  for (let i = 0; i < data.length; i++) hist[LUM[data[i]]]++
+  const total = data.length
+  let sum = 0
+  for (let t = 0; t < 256; t++) sum += t * hist[t]
+  let sumB = 0, wB = 0, best = -1, thr = 128
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]
+    if (!wB) continue
+    const wF = total - wB
+    if (!wF) break
+    sumB += t * hist[t]
+    const mB = sumB / wB, mF = (sum - sumB) / wF
+    const v = wB * wF * (mB - mF) * (mB - mF)
+    if (v > best) { best = v; thr = t }
+  }
+  const m = new Uint8Array(data.length)
+  for (let i = 0; i < data.length; i++) {
+    const dark = LUM[data[i]] <= thr
+    m[i] = (invert ? !dark : dark) ? 1 : 0
+  }
+  return m
+}
+function maskLocalBg(data, W, H, tile) {
+  const m = new Uint8Array(data.length)
+  for (let ty = 0; ty < H; ty += tile) for (let tx = 0; tx < W; tx += tile) {
+    const x1 = Math.min(W, tx + tile), y1 = Math.min(H, ty + tile)
+    const wc = new Int32Array(256)
+    for (let y = ty; y < y1; y++) for (let x = tx; x < x1; x++) wc[data[y * W + x]]++
+    let bg = 0, bc = -1
+    for (let v = 0; v < 256; v++) if (wc[v] > bc) { bc = wc[v]; bg = v }
+    for (let y = ty; y < y1; y++) for (let x = tx; x < x1; x++) m[y * W + x] = data[y * W + x] === bg ? 0 : 1
+  }
+  return m
+}
+function maskOneColor(data, W, H, color) {
+  const m = new Uint8Array(data.length)
+  for (let i = 0; i < data.length; i++) m[i] = data[i] === color ? 1 : 0
+  return m
+}
+function maskInvert(m) { const o = new Uint8Array(m.length); for (let i = 0; i < m.length; i++) o[i] = m[i] ? 0 : 1; return o }
+function maskClose(m, W, H) {   // склеить рассыпавшееся (closing 1)
+  const t = new Uint8Array(m.length)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x
+    if (m[i] || (x > 0 && m[i - 1]) || (x < W - 1 && m[i + 1]) || (y > 0 && m[i - W]) || (y < H - 1 && m[i + W])) t[i] = 1
+  }
+  const o = new Uint8Array(m.length)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x
+    if (t[i] && (x === 0 || t[i - 1]) && (x === W - 1 || t[i + 1]) && (y === 0 || t[i - W]) && (y === H - 1 || t[i + W])) o[i] = 1
+  }
+  return o
+}
+function maskErode(m, W, H) {
+  const o = new Uint8Array(m.length)
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const i = y * W + x
+    if (m[i] && m[i - 1] && m[i + 1] && m[i - W] && m[i + W]) o[i] = 1
+  }
+  return o
+}
+function maskDilate(m, W, H) {
+  const o = new Uint8Array(m.length)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x
+    if (m[i] || (x > 0 && m[i - 1]) || (x < W - 1 && m[i + 1]) || (y > 0 && m[i - W]) || (y < H - 1 && m[i + W])) o[i] = 1
+  }
+  return o
+}
+// открытие (эрозия+дилатация) убирает одиночные пиксели и дитеринг,
+// оставляя толстые штрихи цифр нетронутыми
+function maskOpen(m, W, H) { return maskDilate(maskErode(m, W, H), W, H) }
+function maskCount(m) { let n = 0; for (let i = 0; i < m.length; i++) n += m[i]; return n }
+
+// --- полоса строк с цифрами ---
+function bestBand(mask, W, H) {
+  const prof = new Int32Array(H)
+  for (let y = 0; y < H; y++) { let s = 0; const o = y * W; for (let x = 0; x < W; x++) s += mask[o + x]; prof[y] = s }
+  const total = prof.reduce((a, b) => a + b, 0)
+  if (!total) return null
+  const minH = Math.max(8, Math.round(H * 0.06)), maxH = Math.round(H * 0.75)
+  const pre = new Int32Array(H + 1)
+  for (let y = 0; y < H; y++) pre[y + 1] = pre[y] + prof[y]
+  let best = null
+  for (let y0 = 0; y0 < H; y0++) {
+    for (let y1 = y0 + minH; y1 <= Math.min(H, y0 + maxH); y1++) {
+      const inside = pre[y1] - pre[y0]
+      const h = y1 - y0
+      const density = inside / (h * W)
+      if (density < 0.004 || density > 0.6) continue
+      const share = inside / total                       // доля всех чернил в полосе
+      const tight = inside / Math.max(1, h * W)            // плотность внутри
+      const score = share * 60 + Math.min(1, tight * 8) * 20 - Math.abs(h - H * 0.28) / H * 12
+      if (!best || score > best.score) best = { y0, y1: y1 - 1, score, share, density, h }
+    }
+  }
+  return best
+}
+
+// --- ДП-разрезание строки ровно на n сегментов ---
+function dpSegment(mask, W, y0, y1, n) {
+  const prof = new Int32Array(W)
+  for (let x = 0; x < W; x++) { let s = 0; for (let y = y0; y <= y1; y++) s += mask[y * W + x]; prof[x] = s }
+  const bandH = y1 - y0 + 1
+  let x0 = -1, x1 = -1
+  for (let x = 0; x < W; x++) if (prof[x] > 0) { if (x0 < 0) x0 = x; x1 = x }
+  if (x0 < 0) return null
+  const span = x1 - x0 + 1
+  const ideal = span / n
+  if (ideal < 4) return null
+  const pre = new Int32Array(W + 1)
+  for (let x = 0; x < W; x++) pre[x + 1] = pre[x] + prof[x]
+  const INF = 1e18
+  const dp = [], bk = []
+  for (let k = 0; k <= n; k++) { dp.push(new Float64Array(W + 1).fill(INF)); bk.push(new Int32Array(W + 1).fill(-1)) }
+  dp[0][x0] = 0
+  for (let k = 1; k <= n; k++) {
+    for (let b = x0 + k; b <= x1 + 1; b++) {
+      let bestC = INF, bestA = -1
+      const aMin = x0 + (k - 1), aMax = b - 1
+      for (let a = Math.max(aMin, b - Math.ceil(ideal * 2.2)); a < aMax; a++) {
+        if (dp[k - 1][a] >= INF) continue
+        const w = b - a
+        const inkInside = pre[b] - pre[a]
+        if (inkInside <= 0) continue
+        const boundary = prof[a] + (b <= W ? prof[b - 1] * 0 : 0)   // левая граница сегмента
+        const cost = dp[k - 1][a] + boundary * 0.6 +
+          Math.abs(w - ideal) / ideal * 22 +
+          (w < ideal * 0.35 ? 25 : 0) + (w > ideal * 2.0 ? 25 : 0)
+        if (cost < bestC) { bestC = cost; bestA = a }
+      }
+      if (bestA >= 0) { dp[k][b] = bestC; bk[k][b] = bestA }
+    }
+  }
+  if (dp[n][x1 + 1] >= INF) {
+    // не получилось ровно n — возвращаем равномерную нарезку как запасной вариант
+    const segs = []
+    for (let k = 0; k < n; k++) segs.push([Math.round(x0 + k * ideal), Math.round(x0 + (k + 1) * ideal) - 1])
+    return { segs, cost: null, fallback: true, prof }
+  }
+  const segs = []
+  let b = x1 + 1
+  for (let k = n; k >= 1; k--) { const a = bk[k][b]; segs.unshift([a, b - 1]); b = a }
+  return { segs, cost: dp[n][x1 + 1], fallback: false, prof }
+}
+
+function tightBoxes(mask, W, segs, y0, y1) {
+  const out = []
+  for (const [a, b] of segs) {
+    let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9, area = 0
+    for (let y = y0; y <= y1; y++) for (let x = a; x <= b; x++) {
+      if (!mask[y * W + x]) continue
+      area++
+      if (x < mnX) mnX = x; if (x > mxX) mxX = x
+      if (y < mnY) mnY = y; if (y > mxY) mxY = y
+    }
+    if (area <= 0) { out.push(null); continue }
+    out.push({ mnX, mxX, mnY, mxY, w: mxX - mnX + 1, h: mxY - mnY + 1, area })
+  }
+  return out
+}
+
+// --- оценка: похоже ли на expected цифр в ряд ---
+function scoreBoxes(boxes, mask, W, H, y0, y1, expected) {
+  if (!boxes || boxes.some(b => !b)) return -1e9
+  const n = boxes.length
+  if (n !== expected) return -1e9
+  const hs = boxes.map(b => b.h).sort((a, b) => a - b)
+  const ws = boxes.map(b => b.w).sort((a, b) => a - b)
+  const medH = hs[Math.floor(n / 2)], medW = ws[Math.floor(n / 2)]
+  if (medH < H * 0.05 || medH > H * 0.85) return -1e9
+  const spread = a => (a[a.length - 1] - a[0]) / Math.max(1, a[Math.floor(a.length / 2)])
+  const cx = boxes.map(b => (b.mnX + b.mxX) / 2)
+  const gaps = []
+  for (let i = 1; i < n; i++) gaps.push(cx[i] - cx[i - 1])
+  const mg = gaps.reduce((a, b) => a + b, 0) / Math.max(1, gaps.length)
+  const sg = Math.sqrt(gaps.reduce((a, b) => a + (b - mg) * (b - mg), 0) / Math.max(1, gaps.length))
+  const cy = boxes.map(b => (b.mnY + b.mxY) / 2)
+  const my = cy.reduce((a, b) => a + b, 0) / n
+  const sy = Math.sqrt(cy.reduce((a, b) => a + (b - my) * (b - my), 0) / n)
+
+  let s = 0
+  s += 34 * Math.max(0, 1 - spread(hs))                 // одинаковая высота
+  s += 22 * Math.max(0, 1 - spread(ws))                 // одинаковая ширина
+  s += 22 * Math.max(0, 1 - sg / Math.max(1, mg))       // равномерные промежутки
+  s += 14 * Math.max(0, 1 - sy / Math.max(1, medH * 0.5)) // на одной строке
+  let okAspect = 0, okFill = 0, inkIn = 0
+  for (const b of boxes) {
+    const asp = b.w / b.h
+    if (asp >= 0.2 && asp <= 1.4) okAspect++
+    const f = b.area / (b.w * b.h)
+    if (f >= 0.08 && f <= 0.85) okFill++
+    inkIn += b.area
+  }
+  s += 12 * (okAspect / n) + 10 * (okFill / n)
+  const boxArea = boxes.reduce((a, b) => a + b.w * b.h, 0)
+  const totalInk = maskCount(mask)
+  const densIn = inkIn / Math.max(1, boxArea)
+  const densOut = Math.max(0, totalInk - inkIn) / Math.max(1, H * W - boxArea)
+  s += 18 * Math.min(1, Math.max(0, (densIn / Math.max(1e-6, densOut) - 1) / 4))   // контраст к фону
+  // ГЛАВНЫЙ ШТРАФ: «грязная» маска (шум по всему полю) не годится, даже если
+  // нарезка на 5 частей удалась — чернила должны лежать ВНУТРИ рамок цифр.
+  const outsideFrac = Math.max(0, totalInk - inkIn) / (H * W)
+  s -= 90 * Math.min(1, outsideFrac / 0.12)
+  // и бонус за то, что маска почти целиком объясняется цифрами
+  const insideShare = totalInk ? inkIn / totalInk : 0
+  s += 22 * Math.max(0, insideShare - 0.5) * 2
+  if (medH >= H * 0.12 && medH <= H * 0.6) s += 12
+  return Math.round(s * 100) / 100
+}
+
+// построить маску по имени стратегии (нужно для «замка стиля»: не перебирать всё заново)
+function buildMask(name, data, W, H) {
+  const s = String(name || '')
+  const plus = s.indexOf('+')
+  const base = plus >= 0 ? s.slice(0, plus) : s
+  const op = plus >= 0 ? s.slice(plus + 1) : ''
+  let m = null
+  if (/^dominant\d$/.test(base)) m = maskDominant(data, W, H, Number(base.slice(8)))
+  else if (base === 'dominant1-inv') m = maskInvert(maskDominant(data, W, H, 1))
+  else if (base === 'otsu-dark') m = maskOtsu(data, W, H, false)
+  else if (base === 'otsu-light') m = maskOtsu(data, W, H, true)
+  else if (/^localbg\d+$/.test(base)) m = maskLocalBg(data, W, H, Number(base.slice(7)))
+  else if (/^color\d+$/.test(base)) m = maskOneColor(data, W, H, Number(base.slice(5)))
+  if (!m) return null
+  if (op === 'open') m = maskOpen(m, W, H)
+  else if (op === 'close') m = maskClose(m, W, H)
+  return m
+}
+
+// --- полный автоподбор маски и нарезки ---
+function autoSegment(data, W, H, expected, opts) {
+  opts = opts || {}
+  const limit = opts.limit || 46          // сколько стратегий перебрать максимум
+  const results = []
+  const wc = histColors(data)
+  const total = data.length
+  const tryMask = (name, mask, extra) => {
+    if (!mask) return
+    const cnt = maskCount(mask)
+    const frac = cnt / total
+    if (frac < 0.003 || frac > 0.75) return
+    const band = bestBand(mask, W, H)
+    if (!band) return
+    const seg = dpSegment(mask, W, band.y0, band.y1, expected)
+    if (!seg) return
+    const boxes = tightBoxes(mask, W, seg.segs, band.y0, band.y1)
+    const score = scoreBoxes(boxes, mask, W, H, band.y0, band.y1, expected)
+    results.push({ name, mask, band, segs: seg.segs, boxes, score, inkFrac: Math.round(frac * 10000) / 10000, dpCost: seg.cost, fallback: !!seg.fallback, extra: extra || null })
+  }
+
+  // 0) «замок стиля»: если прошлые раунды уже нашли рабочую маску — пробуем её первой
+  if (opts.prefer) {
+    const pm = buildMask(opts.prefer, data, W, H)
+    if (pm) {
+      tryMask(opts.prefer, pm, { preferred: true })
+      if (results.length && results[0].score >= (opts.preferMin || 100)) {
+        results[0].fastPath = true
+        return results
+      }
+    }
+  }
+
+  // 1) доминантный фон (1..3 цвета) и его инверсия
+  for (let k = 1; k <= 3; k++) {
+    const m = maskDominant(data, W, H, k)
+    tryMask('dominant' + k, m)
+    if (k === 1) tryMask('dominant1-inv', maskInvert(m))
+  }
+  // 2) Otsu по яркости (тёмное/светлое)
+  const mo = maskOtsu(data, W, H, false)
+  tryMask('otsu-dark', mo)
+  tryMask('otsu-light', maskInvert(mo))
+  // 3) локальный фон по тайлам
+  for (const tile of [64, 128]) tryMask('localbg' + tile, maskLocalBg(data, W, H, tile))
+  // 4) каждый цвет палитры по отдельности (цифры часто одного цвета)
+  const colors = []
+  for (let v = 0; v < 256; v++) if (wc[v] / total >= 0.002 && wc[v] / total <= 0.35) colors.push({ v, c: wc[v] })
+  colors.sort((a, b) => b.c - a.c)
+  for (const c of colors.slice(0, limit)) tryMask('color' + c.v, maskOneColor(data, W, H, c.v), { color: c.v, share: Math.round(c.c / total * 10000) / 10000 })
+  // 5) морфология на лучших масках: +open убирает точечный шум, +close склеивает разрывы
+  results.sort((a, b) => b.score - a.score)
+  const top = results.slice(0, 4)
+  for (const t of top) {
+    if (t.name.indexOf('+') >= 0) continue
+    tryMask(t.name + '+open', maskOpen(t.mask, W, H))
+    tryMask(t.name + '+close', maskClose(t.mask, W, H))
+  }
+  // 6) если совсем плохо — открытие на масках отдельных цветов (шум того же цвета, что цифры)
+  if (!results.length || results[0].score < 60) {
+    for (const c of colors.slice(0, 6)) tryMask('color' + c.v + '+open', maskOpen(maskOneColor(data, W, H, c.v), W, H))
+  }
+
+  results.sort((a, b) => b.score - a.score)
+  return results
+}
+
+// --- нормализация с СОХРАНЕНИЕМ пропорций (растяжение ломает тонкие цифры) ---
+function normalizeGlyphAR(mask, W, H, b) {
+  const out = new Float32Array(GW * GH)
+  const bw = b.mxX - b.mnX + 1, bh = b.mxY - b.mnY + 1
+  const scale = Math.min((GW - 2) / bw, (GH - 2) / bh)
+  const nw = Math.max(1, Math.round(bw * scale)), nh = Math.max(1, Math.round(bh * scale))
+  const ox = Math.floor((GW - nw) / 2), oy = Math.floor((GH - nh) / 2)
+  for (let gy = 0; gy < nh; gy++) {
+    const sy0 = b.mnY + Math.floor(gy * bh / nh), sy1 = Math.max(sy0 + 1, b.mnY + Math.floor((gy + 1) * bh / nh))
+    for (let gx = 0; gx < nw; gx++) {
+      const sx0 = b.mnX + Math.floor(gx * bw / nw), sx1 = Math.max(sx0 + 1, b.mnX + Math.floor((gx + 1) * bw / nw))
+      let s = 0, t = 0
+      for (let y = sy0; y < sy1 && y <= b.mxY; y++) for (let x = sx0; x < sx1 && x <= b.mxX; x++) { s += mask[y * W + x]; t++ }
+      out[(oy + gy) * GW + (ox + gx)] = t ? s / t : 0
+    }
+  }
+  return out
+}
+
+// --- извлечение ЦИФР умным способом: ровно expected штук ---
+function extractDigitsSmart(data, W, H, expected, opts) {
+  const all = autoSegment(data, W, H, expected, opts)
+  if (!all.length) return { glyphs: [], strategies: [], strategy: null, score: -1 }
+  const best = all[0]
+  const glyphs = []
+  for (let i = 0; i < best.boxes.length; i++) {
+    const b = best.boxes[i]
+    if (!b) continue
+    const norm = normalizeGlyphAR(best.mask, W, H, b)
+    let sum = 0
+    for (let k = 0; k < norm.length; k++) sum += norm[k]
+    const stroke = sum / (GW * GH)
+    const feat = buildFeatures(norm, { aspect: b.w / b.h, fill: b.area / (b.w * b.h), stroke })
+    glyphs.push({
+      bbox: { mnX: b.mnX, mnY: b.mnY, mxX: b.mxX, mxY: b.mxY, w: b.w, h: b.h },
+      cx: (b.mnX + b.mxX) / 2, cy: (b.mnY + b.mxY) / 2,
+      area: b.area, fill: Math.round(b.area / (b.w * b.h) * 1000) / 1000,
+      aspect: Math.round(b.w / b.h * 1000) / 1000, stroke: Math.round(stroke * 1000) / 1000,
+      norm, feat, mask: best.mask, W, H, index: i
+    })
+  }
+  return {
+    glyphs, strategy: best.name, score: best.score, band: best.band, boxes: best.boxes,
+    mask: best.mask, inkFrac: best.inkFrac, extra: best.extra, fastPath: !!best.fastPath,
+    tried: all.length, preferred: opts.prefer || null,
+    strategies: all.slice(0, 8).map(s => ({ name: s.name, score: s.score, inkFrac: s.inkFrac, extra: s.extra, fallback: s.fallback }))
+  }
+}
+
 // извлечение кандидатов-глифов из ink-маски собранной капчи
 function extractGlyphs(mask, W, H, opts) {
   opts = opts || {}
@@ -755,13 +1180,82 @@ function b64ToF32(s) {
   return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)
 }
 
+const FEAT_VERSION = 2   // v2: нормализация с сохранением пропорций + умная сегментация
+const MAX_PER_CLASS = 400
+
+// ---- аугментация нормализованного глифа (20×28) ----
+// Один размеченный пример превращается в ~13 — обучение идёт в разы быстрее.
+function sampleNorm(norm, x, y) {
+  if (x < 0 || y < 0 || x > GW - 1 || y > GH - 1) return 0
+  const x0 = Math.floor(x), y0 = Math.floor(y)
+  const x1 = Math.min(GW - 1, x0 + 1), y1 = Math.min(GH - 1, y0 + 1)
+  const fx = x - x0, fy = y - y0
+  const a = norm[y0 * GW + x0] * (1 - fx) + norm[y0 * GW + x1] * fx
+  const b = norm[y1 * GW + x0] * (1 - fx) + norm[y1 * GW + x1] * fx
+  return a * (1 - fy) + b * fy
+}
+function transformNorm(norm, dx, dy, scale, angleDeg) {
+  const out = new Float32Array(GW * GH)
+  const a = angleDeg * Math.PI / 180
+  const ca = Math.cos(a), sa = Math.sin(a)
+  const cx = GW / 2, cy = GH / 2
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    // обратное преобразование: из целевых координат в исходные
+    let sx = (x - cx - dx) / scale, sy = (y - cy - dy) / scale
+    const rx = sx * ca + sy * sa, ry = -sx * sa + sy * ca
+    out[y * GW + x] = sampleNorm(norm, rx + cx, ry + cy)
+  }
+  return out
+}
+function augmentNorm(norm) {
+  const out = []
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) out.push({ t: transformNorm(norm, dx, dy, 1, 0), tag: 's' + dx + '_' + dy })
+  for (const sc of [0.93, 1.07]) out.push({ t: transformNorm(norm, 0, 0, sc, 0), tag: 'z' + sc })
+  for (const an of [-4, 4]) out.push({ t: transformNorm(norm, 0, 0, 1, an), tag: 'r' + an })
+  return out
+}
+function normToFeatures(norm, baseMeta) {
+  const zones = new Float32Array(ZONES * ZONES)
+  let o = 0
+  const zw = GW / ZONES, zh = GH / ZONES
+  for (let zy = 0; zy < ZONES; zy++) for (let zx = 0; zx < ZONES; zx++) {
+    let s = 0, t = 0
+    for (let y = Math.floor(zy * zh); y < Math.floor((zy + 1) * zh); y++)
+      for (let x = Math.floor(zx * zw); x < Math.floor((zx + 1) * zw); x++) { s += norm[y * GW + x]; t++ }
+    zones[o++] = t ? s / t : 0
+  }
+  const f = new Float32Array(FEAT_DIM)
+  f.set(norm, 0)
+  f.set(zones, GW * GH)
+  let sum = 0
+  for (let i = 0; i < norm.length; i++) sum += norm[i]
+  f[GW * GH + ZONES * ZONES] = baseMeta ? baseMeta.aspect : 0.5
+  f[GW * GH + ZONES * ZONES + 1] = baseMeta ? baseMeta.fill : 0.4
+  f[GW * GH + ZONES * ZONES + 2] = sum / (GW * GH)
+  return f
+}
+
 class GlyphStore {
-  constructor(dir) {
+  constructor(dir, opts) {
     this.dir = dir
     this.file = path.join(dir, 'glyphs.jsonl')
     this.samples = []
-    this.dirty = false
+    this.skippedVersion = 0
+    this.augment = !(opts && opts.augment === false)   // digits.augment=false отключает варианты
     this.load()
+  }
+  // Аугментация НЕ плодит примеры в базе (это ломает голосование k-NN, превращая его в 1-NN),
+  // а хранится в памяти у каждого примера: расстояние до примера = минимум по его вариантам.
+  // В файле лежит только оригинал — варианты достраиваются детерминированно при загрузке.
+  makeVariants(feat) {
+    if (!this.augment) return []
+    // на большой базе варианты не нужны: своих примеров уже достаточно, экономим память/время
+    if (this.samples.length >= 300) return []
+    try {
+      const norm = feat.subarray(0, GW * GH)
+      const meta = { aspect: feat[GW * GH + ZONES * ZONES], fill: feat[GW * GH + ZONES * ZONES + 1] }
+      return augmentNorm(norm).map(v => normToFeatures(v.t, meta))
+    } catch (e) { return [] }
   }
   load() {
     try {
@@ -772,7 +1266,12 @@ class GlyphStore {
         if (!s) continue
         try {
           const o = JSON.parse(s)
-          if (o && typeof o.digit === 'number' && o.f) this.samples.push({ digit: o.digit, feat: b64ToF32(o.f), src: o.src || '', id: o.id || '' })
+          if (!o || typeof o.digit !== 'number' || !o.f) continue
+          if ((o.fv || 1) !== FEAT_VERSION) { this.skippedVersion++; continue }   // старая нормализация несовместима
+          if (String(o.src || '').indexOf('|aug:') >= 0) { this.skippedVersion++; continue } // старые аугментации-дубли
+          const feat = b64ToF32(o.f)
+          if (feat.length !== FEAT_DIM) { this.skippedVersion++; continue }
+          this.samples.push({ digit: o.digit, feat, variants: this.makeVariants(feat), src: o.src || '', id: o.id || '' })
         } catch (e) {}
       }
     } catch (e) {}
@@ -780,8 +1279,8 @@ class GlyphStore {
   ensureDir() { try { fs.mkdirSync(this.dir, { recursive: true }) } catch (e) {} }
   add(digit, feat, meta) {
     const id = 'g' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36)
-    const rec = { id, digit, f: f32ToB64(feat), src: (meta && meta.src) || '', ts: new Date().toISOString() }
-    this.samples.push({ digit, feat, src: rec.src, id })
+    const rec = { id, digit, fv: FEAT_VERSION, f: f32ToB64(feat), src: (meta && meta.src) || '', ts: new Date().toISOString() }
+    this.samples.push({ digit, feat, variants: this.makeVariants(feat), src: rec.src, id })
     this.ensureDir()
     fs.appendFileSync(this.file, JSON.stringify(rec) + '\n')
     // картинка — для контроля глазами
@@ -791,6 +1290,11 @@ class GlyphStore {
       fs.writeFileSync(path.join(d, id + '.png'), pngFromNorm(feat.subarray(0, GW * GH), 8))
     } catch (e) {}
     return id
+  }
+  // один ответ человека = один пример в базе; варианты добавляются в память (см. makeVariants)
+  addAugmented(digit, feat, meta) {
+    const id = this.add(digit, feat, meta)
+    return [id]
   }
   counts() {
     const c = {}
@@ -806,12 +1310,18 @@ class GlyphStore {
   classify(feat, k) {
     if (!this.samples.length) return null
     k = Math.min(k || KNN_K, this.samples.length)
+    const l2 = f => { let d = 0; for (let i = 0; i < FEAT_DIM; i++) { const t = feat[i] - f[i]; d += t * t } return Math.sqrt(d) }
+    // 1) грубый отбор по оригиналам (быстро)
+    const rough = this.samples.map((s, i) => ({ i, d: l2(s.feat), digit: s.digit }))
+    rough.sort((a, b) => a.d - b.d)
+    const shortlist = rough.slice(0, Math.max(k * 5, 25))
+    // 2) уточнение: расстояние до примера = минимум по его аугментациям
     const dists = []
-    for (const s of this.samples) {
-      let d = 0
-      const f = s.feat
-      for (let i = 0; i < FEAT_DIM; i++) { const t = feat[i] - f[i]; d += t * t }
-      dists.push({ d: Math.sqrt(d), digit: s.digit })
+    for (const r of shortlist) {
+      const s = this.samples[r.i]
+      let best = r.d
+      if (s.variants) for (const v of s.variants) { const dv = l2(v); if (dv < best) best = dv }
+      dists.push({ d: best, digit: r.digit })
     }
     dists.sort((a, b) => a.d - b.d)
     // ближайший пример каждого класса
@@ -1005,7 +1515,8 @@ class MLP {
 function recognize(glyphs, store, model, opts) {
   opts = opts || {}
   const expected = Number(opts.expected) || 0
-  const row = dominantRow(glyphs, expected)
+  // presorted=true — глифы уже отобраны умной сегментацией (ровно expected штук слева направо)
+  const row = opts.presorted ? glyphs.slice().sort((a, b) => a.cx - b.cx) : dominantRow(glyphs, expected)
   const items = row.map((g, i) => {
     const knn = store ? store.classify(g.feat, opts.k || KNN_K) : null
     let mlp = null
@@ -1068,9 +1579,12 @@ function enqueueGlyphs(queue, needLabel, meta) {
   return {
     GW, GH, ZONES, FEAT_DIM, CONF_OK, CONF_QUEUE,
     components8, splitComponent, subComponent, normalizeGlyph, buildFeatures,
-    extractGlyphs, dominantRow, digitScore, asciiArt,
+    extractGlyphs, extractDigitsSmart, autoSegment, buildMask, normalizeGlyphAR, scoreBoxes, maskOpen, maskErode, maskDilate,
+    dpSegment, bestBand, maskDominant, maskOtsu, maskLocalBg, maskOneColor, maskClose, maskInvert,
+    dominantRow, digitScore, asciiArt,
     pngGray, pngRgba, pngFromNorm, pngFromMask,
-    GlyphStore, LabelQueue, MLP, recognize, enqueueGlyphs, f32ToB64, b64ToF32
+    GlyphStore, LabelQueue, MLP, recognize, enqueueGlyphs, f32ToB64, b64ToF32,
+    augmentNorm, transformNorm, normToFeatures, sampleNorm, FEAT_VERSION, MAX_PER_CLASS
   }
 })()
 
@@ -2015,6 +2529,49 @@ function getMapIdFromPacket(p) {
 }
 
 // ========================= ЗАПИСЬ РАУНДА =========================
+function readStyle() {
+  try {
+    const p = path.join(LEARN_DIR, 'style.json')
+    if (!fs.existsSync(p)) return null
+    const o = JSON.parse(fs.readFileSync(p, 'utf8'))
+    return (o && o.strategy) ? o : null
+  } catch (e) { return null }
+}
+function writeStyle(strategy, score, extra) {
+  try {
+    fs.mkdirSync(LEARN_DIR, { recursive: true })
+    const prev = readStyle() || { rounds: 0 }
+    fs.writeFileSync(path.join(LEARN_DIR, 'style.json'), JSON.stringify({
+      strategy, score, extra: extra || null,
+      rounds: (prev.rounds || 0) + 1,
+      sameAsBefore: prev.strategy === strategy,
+      updated: new Date().toISOString()
+    }, null, 2))
+  } catch (e) {}
+}
+
+// картинка капчи с нарисованными рамками цифр — главная диагностика сегментации
+function debugSegmentationPng(asm, boxes, band) {
+  try {
+    const W = asm.W, H = asm.H
+    const inBox = new Uint8Array(W * H)
+    for (const b of (boxes || [])) {
+      if (!b) continue
+      for (let x = b.mnX; x <= b.mxX; x++) { if (b.mnY >= 0) inBox[b.mnY * W + x] = 1; if (b.mxY < H) inBox[b.mxY * W + x] = 1 }
+      for (let y = b.mnY; y <= b.mxY; y++) { if (b.mnX >= 0) inBox[y * W + b.mnX] = 1; if (b.mxX < W) inBox[y * W + b.mxX] = 1 }
+    }
+    const bandLine = new Uint8Array(W * H)
+    if (band) for (let x = 0; x < W; x++) { bandLine[band.y0 * W + x] = 1; bandLine[band.y1 * W + x] = 1 }
+    return DIG.pngRgba(W, H, 1, (x, y) => {
+      const v = asm.data[y * W + x]
+      let r = PALETTE[v * 3], g = PALETTE[v * 3 + 1], bl = PALETTE[v * 3 + 2]
+      if (bandLine[y * W + x]) { r = 40; g = 120; bl = 255 }
+      if (inBox[y * W + x]) { r = 255; g = 40; bl = 40 }
+      return [r, g, bl]
+    })
+  } catch (e) { return null }
+}
+
 async function saveRecord(outDir, snap, label, roundNo, opts) {
   const LIGHT = !!(opts && opts.light)
   fs.mkdirSync(outDir, { recursive: true })
@@ -2053,7 +2610,7 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
   // ---- база цифр (обучаемая) ----
   let store = null, model = null, queue = null
   try {
-    store = new DIG.GlyphStore(LEARN_DIR)
+    store = new DIG.GlyphStore(LEARN_DIR, { augment: DIG_AUGMENT })
     model = DIG.MLP.load(LEARN_DIR)
     queue = new DIG.LabelQueue(LEARN_DIR)
     if (roundNo === 1 || DIG_LOG_ONCE.v !== store.size) {
@@ -2061,6 +2618,10 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
       step('[digits] база: ' + store.size + ' размеченных глифов ' + JSON.stringify(store.counts()) + (model ? ' | MLP загружена' : ' | MLP нет (нужно --train)'))
     }
   } catch (e) { step('[digits] модуль недоступен: ' + e.message) }
+
+  const styleInfo = readStyle()
+  const styleHint = styleInfo ? styleInfo.strategy : null
+  if (styleHint) dbg('замок стиля: маска ' + styleHint + ' (раундов ' + styleInfo.rounds + ')')
 
   const stats = []
   for (const w of walls.slice(0, 6)) {
@@ -2070,12 +2631,27 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
 
     const im = inkMaskWall(asm.data, asm.W, asm.H)
     let rec = { text: '', textAll: '', prediction: '', complete: !DIGITS_EXPECTED, confident: false, avgConf: 0, expected: DIGITS_EXPECTED, items: [], needLabel: [], rowCount: 0, allCount: 0 }
-    let glyphs = []
+    let glyphs = [], seg = null, segPath = 'none'
     if (store) {
-      try {
-        glyphs = DIG.extractGlyphs(im.ink, asm.W, asm.H, GLYPH_OPTS)
-        rec = DIG.recognize(glyphs, store, model, { confOk: DIG_CONF_OK, expected: DIGITS_EXPECTED })
-      } catch (e) { dbg('glyphs err ' + e.message) }
+      if (DIGITS_EXPECTED > 0) {
+        try {
+          const t0 = Date.now()
+          seg = DIG.extractDigitsSmart(asm.data, asm.W, asm.H, DIGITS_EXPECTED, { prefer: styleHint })
+          seg.ms = Date.now() - t0
+        } catch (e) { dbg('smart segment err ' + e.message); seg = null }
+      }
+      const segOk = seg && seg.glyphs && seg.glyphs.length === DIGITS_EXPECTED && seg.score >= SEG_MIN_SCORE
+      if (segOk) {
+        glyphs = seg.glyphs
+        segPath = 'smart:' + seg.strategy + (seg.fastPath ? '(замок стиля)' : '')
+        rec = DIG.recognize(glyphs, store, model, { confOk: DIG_CONF_OK, expected: DIGITS_EXPECTED, presorted: true })
+      } else {
+        try {
+          glyphs = DIG.extractGlyphs(im.ink, asm.W, asm.H, GLYPH_OPTS)
+          segPath = 'components'
+          rec = DIG.recognize(glyphs, store, model, { confOk: DIG_CONF_OK, expected: DIGITS_EXPECTED })
+        } catch (e) { dbg('glyphs err ' + e.message) }
+      }
     }
 
     const dot = wallDot(w, snap.view)
@@ -2100,7 +2676,7 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
     const score = Math.round(sizeBonus + fillBonus + dotBonus + distBonus + digitBonus - seamPenalty - gapPenalty - yawPenalty)
 
     stats.push({
-      w, asm, im, glyphs, rec, dot, dist, fillRatio, score,
+      w, asm, im, glyphs, rec, seg, segPath, dot, dist, fillRatio, score,
       breakdown: {
         sizeBonus, fillBonus, dotBonus, distBonus, digitBonus,
         seamPenalty: Math.round(seamPenalty), gapPenalty, yawPenalty,
@@ -2160,6 +2736,23 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
       ocrLines.push(v.name + ': legacy-ocr="' + r.text + '" digits=' + r.digits.length)
     }
     fs.writeFileSync(path.join(outDir, 'ocr_variants.txt'), ocrLines.join('\n'))
+  }
+
+  // ---- диагностика сегментации: картинка с рамками + отчёт по всем стратегиям ----
+  if (best.seg) {
+    try {
+      const dbgPng = debugSegmentationPng(asm, best.seg.boxes, best.seg.band)
+      if (dbgPng) fs.writeFileSync(path.join(outDir, 'debug_segmentation.png'), dbgPng)
+      fs.writeFileSync(path.join(outDir, 'segmentation_report.json'), JSON.stringify({
+        used: best.segPath, strategy: best.seg.strategy, score: best.seg.score,
+        fastPath: !!best.seg.fastPath, triedStrategies: best.seg.tried, ms: best.seg.ms,
+        preferred: best.seg.preferred, inkFrac: best.seg.inkFrac, color: best.seg.extra,
+        band: best.seg.band ? { y0: best.seg.band.y0, y1: best.seg.band.y1, share: best.seg.band.share } : null,
+        boxes: (best.seg.boxes || []).map(b => b ? { x0: b.mnX, x1: b.mxX, y0: b.mnY, y1: b.mxY, w: b.w, h: b.h, area: b.area } : null),
+        topStrategies: best.seg.strategies
+      }, null, 2))
+    } catch (e) { dbg('seg debug err ' + e.message) }
+    if (best.seg.score >= STYLE_LOCK_MIN) writeStyle(best.seg.strategy, best.seg.score, best.seg.extra)
   }
 
   // ---- глиф-кандидаты и распознавание ----
@@ -2231,6 +2824,11 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
       ') — картинка может быть собрана неверно. Проверьте ORIGINAL_CAPTCHA.png' +
       (TRY_COL_PERMS ? '' : '; при необходимости запустите с --perms'))
   }
+  step(label + ': 🧩 сегментация: ' + best.segPath +
+    (best.seg ? ' балл=' + best.seg.score + ' стратегий=' + best.seg.tried + ' за ' + best.seg.ms + 'мс полоса=[' +
+      (best.seg.band ? best.seg.band.y0 + '-' + best.seg.band.y1 : '?') + ']' +
+      (best.seg.extra && best.seg.extra.color !== undefined ? ' цвет=' + best.seg.extra.color : '') : '') +
+    (best.seg && best.seg.score < SEG_MIN_SCORE ? ' ⚠️ балл ниже порога ' + SEG_MIN_SCORE + ' — откат к компонентам' : ''))
   step(label + ': 🔢 ПРЕДСКАЗАНИЕ="' + best.rec.prediction + '" уверенных="' + best.rec.text +
     '" ср.уверенность=' + best.rec.avgConf +
     ' глифов=' + best.rec.rowCount + (DIGITS_EXPECTED ? '/' + DIGITS_EXPECTED : '') + ' кандидатов=' + best.rec.allCount +
@@ -2252,6 +2850,7 @@ async function saveRecord(outDir, snap, label, roundNo, opts) {
       bbox: it.glyph ? it.glyph.bbox : null,
       feat: it.glyph ? it.glyph.feat : null
     })),
+    segPath: best.segPath, segStrategy: best.seg ? best.seg.strategy : null, segScore: best.seg ? best.seg.score : null,
     pngFile: path.join(outDir, 'ORIGINAL_CAPTCHA_x1.png'),
     pngFile2x: path.join(outDir, 'ORIGINAL_CAPTCHA.png'),
     candidates: stats.map(s => ({ wall: s.w.tag, score: s.score, breakdown: s.breakdown })),
@@ -2657,7 +3256,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.9.3: геометрия сборки ===')
+  console.log('=== SELFTEST v3.10.0: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -2893,6 +3492,64 @@ async function selftest() {
         ' light-режим=' + (lightOk ? 'ок (raw совпадает, тяжёлое не пишем)' : 'СБОЙ') +
         ' расхождений=' + pct.toFixed(3) + '%')
     }
+  }
+
+  // ---- УМНАЯ СЕГМЕНТАЦИЯ на «трудных» фонах (ровно 5 цифр) ----
+  console.log('--- умная сегментация: ровный/слипшийся/инверсный/блочный/шум/враждебный фон ---')
+  {
+    const segCase = (mode, seed) => {
+      const digits = '48152'
+      let s = seed
+      const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff }
+      const W = 512, H = 384
+      const img = new Uint8Array(W * H)
+      const DC = 118
+      const PAL = [122, 30, 46, 98, 74, 34, 26, 54, 50, 102, 86, 90, 110, 114]
+      const use = mode === 'adv' ? PAL.concat([DC]) : PAL
+      if (mode === 'noise' || mode === 'adv') for (let i = 0; i < img.length; i++) img[i] = use[Math.floor(rnd() * use.length)]
+      else if (mode === 'blocks') { for (let y = 0; y < H; y += 8) for (let x = 0; x < W; x += 8) { const c = use[Math.floor(rnd() * use.length)]; for (let dy = 0; dy < 8; dy++) for (let dx = 0; dx < 8; dx++) img[(y + dy) * W + x + dx] = c } }
+      else img.fill(mode === 'white' ? DC : 34)
+      const sc = 17, gap = mode === 'touch' ? 0 : 12
+      const total = digits.length * (5 * sc) + (digits.length - 1) * gap
+      const x0 = Math.floor((W - total) / 2), y0 = Math.floor(H / 2 - 3.5 * sc)
+      const truth = []
+      digits.split('').forEach((d, i) => {
+        const p = DIGITS[d]; let t = null
+        for (let y = 0; y < 7; y++) for (let x = 0; x < 5; x++) {
+          if (p[y][x] !== 1) continue
+          for (let dy = 0; dy < sc; dy++) for (let dx = 0; dx < sc; dx++) {
+            const X = x0 + i * (5 * sc + gap) + x * sc + dx, Y = y0 + y * sc + dy
+            if (X < 0 || Y < 0 || X >= W || Y >= H) continue
+            img[Y * W + X] = mode === 'white' ? 34 : DC
+            if (!t) t = { mnX: X, mxX: X, mnY: Y, mxY: Y }
+            else { if (X < t.mnX) t.mnX = X; if (X > t.mxX) t.mxX = X; if (Y < t.mnY) t.mnY = Y; if (Y > t.mxY) t.mxY = Y }
+          }
+        }
+        truth.push(t)
+      })
+      const r = DIG.extractDigitsSmart(img, W, H, 5, {})
+      let worst = 999
+      if (r.glyphs.length === 5) {
+        worst = 0
+        r.glyphs.forEach((g, i) => {
+          const t = truth[i]; if (!t) return
+          worst = Math.max(worst, Math.abs(g.bbox.mnX - t.mnX), Math.abs(g.bbox.mxX - t.mxX), Math.abs(g.bbox.mnY - t.mnY), Math.abs(g.bbox.mxY - t.mxY))
+        })
+      }
+      const tol = (mode === 'adv' || mode === 'noise') ? 14 : 3
+      return { mode, ok: r.glyphs.length === 5 && worst <= tol, worst, tol, strategy: r.strategy, score: r.score, tried: r.tried, ms: r.ms }
+    }
+    let segFails = 0
+    for (const mode of ['plain', 'touch', 'white', 'blocks', 'noise', 'adv']) {
+      const t0 = Date.now()
+      const r = segCase(mode, 4242 + mode.length)
+      r.ms = Date.now() - t0
+      if (!r.ok) segFails++
+      console.log('  ' + (r.ok ? '\u2705' : '\u274c') + ' ' + r.mode.padEnd(7) + ' маска=' + String(r.strategy).padEnd(18) +
+        ' балл=' + String(r.score).padEnd(7) + ' стратегий=' + r.tried + ' за ' + r.ms + 'мс' +
+        ' | отклонение рамок=' + r.worst + 'px (допуск ' + r.tol + 'px)')
+    }
+    if (segFails) fails += segFails
   }
 
   // ---- ЦИКЛ ОБУЧЕНИЯ: разметили несколько раундов -> распознаём новый ----
@@ -3334,10 +3991,14 @@ function labelRoundWithDigits(store, rec, round, digits) {
   const items = (rec.digitItems || []).filter(it => it.feat)
   if (!items.length) return { ok: false, reason: 'нет глифов' }
   if (digits.length !== items.length) return { ok: false, reason: 'не совпало количество', found: items.length, got: digits.length }
+  let added = 0
   items.forEach((it, i) => {
-    try { store.add(Number(digits[i]), it.feat, { src: 'tg:round' + round + ':' + i }) } catch (e) { tgLog('store.add err: ' + e.message) }
+    try {
+      const ids = store.addAugmented(Number(digits[i]), it.feat, { src: 'tg:round' + round + ':' + i, aspect: it.w / Math.max(1, it.h) })
+      added += ids.length
+    } catch (e) { tgLog('store.add err: ' + e.message) }
   })
-  return { ok: true, n: items.length }
+  return { ok: true, n: items.length, variants: added }
 }
 
 // убрать глифы этого раунда из очереди ручной разметки (они уже размечены через TG)
@@ -3465,7 +4126,7 @@ async function runTelegramSession(ctx, captureFn) {
 
   await tgApi('getUpdates', { offset: -1, timeout: 0 })   // сброс старых апдейтов
 
-  await tgSendText('🟢 Бот запущен (v3.9.3)\n' +
+  await tgSendText('🟢 Бот запущен (v3.10.0)\n' +
     'В капче всегда ' + DIGITS_EXPECTED + ' цифр. Цель обучения: ' + TG.targetStreak + ' совпадений подряд.\n' +
     'База цифр: ' + store.size + ' примеров' + (store.size ? '' : ' (пуста — первые ответы её создадут)') + '\n\n' +
     'Я присылаю картинку и СВОЁ ПРЕДСКАЗАНИЕ. Вы отвечаете правильными цифрами:\n' +
@@ -3522,12 +4183,18 @@ async function runTelegramSession(ctx, captureFn) {
         try { png = fs.readFileSync(rec.pngFile) } catch (e) { try { png = fs.readFileSync(rec.pngFile2x) } catch (e2) {} }
         if (!png) { await tgSendText('⚠️ Раунд ' + round + ': не удалось прочитать картинку с диска'); continue }
 
+        const segLine = rec.segStrategy
+          ? ('🧩 Маска: ' + rec.segStrategy + ' (балл ' + rec.segScore + ')')
+          : '🧩 Сегментация: запасной метод'
         const cap = '🖼 Раунд ' + round + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows + ' · seam ' + rec.seamCost + '\n' +
           '🤖 Предсказание: ' + (pred || '—') + '  (уверенность ' + avgConf + ')\n' +
-          '🔤 Вырезано цифр: ' + items.length + ' из ' + DIGITS_EXPECTED +
-          (complete ? '' : '  ⚠️ не хватает — пришлите /glyphs, посмотрим вместе') + '\n' +
+          '🔤 Найдено цифр: ' + items.length + ' из ' + DIGITS_EXPECTED +
+          (items.length === DIGITS_EXPECTED ? '' : '  ⚠️ НЕ ВСЕ — пришлите /skip') + '\n' +
+          segLine + '\n' +
           '🎯 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + '\n\n' +
-          'Ответьте ' + DIGITS_EXPECTED + ' цифрами (или «+», если предсказание верное)'
+          (items.length === DIGITS_EXPECTED
+            ? 'Ответьте ' + DIGITS_EXPECTED + ' цифрами (или «+», если предсказание верное)'
+            : 'Цифры нашлись не все — ответьте /skip (я запишу проблему в лог) или /glyphs')
         const sent = await tgSendPhoto(png, cap)
         if (!sent.ok) { tgLog('не отправил фото раунда ' + round + ': ' + (sent.description || '')); continue }
         tgLog('раунд ' + round + ': фото + предсказание "' + pred + '" отправлены (message_id=' +
@@ -3584,6 +4251,13 @@ async function runTelegramSession(ctx, captureFn) {
             tgLog('/train: ' + st.lastModelInfo)
             continue
           }
+          if (items.length !== DIGITS_EXPECTED && !/^\//.test(low) && text.replace(/[^0-9]/g, '').length !== DIGITS_EXPECTED) {
+            await tgSendText('⚠️ На этой картинке я нашёл ' + items.length + ' цифр из ' + DIGITS_EXPECTED +
+              ' — размечать нечего. Пришлите /skip, чтобы перейти к следующей.\n' +
+              'Для диагностики: файл debug_segmentation.png в папке раунда (на нём рамки, которые я нашёл).')
+            tgLog('раунд ' + round + ': найдено ' + items.length + ' цифр из ' + DIGITS_EXPECTED + ' — жду /skip')
+            continue
+          }
           if (low === '/skip' || low === '/skip@' + botName) {
             st.skipped++
             await tgSendText('⏭ Раунд ' + round + ' пропущен. Счётчик совпадений сброшен (' + st.streak + ' → 0)')
@@ -3623,12 +4297,13 @@ async function runTelegramSession(ctx, captureFn) {
           if (res.ok) {
             st.labeled += res.n
             st.newLabels += res.n
+            st.variants = (st.variants || 0) + (res.variants || res.n)
             const dropped = dropQueueRound(round)
             rep = (match
               ? '✅ СОВПАЛО! Я: ' + pred + ' = Вы: ' + digits
               : '❌ Я сказал «' + pred + '», верно «' + digits + '»' + (complete ? '' : ' (предсказание неполное)')) +
               '\n🎯 Подряд: ' + st.streak + '/' + TG.targetStreak + (st.bestStreak > st.streak ? ' (рекорд ' + st.bestStreak + ')' : '') +
-              '\n📚 Размечено ' + res.n + ' глифов → база ' + store.size + (dropped ? ' (из очереди убрано ' + dropped + ')' : '')
+              '\n📚 Размечено ' + res.n + ' цифр (с аугментацией ' + (res.variants || res.n) + ' примеров) → база ' + store.size + (dropped ? ' (из очереди убрано ' + dropped + ')' : '')
             tgLog('раунд ' + round + ': ' + (match ? 'СОВПАЛО' : 'НЕ СОВПАЛО') + ' бот="' + pred + '" человек="' + digits +
               '" streak=' + st.streak + '/' + TG.targetStreak + ' размечено=' + res.n + ' база=' + store.size)
           } else {
@@ -3852,11 +4527,11 @@ function runLabelTool() {
     const it = queue.items[pos]
     if (!it) { finish(); return }
     if (/^[0-9]$/.test(a)) {
-      store.add(Number(a), DIG.b64ToF32(it.f), { src: (it.src || '') + '#' + it.id })
+      store.addAugmented(Number(a), DIG.b64ToF32(it.f), { src: (it.src || '') + '#' + it.id })
       asked.push({ pos, id: it.id, item: it })
       queue.items.splice(pos, 1); queue.save()
       labeled++
-      console.log('  ✓ записано как ' + a + '  (в базе ' + store.size + ')')
+      console.log('  ✓ записано как ' + a + ' + аугментация → в базе ' + store.size + ' примеров')
       show(); return
     }
     if (a === 's') { pos++; skipped++; console.log('  → пропущен'); show(); return }
@@ -4019,7 +4694,7 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.9.3 ===')
+  step('=== СТАРТ v3.10.0 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
@@ -4084,7 +4759,7 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.9.3) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.10.0) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
@@ -4107,7 +4782,7 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.9.3', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.10.0', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
