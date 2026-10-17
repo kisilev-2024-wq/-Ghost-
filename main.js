@@ -78,6 +78,7 @@ const CLI = {
   replay: typeof argVal('replay', '') === 'string' ? argVal('replay', '') : '',
   replayAll: typeof argVal('replay-all', '') === 'string' ? argVal('replay-all', '') : '',
   train: ARGV.includes('--train'),
+  tgTest: ARGV.includes('--tg-test'),
   perms: ARGV.includes('--perms'),
   label: ARGV.includes('--label'),
   debug: ARGV.includes('--debug')
@@ -227,15 +228,33 @@ const PROXY = {
 const NICK_PREFIX = String(cfgGet(CFG, 'accounts.nickPrefix', 'Player')).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'Player'
 
 // ========================= TELEGRAM (бот-разметчик) =========================
+// Прокси для Telegram берём из любого из ключей: socksUrl / apiProxy / proxy / socks5.
+// (в вашем конфиге он лежит в telegram.apiProxy)
+function tgProxyFromConfig() {
+  const keys = ['telegram.socksUrl', 'telegram.apiProxy', 'telegram.proxy', 'telegram.socks', 'telegram.socks5']
+  for (const k of keys) {
+    const v = String(cfgGet(CFG, k, '') || '').trim()
+    if (v && !/YOUR_|CHANGE/i.test(v)) return { key: k, url: v }
+  }
+  return null
+}
+const TG_PROXY_CFG = tgProxyFromConfig()
+
 const TG = {
   enabled: cfgGet(CFG, 'telegram.enabled', true) !== false,
   token: String(cfgGet(CFG, 'telegram.token', '') || '').trim(),
   chatId: String(cfgGet(CFG, 'telegram.chatId', '') || '').trim(),
   apiUrl: String(cfgGet(CFG, 'telegram.apiUrl', 'https://api.telegram.org') || 'https://api.telegram.org').replace(/\/+$/, ''),
-  socksUrl: String(cfgGet(CFG, 'telegram.socksUrl', '') || '').trim(),
+  socksUrl: TG_PROXY_CFG ? TG_PROXY_CFG.url : '',
+  socksKey: TG_PROXY_CFG ? TG_PROXY_CFG.key : '',
+  // специальный прокси пробуем ПЕРВЫМ: прямой доступ к api.telegram.org в РФ обычно таймаутит
+  preferSocks: cfgGet(CFG, 'telegram.preferSocks', true) !== false,
+  // мобильный прокси Minecraft — только как последний резерв (он часто режет не-MC трафик
+  // и ротация IP рвёт long polling)
   useMcProxy: cfgGet(CFG, 'telegram.useMcProxy', true) !== false,
   prefetch: Math.max(1, Number(cfgGet(CFG, 'telegram.prefetch', 2)) || 2),
   timeoutMs: Math.max(10000, Number(cfgGet(CFG, 'telegram.timeoutMs', 30000)) || 30000),
+  probeTimeoutMs: Math.max(4000, Number(cfgGet(CFG, 'telegram.probeTimeoutMs', 12000)) || 12000),
   autoTrainEvery: Math.max(0, Number(cfgGet(CFG, 'telegram.autoTrainEvery', 25)) || 0),
   sendGlyphStrip: cfgGet(CFG, 'telegram.sendGlyphStrip', false) === true
 }
@@ -2905,11 +2924,30 @@ function tgLog(msg) {
   step('[TG] ' + msg)
 }
 
+// принимает: socks5://u:p@host:port, socks5h://u:p@host:port, socks4://...,
+//            u:p@host:port и host:port (без схемы и без логина)
 function parseSocksUrl(s) {
   try {
-    const m = String(s || '').match(/^socks5[h]?:\/\/([^:]*):([^@]*)@([^:]+):(\d+)\/?$/i)
-    if (!m) return null
-    return { host: m[3], port: Number(m[4]), username: decodeURIComponent(m[1]), password: decodeURIComponent(m[2]) }
+    let str = String(s || '').trim()
+    if (!str) return null
+    let type = 5
+    const pm = str.match(/^(socks[45])h?:\/\//i)
+    if (pm) { type = pm[1].toLowerCase() === 'socks4' ? 4 : 5; str = str.slice(pm[0].length) }
+    else if (/^[a-z0-9]+:\/\//i.test(str)) return null
+    const at = str.lastIndexOf('@')
+    let user = '', pass = ''
+    if (at >= 0) {
+      const auth = str.slice(0, at)
+      str = str.slice(at + 1)
+      const ci = auth.indexOf(':')
+      if (ci >= 0) { user = auth.slice(0, ci); pass = auth.slice(ci + 1) } else user = auth
+    }
+    const hm = str.match(/^\[?([^\]:]+)\]?:(\d+)\/?$/)
+    if (!hm) return null
+    return {
+      type, host: hm[1], port: Number(hm[2]),
+      username: decodeURIComponent(user), password: decodeURIComponent(pass)
+    }
   } catch (e) { return null }
 }
 
@@ -2919,7 +2957,7 @@ function socksTlsConnect(host, port, socks, timeoutMs) {
     let done = false
     const to = setTimeout(() => { if (!done) { done = true; reject(new Error('SOCKS timeout')) } }, timeoutMs || 25000)
     SocksClient.createConnection({
-      proxy: { host: socks.host, port: socks.port, type: 5, userId: socks.username, password: socks.password },
+      proxy: { host: socks.host, port: socks.port, type: socks.type || 5, userId: socks.username, password: socks.password },
       command: 'connect', destination: { host, port }
     }).then(conn => {
       if (done) { try { conn.socket.destroy() } catch (e) {} return }
@@ -2987,13 +3025,22 @@ function tgMultipart(fields, file) {
 
 let tgTransport = null
 function tgTransports() {
-  const list = ['direct']
   let isHttp = false
   try { isHttp = new URL(TG.apiUrl).protocol === 'http:' } catch (e) {}
-  if (isHttp) return list   // локальный/тестовый endpoint — прокси не нужен
+  if (isHttp) return ['direct']        // локальный/тестовый endpoint — прокси не нужен
+
+  const direct = 'direct'
   const s = parseSocksUrl(TG.socksUrl)
-  if (s) list.push({ name: 'tg.socksUrl', socks: s })
-  if (TG.useMcProxy && PROXY.host) list.push({ name: 'mc-proxy', socks: { host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password } })
+  const tgProxy = s ? { name: 'tg-proxy(' + s.host + ':' + s.port + ')', socks: s } : null
+  const mc = (TG.useMcProxy && PROXY.host)
+    ? { name: 'mc-proxy(' + PROXY.host + ')', socks: { type: 5, host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password } }
+    : null
+  // специальный прокси первым (если задан): прямой доступ к Telegram обычно заблокирован
+  const list = []
+  if (tgProxy && TG.preferSocks) list.push(tgProxy)
+  list.push(direct)
+  if (tgProxy && !TG.preferSocks) list.push(tgProxy)
+  if (mc) list.push(mc)
   return list
 }
 function tgTransportByName(n) {
@@ -3003,14 +3050,18 @@ function tgTransportByName(n) {
 }
 
 // вызов метода Telegram Bot API: сначала рабочий транспорт, потом остальные
-async function tgApi(method, params, file, timeoutMs) {
+async function tgApi(method, params, file, timeoutMs, onlyTransport) {
   if (!TG.token) return { ok: false, description: 'нет telegram.token' }
   let u
   try { u = new URL(TG.apiUrl + '/bot' + TG.token + '/' + method) } catch (e) { return { ok: false, description: 'плохой telegram.apiUrl' } }
   const order = []
-  if (tgTransport) order.push(tgTransport)
-  for (const t of tgTransports()) if (order.indexOf(t) < 0) order.push(t)
+  if (onlyTransport) order.push(onlyTransport)
+  else {
+    if (tgTransport) order.push(tgTransport)
+    for (const t of tgTransports()) if (order.indexOf(t) < 0) order.push(t)
+  }
 
+  const errs = []
   let lastErr = 'нет транспорта'
   for (const tr of order) {
     for (let retry = 0; retry < 2; retry++) {
@@ -3021,7 +3072,13 @@ async function tgApi(method, params, file, timeoutMs) {
       const tName = (tr === 'direct') ? 'direct' : tr.name
       const secure = u.protocol !== 'http:'
       const r = await httpsRequest({ host: u.hostname, port: Number(u.port || (secure ? 443 : 80)), path: u.pathname + u.search, method: 'POST', headers, body, timeoutMs: timeoutMs || TG.timeoutMs, socks, secure })
-      if (!r.ok) { lastErr = tName + ': ' + r.error; tgLog('API ' + method + ' через ' + tName + ' не прошёл: ' + r.error); break }
+      if (!r.ok) {
+        lastErr = tName + ': ' + r.error
+        if (errs.indexOf(lastErr) < 0) errs.push(lastErr)
+        if (/модуль socks не установлен/.test(r.error)) tgLog('⚠️ нужен пакет socks: npm i socks (без него прокси-транспорты не работают)')
+        else tgLog('API ' + method + ' через ' + tName + ' не прошёл: ' + r.error)
+        break
+      }
       let json = null
       try { json = JSON.parse(r.body.toString('utf8')) } catch (e) {}
       if (r.status === 429) {
@@ -3034,10 +3091,11 @@ async function tgApi(method, params, file, timeoutMs) {
         if (tgTransport !== tr) { tgTransport = tr; tgLog('транспорт: ' + tName) }
         return json
       }
-      return { ok: false, error_code: r.status, description: (json && json.description) || ('HTTP ' + r.status + ' ' + r.body.toString('utf8').slice(0, 200)) }
+      const d = (json && json.description) || ('HTTP ' + r.status + ' ' + r.body.toString('utf8').slice(0, 200))
+      return { ok: false, error_code: r.status, description: tName + ': ' + d }
     }
   }
-  return { ok: false, description: lastErr }
+  return { ok: false, description: errs.length ? errs.join(' | ') : lastErr }
 }
 
 async function tgSendText(text) {
@@ -3140,9 +3198,13 @@ async function runTelegramSession(ctx, captureFn) {
   const q = new AsyncQueue(TG.prefetch)
   const st = { offset: 0, stop: false, labeled: 0, newLabels: 0, rounds: 0, skipped: 0, lastModelInfo: null }
 
-  const me = await tgApi('getMe')
+  tgLog('порядок транспортов: ' + tgTransports().map(t => t === 'direct' ? 'direct' : t.name).join(' → ') +
+    (TG.socksUrl ? ' | прокси из ' + TG.socksKey : ''))
+  const me = await tgApi('getMe', null, null, TG.probeTimeoutMs)
   if (!me.ok) {
     tgLog('❌ getMe не прошёл: ' + (me.description || me.error_code) + ' — работаю БЕЗ Telegram')
+    tgLog('   что сделать: проверьте telegram.apiProxy/socksUrl (формат socks5://логин:пароль@хост:порт),')
+    tgLog('   либо diagnosis: node main.js --tg-test')
     return false
   }
   tgLog('бот @' + (me.result && me.result.username) + ' (id ' + (me.result && me.result.id) + ') | chat_id=' + TG.chatId +
@@ -3350,6 +3412,56 @@ async function tgWaitMessage(st) {
     }
   }
   return null
+}
+
+// ========================= ДИАГНОСТИКА TELEGRAM =========================
+async function runTgTest() {
+  console.log('=== ПРОВЕРКА TELEGRAM ===')
+  console.log('apiUrl     : ' + TG.apiUrl)
+  console.log('token      : ' + (TG.token ? TG.token.slice(0, 8) + '...' + TG.token.slice(-4) + ' (длина ' + TG.token.length + ')' : 'НЕ ЗАДАН'))
+  console.log('chatId     : ' + (TG.chatId || 'НЕ ЗАДАН'))
+  const sp = parseSocksUrl(TG.socksUrl)
+  console.log('спец-прокси: ' + (TG.socksUrl ? TG.socksUrl.replace(/:([^:@/]+)@/, ':***@') + '  (ключ ' + TG.socksKey + ')' : 'не задан') +
+    (TG.socksUrl ? (sp ? '  → распознан: socks' + sp.type + ' ' + sp.host + ':' + sp.port + (sp.username ? ' логин=' + sp.username : '') : '  → ⚠️ НЕ РАСПОЗНАН (формат: socks5://логин:пароль@хост:порт)') : ''))
+  console.log('MC-прокси  : ' + (PROXY.host ? PROXY.host + ':' + PROXY.port + ' (резерв)' : 'нет') + ' | useMcProxy=' + TG.useMcProxy)
+  console.log('')
+  if (!TG.token) { console.log('❌ нет telegram.token — нечего проверять'); return false }
+
+  let working = null
+  for (const tr of tgTransports()) {
+    const name = tr === 'direct' ? 'direct' : tr.name
+    const savedTransport = tgTransport
+    tgTransport = tr
+    const t0 = Date.now()
+    const r = await tgApi('getMe', null, null, TG.probeTimeoutMs, tr)   // только этот транспорт
+    const ms = Date.now() - t0
+    tgTransport = savedTransport
+    if (r.ok) {
+      console.log('✅ ' + name + ': ОК за ' + ms + 'мс — бот @' + (r.result && r.result.username) + ' (id ' + (r.result && r.result.id) + ')')
+      working = { tr, name, bot: r.result }
+      break
+    } else {
+      const d = String(r.description || r.error_code || 'ошибка')
+      console.log('❌ ' + (d.indexOf(name + ':') === 0 ? d : name + ': ' + d) + ' (' + ms + 'мс)')
+    }
+  }
+  if (!working) {
+    console.log('')
+    console.log('Ни один транспорт не дошёл до api.telegram.org.')
+    console.log('Что делать:')
+    console.log('  1) задать рабочий SOCKS в config.json:  "telegram": { "apiProxy": "socks5://логин:пароль@хост:порт" }')
+    console.log('  2) проверить, что прокси живой и пускает на 443 порт')
+    console.log('  3) если Telegram доступен напрямую — "telegram": { "preferSocks": false }')
+    tgTransport = null
+    return false
+  }
+  tgTransport = working.tr
+  console.log('')
+  console.log('Рабочий транспорт: ' + working.name + ' — он будет использоваться для всех запросов.')
+  const msg = await tgApi('sendMessage', { chat_id: TG.chatId, text: '✅ Связь есть. Транспорт: ' + working.name + '\nБот @' + (working.bot && working.bot.username) + ' готов к разметке капчи.' }, null, TG.probeTimeoutMs)
+  if (msg.ok) console.log('✅ тестовое сообщение отправлено в chat_id=' + TG.chatId + ' (message_id=' + (msg.result && msg.result.message_id) + ')')
+  else console.log('❌ сообщение не отправилось: ' + (msg.description || msg.error_code) + ' — проверьте chatId (узнать: @userinfobot) и что вы написали боту /start')
+  return msg.ok
 }
 
 // ========================= ОБУЧЕНИЕ ЦИФР =========================
@@ -3580,6 +3692,7 @@ async function main() {
   step('=== СТАРТ v3.9.1 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
+  if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
   if (CLI.label) { runLabelTool(); return }
   if (CLI.train) { runTrain(); return }
 
@@ -3620,7 +3733,11 @@ async function main() {
 
   if (TG.ready) {
     step('TELEGRAM: ВКЛ — бот-разметчик (предзагрузка ' + TG.prefetch + ' картинк' + (TG.prefetch > 1 ? 'и' : 'а') +
-      ', chat_id=' + TG.chatId + ', автообучение ' + (TG.autoTrainEvery ? 'каждые ' + TG.autoTrainEvery + ' глифов' : 'выкл'))
+      ', chat_id=' + TG.chatId + ', автообучение ' + (TG.autoTrainEvery ? 'каждые ' + TG.autoTrainEvery + ' глифов' : 'выкл') + ')')
+    const sp = parseSocksUrl(TG.socksUrl)
+    step('  трафик Telegram: ' + (sp ? ('СОКС-прокси ' + sp.host + ':' + sp.port + ' (из ' + TG.socksKey + '), тип socks' + sp.type + (sp.username ? ', логин ' + sp.username : '') + ' → затем direct → затем мобильный прокси') :
+      'напрямую (спец-прокси не задан: добавьте telegram.apiProxy) → затем мобильный прокси ' + (PROXY.host || 'НЕТ')) +
+      (TG.preferSocks && sp ? '' : ''))
     const okTg = await runTelegramSession(ctx)
     if (!okTg) { step('Telegram недоступен — переключаюсь в обычный режим (только сбор картинок)'); await runClassic(ctx) }
   } else {
@@ -3694,6 +3811,6 @@ module.exports = {
   yawSpread, maxGridGap, wallDist, wallDot, GLYPH_OPTS, LEARN_DIR, DIG,
   selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord,
   runTrain, runLabel: runLabelTool, replayAll, replayDir, captureRound, runClassic, trainModel,
-  TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, AsyncQueue, glyphStripPng,
+  TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, runTgTest, parseSocksUrl, tgTransports, AsyncQueue, glyphStripPng,
   labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary
 }
