@@ -1,5 +1,31 @@
-// VERSION: 3.12.0
+// VERSION: 3.13.0
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ============ ЧТО ИСПРАВЛЕНО В v3.13.0 (по вашему логу 21:19) ============
+// P1. «socks fail: Socks5 proxy rejected connection - ConnectionRefused».
+//     Мобильный прокси (bproxy.site:23750, MobileProxy.Space) НЕ принимал TCP —
+//     порт никто не слушал: аренда истекла / оборудование выключено / неверный порт.
+//     Это НЕ баг бота, но раньше он в такой ситуации: (а) молча показывал «IP ?»,
+//     потому что спрашивал IP через тот же мёртвый прокси; (б) жёг 6 ротаций IP
+//     впустую; (в) не объяснял, что делать. Теперь:
+//       • встроенный SOCKS5-клиент (не зависит от модуля socks) с понятными ошибками;
+//       • ИП определяется и НАПРЯМУЮ, когда прокси мёртв (в логе больше нет «?»);
+//       • при ConnectionRefused в лог печатается пошаговая инструкция (что проверить);
+//       • node main.js --proxy-check — полная диагностика: DNS, SOCKS5, HTTP-резерв,
+//         внешний IP, ссылка смены IP, пинг MC-сервера и ВЕРДИКТ с причиной.
+// P2. «changeIp: direct:200 body=<!DOCTYPE html>...» — ссылка смены IP вернула
+//     ВЕБ-СТРАНИЦУ, а не ответ API. Значит IP фактически НЕ менялся (провайдеру
+//     нужен формат API). Теперь:
+//       • к ссылке автоматически дописывается format=json;
+//       • ответ разбирается: {"status":"OK","new_ip":...,"rt":...} / лимит «30 сек» /
+//         HTML / текст — и в лог пишется ЧТО ИМЕННО вернулось и что делать;
+//       • если пришёл HTML — явное предупреждение «IP так не меняется, возьмите ссылку
+//         из панели "Мои прокси" → колонка "Смена IP"».
+// P3. Резервный хост прокси: у MobileProxy.Space один порт слушают и bproxy.site
+//     (SOCKS5), и mproxy.site (HTTP). Бот пробует оба + запоминает живой, так что
+//     временный отказ одного хоста больше не рвёт весь забег.
+// P4. Лимит 30 секунд между сменами IP учитывается (раньше частые запросы молча
+//     отбрасывались провайдером, и бот писал «IP не сменился» без причины).
 //
 // ============ ЧТО ИСПРАВЛЕНО В v3.12.0 (по вашему логу 13:01–19:54) ============
 // G1. ГЛАВНОЕ: СЕГМЕНТАЦИЯ РЕЗАЛА НЕ ЦИФРЫ — И ЭТО ОТРАВЛЯЛО БАЗУ.
@@ -210,9 +236,13 @@
 //
 // Запуск:
 //   node main.js                 # 10 раундов: картинки + цифры
+//   node main.js --proxy-check   # диагностика прокси/IP (DNS, SOCKS5, HTTP-резерв, смена IP, пинг MC) + вердикт
 //   node main.js --label         # разметка глифов (обучение)  [или node main.js --label]
 //   node main.js --train         # обучить MLP по размеченной базе
-//   node main.js --selftest      # 23 проверки без сервера
+//   node main.js --autotune [--apply]  # офлайн-подбор маски сегментации по сохранённым картинкам
+//   node main.js --diag [DIR]    # диагностика одной картинки (топ стратегий, ASCII-кропы, фото с рамками)
+//   node main.js --import-answers learn\telegram.log  # импорт старых ответов человека
+//   node main.js --selftest      # 72 проверки без сервера
 //   node main.js --replay DIR    # пересобрать картинку из старой записи
 //   node main.js --rounds 3      # короткий прогон
 //   node main.js --debug         # подробный лог
@@ -226,6 +256,8 @@ const zlib = require('zlib')
 const http = require('http')
 const https = require('https')
 const tls = require('tls')
+const net = require('net')     // свой SOCKS5-клиент: диагностика прокси и резервный хост
+const dns = require('dns')
 
 // mineflayer/socks нужны только для живого забега. Для --selftest/--replay — не нужны.
 let mineflayer = null
@@ -262,6 +294,7 @@ const CLI = {
     ? ((typeof argVal('import-answers', '') === 'string' && argVal('import-answers', '') !== '') ? argVal('import-answers', '') : path.join('learn', 'telegram.log'))
     : '',
   apply: ARGV.includes('--apply'),
+  proxyCheck: ARGV.includes('--proxy-check') || ARGV.includes('--proxy'),
   diag: ARGV.includes('--diag'),
   diagDir: (typeof argVal('diag', '') === 'string' && argVal('diag', '') !== '') ? argVal('diag', '') : ''
 }
@@ -690,55 +723,635 @@ function plainGet(urlStr, timeoutMs) {
   })
 }
 
-function socksHttpGet(host, reqText) {
-  if (!SocksClient || !PROXY.host) return Promise.resolve(null)
-  return new Promise(resolve => {
-    SocksClient.createConnection({
-      proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password },
-      command: 'connect', destination: { host, port: 80 }
-    }).then(conn => {
-      let data = ''
-      const t = setTimeout(() => { try { conn.socket.destroy() } catch (e) {}; resolve(null) }, 10000)
-      conn.socket.on('data', d => {
-        data += d.toString()
-        const m = data.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
-        if (m && data.includes('\r\n\r\n')) { clearTimeout(t); try { conn.socket.destroy() } catch (e) {}; resolve(m[1]) }
-      })
-      conn.socket.on('error', () => { clearTimeout(t); resolve(null) })
-      conn.socket.on('end', () => { clearTimeout(t); const m = data.match(/(\d{1,3}(?:\.\d{1,3}){3})/); resolve(m ? m[1] : null) })
-      conn.socket.write(reqText)
-    }).catch(() => resolve(null))
+// IP через прокси (оставлено для совместимости; основной путь — currentIp())
+async function socksHttpGet(host, reqText) {
+  if (!PROXY.host) return null
+  try { return await socksHttpGet2(host, reqText, { timeoutMs: 10000 }) } catch (e) { return null }
+}
+
+// ========================= ПРОКСИ: свой SOCKS5, резервные хосты, диагностика =========================
+// v3.13.0. Повод — лог 21:19:
+//   [r1a1] socks fail: Socks5 proxy rejected connection - ConnectionRefused
+//   IP до ротации: ?            <- IP не определялся, потому что он спрашивался ЧЕРЕЗ тот же мёртвый прокси
+//   changeIp: direct:200 body=<!DOCTYPE html> ...   <- ссылка смены IP вернула HTML-страницу, не JSON
+// Вывод: мобильный прокси MobileProxy.Space (bproxy.site:23750) не принимал TCP-соединения —
+// аренда истекла / порт выключен /Equipment выключено. Код при этом продолжал «крутить IP»
+// и молча показывать «?». Теперь:
+//   1) свой SOCKS5-клиент (не зависит от модуля socks) — умеет и handshake, и понятные ошибки;
+//   2) резервные хосты: у MobileProxy.Space тот же порт слушают bproxy.site (SOCKS5) и
+//      mproxy.site (HTTP), плюс IP из DNS — пробуем всё по очереди и запоминаем живой;
+//   3) currentIp() умеет работать НАПРЯМУЮ, когда прокси мёртв (иначе везде «?»);
+//   4) ссылка смены IP запрашивается с format=json и браузерным User-Agent, ответ
+//      разбирается: {"status":"OK","new_ip":...,"rt":...} / «30 seconds» / HTML;
+//   5) node main.js --proxy-check — полная диагностика с подсказками.
+
+function isIpV4(s) { return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s || '').trim()) }
+
+// bproxy.site <-> mproxy.site (http-хост того же порта у MobileProxy.Space)
+function altHostOf(host) {
+  const h = String(host || '').toLowerCase()
+  if (h.startsWith('bproxy.')) return 'mproxy.' + h.slice(7)
+  if (h.startsWith('mproxy.')) return 'bproxy.' + h.slice(7)
+  return null
+}
+// список хостов-кандидатов для одного порта: рабочий раньше -> из конфига -> запасной
+function proxyHostCandidates(host) {
+  const out = []
+  const push = h => { h = String(h || '').trim().toLowerCase(); if (h && out.indexOf(h) < 0) out.push(h) }
+  push(PROXY_OK_HOST)
+  push(host || PROXY.host)
+  push(altHostOf(host || PROXY.host))
+  return out
+}
+
+function readExact(sock, n, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0), to = null
+    const onData = d => {
+      buf = Buffer.concat([buf, d])
+      if (buf.length >= n) {
+        const extra = buf.slice(n)
+        cleanup()
+        // ВАЖНО: возвращаем «лишние» байты в сокет, иначе следующий слушатель
+        // (mineflayer после CONNECT) потеряет начало данных сервера, если они
+        // пришли одним TCP-сегментом с SOCKS-ответом.
+        if (extra.length) { try { sock.unshift(extra) } catch (e) {} }
+        resolve(buf.slice(0, n))
+      }
+    }
+    const onErr = e => { cleanup(); reject(new Error((label || 'read') + ': ' + e.message)) }
+    const onEnd = () => { cleanup(); reject(new Error((label || 'read') + ': соединение закрыто (недополучено ' + (n - buf.length) + ' байт)')) }
+    const cleanup = () => { try { clearTimeout(to) } catch (e) {}; sock.removeListener('data', onData); sock.removeListener('error', onErr); sock.removeListener('end', onEnd) }
+    to = setTimeout(() => { cleanup(); reject(new Error((label || 'read') + ': таймаут ' + Math.round(timeoutMs / 1000) + 'с')) }, timeoutMs)
+    sock.on('data', onData); sock.on('error', onErr); sock.on('end', onEnd)
   })
 }
-async function currentIp() { return await socksHttpGet('api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n') }
 
-async function rotateIp() {
-  if (!PROXY.changeIpUrl || PROXY.changeIpUrl.includes('YOUR_KEY')) { currentRunIp = await currentIp(); return currentRunIp }
+// Полный SOCKS5-handshake своими силами: greeting -> auth -> CONNECT.
+// Возвращает живой net.Socket до цели. Ошибки — человекочитаемые (для лога и --proxy-check).
+function socks5Open(pxy, destHost, destPort, timeoutMs) {
+  timeoutMs = timeoutMs || 15000
+  return new Promise((resolve, reject) => {
+    let sock = null
+    try {
+      sock = net.connect({ host: pxy.host, port: Number(pxy.port) })
+    } catch (e) { reject(e instanceof Error ? e : new Error(String(e))); return }
+
+    let settled = false
+    let buf = Buffer.alloc(0)          // единый буфер: данные не теряются между чтениями
+    let need = 0, onHave = null, onWantReject = null
+    const fail = e => {
+      if (settled) return
+      settled = true; try { clearTimeout(to) } catch (x) {}
+      const r = onWantReject; onHave = null; onWantReject = null
+      try { sock.destroy() } catch (x) {}
+      if (r) r(e instanceof Error ? e : new Error(String(e)))
+      else reject(e instanceof Error ? e : new Error(String(e)))
+    }
+    const to = setTimeout(() => fail(new Error('таймаут подключения к прокси ' + Math.round(timeoutMs / 1000) + 'с')), timeoutMs)
+    sock.setTimeout(timeoutMs, () => fail(new Error('таймаут сокета прокси')))
+    sock.on('error', e => {
+      const m = String(e.message || e); let msg = m
+      if (e.code === 'ECONNREFUSED') msg = 'прокси ' + pxy.host + ':' + pxy.port + ' ОТКАЗАЛ в соединении (ECONNREFUSED) — порт не слушает: аренда истекла / прокси выключен / неверный порт'
+      else if (e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN') msg = 'не удалось определить адрес ' + pxy.host + ' (' + e.code + ') — DNS/интернет'
+      else if (e.code === 'ETIMEDOUT' || e.code === 'EHOSTUNREACH' || e.code === 'ENETUNREACH') msg = pxy.host + ':' + pxy.port + ' недоступен (' + e.code + ') — файрвол/провайдер блокирует порт, или прокси выключен'
+      fail(new Error(msg))
+    })
+    const onEnd = () => fail(new Error('прокси закрыл соединение до завершения handshake'))
+    sock.on('end', onEnd)
+    // постоянный слушатель: копит байты, отдаёт текущему «хочу N байт»
+    const onData = d => {
+      buf = Buffer.concat([buf, d])
+      if (onHave && buf.length >= need) {
+        const chunk = buf.slice(0, need); buf = buf.slice(need)
+        const cb = onHave; onHave = null; onWantReject = null
+        cb(chunk)
+      }
+    }
+    sock.on('data', onData)
+    const read = (n, label) => new Promise((res, rej) => {
+      if (settled) { rej(new Error(label + ': сокет уже закрыт')); return }
+      if (buf.length >= n) { const c = buf.slice(0, n); buf = buf.slice(n); res(c); return }
+      need = n; onHave = res; onWantReject = rej
+    })
+
+    sock.once('connect', async () => {
+      try {
+        const user = pxy.userId || pxy.username || ''
+        const pass = pxy.password || ''
+        const auth = !!(user || pass)
+        sock.write(auth ? Buffer.from([0x05, 0x02, 0x00, 0x02]) : Buffer.from([0x05, 0x01, 0x00]))
+        const g = await read(2, 'SOCKS greeting')
+        if (g[0] !== 0x05) throw new Error('это не SOCKS5 (первый байт 0x' + g[0].toString(16) + ') — вероятно, порт HTTP-прокси')
+        if (g[1] === 0xff) throw new Error('прокси не принял ни один метод авторизации (0xFF)')
+        if (g[1] === 0x02) {
+          const ub = Buffer.from(String(user), 'utf8'), pb = Buffer.from(String(pass), 'utf8')
+          sock.write(Buffer.concat([Buffer.from([0x01, ub.length & 255]), ub, Buffer.from([pb.length & 255]), pb]))
+          const ab = await read(2, 'SOCKS auth')
+          if (ab[0] !== 0x01) throw new Error('мусор в ответе авторизации SOCKS')
+          if (ab[1] !== 0x00) throw new Error('прокси ОТВЕРГ логин/пароль (status 0x' + ab[1].toString(16) + ')')
+        }
+        // CONNECT
+        const h = String(destHost)
+        let head
+        if (isIpV4(h)) head = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), Buffer.from(h.split('.').map(x => Number(x) & 255))])
+        else { const hb = Buffer.from(h, 'utf8'); head = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length & 255]), hb]) }
+        const pb = Buffer.alloc(2); pb.writeUInt16BE(Number(destPort) & 0xffff, 0)
+        sock.write(Buffer.concat([head, pb]))
+        const rp = await read(4, 'SOCKS reply')
+        if (rp[0] !== 0x05) throw new Error('мусор в ответе SOCKS (0x' + rp[0].toString(16) + ')')
+        const code = rp[1]
+        if (code !== 0x00) {
+          const names = { 1: 'общий сбой прокси', 2: 'соединение ЗАПРЕЩЕНО правилами прокси', 3: 'сеть недоступна', 4: 'хост недоступен', 5: 'отказано в соединении с целью', 6: 'TTL истёк', 7: 'команда не поддержана', 8: 'тип адреса не поддержан' }
+          throw new Error('SOCKS5 отказ 0x' + code.toString(16) + ' — ' + (names[code] || 'неизвестно') + (code === 2 ? ' (обычно неверный логин/пароль или привязка по IP)' : '') + (code === 5 ? ' (цель ' + destHost + ':' + destPort + ' не пускает)' : ''))
+        }
+        const at = rp[3]
+        if (at === 1) await read(4 + 2, 'SOCKS bind')
+        else if (at === 4) await read(16 + 2, 'SOCKS bind')
+        else if (at === 3) { const lb = await read(1, 'SOCKS bind-len'); await read(lb[0] + 2, 'SOCKS bind') }
+        else throw new Error('непонятный тип адреса 0x' + at.toString(16))
+
+        // handshake завершён: снимаем свой слушатель и возвращаем «лишние» байты в сокет,
+        // чтобы mineflayer получил всё, что сервер прислал сразу за SOCKS-ответом.
+        if (settled) return
+        settled = true; clearTimeout(to); try { sock.setTimeout(0) } catch (e) {}
+        sock.removeListener('data', onData)
+        sock.removeListener('end', onEnd)
+        if (buf.length) { try { sock.unshift(buf) } catch (e) {} }
+        buf = Buffer.alloc(0)
+        resolve(sock)
+      } catch (e) { fail(e) }
+    })
+  })
+}
+
+// HTTP-запрос через уже открытый туннель (сокеты после socks5Open / httpConnect)
+function httpThrough(sock, host, reqText, timeoutMs) {
+  timeoutMs = timeoutMs || 10000
+  return new Promise(resolve => {
+    let data = '', fin = false
+    const end = v => { if (fin) return; fin = true; try { clearTimeout(t) } catch (e) {}; try { sock.destroy() } catch (e) {}; resolve(v) }
+    const t = setTimeout(() => end(data), timeoutMs)
+    sock.on('data', d => {
+      data += d.toString('utf8')
+      if (data.indexOf('\r\n\r\n') >= 0) {
+        const body = data.split('\r\n\r\n').slice(1).join('\r\n\r\n')
+        if (body.trim()) end(body.trim())
+      }
+      if (data.length > 200000) end(data)
+    })
+    sock.on('error', () => end(data))
+    sock.on('end', () => end(data))
+    try { sock.write(reqText) } catch (e) { end('') }
+  })
+}
+
+// HTTP-прокси методом CONNECT (mproxy.site — тот же порт, но протокол HTTP)
+function httpConnect(pxy, destHost, destPort, timeoutMs) {
+  timeoutMs = timeoutMs || 15000
+  return new Promise((resolve, reject) => {
+    let sock = null
+    try { sock = net.connect({ host: pxy.host, port: Number(pxy.port) }) } catch (e) { reject(e); return }
+    let done = false
+    const fail = e => { if (done) return; done = true; try { clearTimeout(to) } catch (x) {}; try { sock.destroy() } catch (x) {}; reject(e instanceof Error ? e : new Error(String(e))) }
+    const to = setTimeout(() => fail(new Error('таймаут HTTP CONNECT ' + Math.round(timeoutMs / 1000) + 'с')), timeoutMs)
+    sock.once('error', e => fail(new Error('HTTP-прокси ' + pxy.host + ':' + pxy.port + ': ' + (e.code === 'ECONNREFUSED' ? 'ОТКАЗ в соединении (порт не слушает)' : e.message))))
+    let head = 'CONNECT ' + destHost + ':' + destPort + ' HTTP/1.1\r\nHost: ' + destHost + ':' + destPort + '\r\n'
+    if (pxy.userId || pxy.username) head += 'Proxy-Authorization: Basic ' + Buffer.from((pxy.userId || pxy.username) + ':' + (pxy.password || '')).toString('base64') + '\r\n'
+    head += '\r\n'
+    sock.once('connect', () => { try { sock.write(head) } catch (e) { fail(e) } })
+    let buf = Buffer.alloc(0)
+    const onData = d => {
+      buf = Buffer.concat([buf, d])
+      const i = buf.indexOf('\r\n\r\n')
+      if (i < 0) { if (buf.length > 65536) fail(new Error('HTTP-прокси: мусор вместо ответа CONNECT')); return }
+      sock.removeListener('data', onData)
+      const line = buf.slice(0, i).toString('latin1').split('\r\n')[0]
+      if (done) return
+      done = true; clearTimeout(to)
+      if (!/ 200\b/.test(line)) { try { sock.destroy() } catch (e) {}; reject(new Error('HTTP-прокси ответил «' + line.slice(0, 60) + '»' + (/ 407\b/.test(line) ? ' — неверный логин/пароль' : ''))); return }
+      const rest = buf.slice(i + 4)          // «лишние» байты — назад в сокет без потерь
+      if (rest.length) { try { sock.unshift(rest) } catch (e) {} }
+      resolve(sock)
+    }
+    sock.on('data', onData)
+  })
+}
+
+// туннель к цели: сначала SOCKS5, при неудаче — HTTP CONNECT (если host похож на mproxy)
+async function proxyTunnel(destHost, destPort, opt) {
+  opt = opt || {}
+  const pxy = { host: opt.host || PROXY.host, port: opt.port || PROXY.port, userId: opt.username !== undefined ? opt.username : PROXY.username, password: opt.password !== undefined ? opt.password : PROXY.password }
+  const timeoutMs = opt.timeoutMs || 15000
+  if (!pxy.host) throw new Error('нет proxy.host в конфиге')
+  if (opt.method === 'http') return await httpConnect(pxy, destHost, destPort, timeoutMs)
+  try {
+    return await socks5Open(pxy, destHost, destPort, timeoutMs)
+  } catch (e) {
+    const alt = opt.allowAlt === false ? null : altHostOf(pxy.host)
+    if (alt && /ОТКАЗАЛ|не удалось определить|недоступен|не SOCKS5/i.test(e.message)) {
+      try { return await httpConnect(Object.assign({}, pxy, { host: alt }), destHost, destPort, timeoutMs) } catch (e2) { throw e }
+    }
+    throw e
+  }
+}
+
+async function socksHttpGet2(host, reqText, opt) {
+  const sock = await proxyTunnel(host, 80, opt)
+  return await httpThrough(sock, host, reqText, (opt && opt.timeoutMs) || 10000)
+}
+
+let PROXY_OK_HOST = null          // хост, через который реально удалось пройти
+let PROXY_STATE = 'unknown'       // unknown | alive | dead
+const PROXY_ERRS = []             // последние ошибки (для --proxy-check и Telegram-чата)
+function rememberProxyErr(host, e) {
+  PROXY_ERRS.push({ host: host || PROXY.host, msg: String((e && e.message) || e), ts: Date.now() })
+  if (PROXY_ERRS.length > 12) PROXY_ERRS.shift()
+}
+
+// живой прокси: пробуем запомненный хост, затем из конфига, затем запасной (mproxy/bproxy)
+async function proxyConnect(destHost, destPort, timeoutMs) {
+  const hosts = proxyHostCandidates()
+  let last = null
+  for (const h of hosts) {
+    try {
+      const sock = await socks5Open({ host: h, port: PROXY.port, userId: PROXY.username, password: PROXY.password }, destHost, destPort, timeoutMs || 15000)
+      if (PROXY_OK_HOST !== h) {
+        if (PROXY_OK_HOST) step('прокси: хост ' + (PROXY_OK_HOST) + ' не отвечает — работаю через ' + h)
+        PROXY_OK_HOST = h
+      }
+      PROXY_STATE = 'alive'
+      return sock
+    } catch (e) { last = e; rememberProxyErr(h, e) }
+  }
+  PROXY_STATE = 'dead'
+  throw last || new Error('прокси недоступен')
+}
+
+// внешний IP: через прокси (это IP забега), при неудаче — напрямую (чтобы в логе не было «?»)
+async function currentIp(opts) {
+  opts = opts || {}
+  if (!opts.directOnly) {
+    try {
+      const body = await socksHttpGet2('api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n', { timeoutMs: opts.timeoutMs || 10000 })
+      const m = String(body || '').trim().match(/^\s*(\d{1,3}(?:\.\d{1,3}){3})\s*$/)
+      if (m) { PROXY_STATE = 'alive'; return m[1] }
+    } catch (e) { if (!PROXY_ERRS.length || PROXY_ERRS[PROXY_ERRS.length - 1].msg !== String(e.message)) rememberProxyErr(PROXY_OK_HOST || PROXY.host, e) }
+  }
+  if (opts.proxyOnly) return null
+  try {
+    const r = await plainGet('https://api.ipify.org', 8000)
+    const m = String(r.body || '').trim().match(/^<?\s*(\d{1,3}(?:\.\d{1,3}){3})\s*>?$/)
+    if (m) { if (opts.tagDirect !== false) step('IP определён НАПРЯМУЮ (прокси не отвечает): ' + m[1]); return m[1] }
+  } catch (e) {}
+  return null
+}
+
+// разбираем ответ ссылки смены IP. Чистые функции — покрыты selftest.
+function parseChangeIpResponse(status, body, url) {
+  const out = { status: Number(status) || 0, kind: 'unknown', newIp: null, rt: null, rateLimited: false, title: '', text: '', hint: '' }
+  const raw = String(body == null ? '' : body)
+  out.text = raw.replace(/\s+/g, ' ').trim().slice(0, 200)
+  const low = raw.toLowerCase()
+  if (low.indexOf('<!doctype html') >= 0 || low.indexOf('<html') >= 0) {
+    out.kind = 'html'
+    const t = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+    out.title = t ? t[1].replace(/\s+/g, ' ').trim().slice(0, 90) : ''
+    const isMps = /mobileproxy\.space|changeip\./i.test(String(url || ''))
+    out.hint = isMps
+      ? 'ссылка вернула ВЕБ-СТРАНИЦУ («' + (out.title || 'без заголовка') + '»), а не ответ API. Возьмите ссылку в панели «Мои прокси» → колонка «Смена IP» и добавьте &format=json'
+      : 'ссылка вернула ВЕБ-СТРАНИЦУ («' + (out.title || 'без заголовка') + '»), а не JSON/текст — похоже, это не API смены IP (или нужна авторизация)'
+    return out
+  }
+  const jm = raw.match(/\{[\s\S]*\}/)
+  if (jm) {
+    try {
+      const j = JSON.parse(jm[0])
+      out.kind = 'json'
+      out.newIp = isIpV4(j.new_ip || j.newIp || j.ip || j.newip) ? String(j.new_ip || j.newIp || j.ip || j.newip) : null
+      out.rt = j.rt !== undefined ? String(j.rt) : null
+      out.status0 = j.status !== undefined ? String(j.status) : null
+      const s = String(j.status || j.error || j.message || '').toLowerCase()
+      if (/30\s*(сек|sec|second)|часто|too\s*often|rate|limit|ждите|подождите/i.test(s + ' ' + out.text.toLowerCase())) out.rateLimited = true
+      if (!out.newIp) { const m = out.text.match(/(\d{1,3}(?:\.\d{1,3}){3})/); if (m && isIpV4(m[1])) out.newIp = m[1] }
+      if (out.rateLimited) out.hint = 'прокси меняет IP не чаще раза в 30 секунд — запрос отброшен, ждём'
+      else if (j.status && !/^ok$/i.test(String(j.status))) out.hint = 'API ответил status=' + j.status + (j.error ? ' error=' + j.error : '')
+      return out
+    } catch (e) { /* не JSON — падём ниже */ }
+  }
+  const m = raw.match(/(\d{1,3}(?:\.\d{1,3}){3})/)
+  if (m && isIpV4(m[1])) { out.kind = 'ip'; out.newIp = m[1]; return out }
+  if (/30\s*(сек|sec|second)|часто|too\s*often|rate|limit/i.test(low)) { out.kind = 'rate'; out.rateLimited = true; out.hint = 'слишком частая смена IP (лимит 30 секунд)'; return out }
+  if (/ok|success|changed|сменен|изменен/i.test(low)) { out.kind = 'ok-text'; return out }
+  out.kind = raw.trim() ? 'text' : 'empty'
+  if (!raw.trim()) out.hint = 'пустой ответ — ссылка не сработала'
+  return out
+}
+
+// дописать format=json к ссылке смены IP (MobileProxy.Space умеет отдавать JSON)
+function ensureJsonParam(url) {
+  const u = String(url || '')
+  if (!u) return u
+  if (/[?&]format=/i.test(u)) return u
+  return u + (u.indexOf('?') >= 0 ? '&' : '?') + 'format=json'
+}
+// человекочитаемое «что это за ссылка»
+function describeChangeIpUrl(u) {
+  const s = String(u || '')
+  if (!s) return 'не задана (proxy.changeIpUrl)'
+  if (/changeip\.mobileproxy\.space/i.test(s)) return 'API MobileProxy.Space (changeip.mobileproxy.space)'
+  if (/mobileproxy\.space/i.test(s)) return 'сайт MobileProxy.Space'
+  try { const p = new URL(s); return p.host + p.pathname } catch (e) { return s.slice(0, 60) }
+}
+
+let lastChangeAt = 0        // ссылка смены IP: минимум 30 секунд между запросами (лимит провайдера)
+let lastChangeWasLimited = false
+const CHANGE_IP_MIN_MS = 30000
+
+// Быстрая проверка «жив ли прокси» — до старта, чтобы не жечь 6 ротаций впустую.
+async function proxyAlive(timeoutMs) {
+  if (!PROXY.host) return false
+  try { await proxyConnect('api.ipify.org', 80, timeoutMs || 7000); return true } catch (e) { return false }
+}
+
+// подсказка к ошибке прокси — прямо в лог раунда (раньше было просто «socks: ...»)
+function socksHint(msg) {
+  const s = String(msg || '')
+  if (/ConnectionRefused|ECONNREFUSED|ОТКАЗАЛ/i.test(s)) return [
+    '🔌 прокси ' + (PROXY_OK_HOST || PROXY.host) + ':' + PROXY.port + ' не принимает соединения (порт не слушает).',
+    '   Чаще всего это значит: аренда мобильного прокси истекла или порт выключен.',
+    '   Что сделать:',
+    '     1) node main.js --proxy-check   — полная диагностика (DNS, SOCKS5, HTTP-резерв, ссылка смены IP, пинг MC-сервера)',
+    '     2) панель провайдера → «Мои прокси»: проверить срок аренды, нажать «Renew» / «Перезагрузить оборудование» / «Сменить оборудование»',
+    '     3) сверить proxy.host / proxy.port / логин / пароль в config.json со свежими данными из панели',
+    '     4) если прокси больше не нужен — уберите секцию proxy из config.json (бот пойдёт напрямую)'
+  ].join('\n')
+  if (/ОТВЕРГ логин|407|неверный логин|ПРАВИЛАМИ|запрещено|0x02/i.test(s)) return [
+    '🔐 прокси не принял авторизацию/правила.',
+    '   Проверьте proxy.username и proxy.password в config.json (свежие — в панели провайдера),',
+    '   и не включена ли у провайдера привязка по IP (тогда ваш IP нужно добавить в белый список).',
+    '   Диагностика: node main.js --proxy-check'
+  ].join('\n')
+  if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|недоступен|таймаут/i.test(s)) return [
+    '⏳ прокси ' + (PROXY_OK_HOST || PROXY.host) + ':' + PROXY.port + ' не отвечает (таймаут/недоступен).',
+    '   Варианты: прокси выключен, ваш провайдер/файрвол блокирует исходящие на этот порт,',
+    '   или оборудование «зависло» — в панели провайдера нажмите «Перезагрузить оборудование».',
+    '   Диагностика: node main.js --proxy-check'
+  ].join('\n')
+  if (/не SOCKS5|первый байт/i.test(s)) return [
+    '🔀 порт отвечает, но это не SOCKS5. У MobileProxy.space порт один на два протокола:',
+    '   SOCKS5-хост bproxy.site, HTTP-хост mproxy.site. Бот пробует оба сам.',
+    '   Диагностика: node main.js --proxy-check'
+  ].join('\n')
+  if (/ENOTFOUND|EAI_AGAIN|определить адрес/i.test(s)) return [
+    '🌐 не удалось определить адрес ' + (PROXY_OK_HOST || PROXY.host) + ' (DNS).',
+    '   Проверьте интернет и DNS; при необходимости пропишите proxy.host IP-адресом из панели.'
+  ].join('\n')
+  return ''
+}
+
+async function rotateIp(opt) {
+  opt = opt || {}
+  const url = String(PROXY.changeIpUrl || '').trim()
+  if (!url || url.includes('YOUR_KEY')) { currentRunIp = await currentIp(); return currentRunIp }
+
+  // сначала убеждаемся, что прокси вообще жив: иначе «IP не сменился» — это не про IP,
+  // а про то, что спросить не у кого (в логе 21:19 было именно так: везде «?»)
+  const alive = await proxyAlive(7000)
+  if (!alive) {
+    step('⚠️ прокси ' + (PROXY_OK_HOST || PROXY.host) + ':' + PROXY.port + ' НЕ отвечает — IP через него не узнать' + (PROXY_ERRS.length ? ' (' + PROXY_ERRS[PROXY_ERRS.length - 1].msg.slice(0, 120) + ')' : ''))
+    if (!opt.quiet) { const h = socksHint(PROXY_ERRS.length ? PROXY_ERRS[PROXY_ERRS.length - 1].msg : 'ECONNREFUSED'); if (h) h.split('\n').forEach(l => step('   ' + l)) }
+  }
+
   for (let round = 1; round <= 2; round++) {
-    const oldIp = await currentIp()
-    step('IP до ротации: ' + (oldIp || '?'))
-    let hit = 'fail', ok = false
+    const oldIp = await currentIp({ quiet: true })
+    step('IP до ротации: ' + (oldIp || '?') + (PROXY_STATE === 'dead' ? ' (напрямую — прокси мёртв)' : ''))
+
+    // лимит провайдера: 30 секунд между сменами IP (иначе запрос молча отбрасывается)
+    const since = Date.now() - lastChangeAt
+    if (lastChangeAt && since < CHANGE_IP_MIN_MS && !opt.force) {
+      const w = Math.ceil((CHANGE_IP_MIN_MS - since) / 1000)
+      step('⏱ смена IP была ' + Math.round(since / 1000) + 'с назад — лимит провайдера 30с, жду ' + w + 'с')
+      await sleep(CHANGE_IP_MIN_MS - since + 300)
+    }
+
+    // API MobileProxy.Space отдаёт JSON, если попросить format=json, и требует браузерный User-Agent
+    const reqUrl = ensureJsonParam(url)
+    if (reqUrl !== url) dbg('changeIp: добавил format=json → ' + reqUrl.slice(0, 120))
+    let res = null, p = null, hit = 'fail'
     for (let t = 1; t <= 2; t++) {
       try {
-        const r = await plainGet(PROXY.changeIpUrl, 15000)
-        const body = String(r.body || '').replace(/\s+/g, ' ').slice(0, 90)
-        hit = 'direct:' + r.status + (body ? ' body=' + body : ''); ok = r.status >= 200 && r.status < 400
-      } catch (e) { hit = 'direct:ERR ' + ((e && e.message) || e); ok = false }
-      if (ok) break
-      if (t < 2) { step('changeIp ' + t + ' не удалась, повтор'); await sleep(3000) }
+        res = await plainGet(reqUrl, 15000)
+        p = parseChangeIpResponse(res.status, res.body, reqUrl)
+        hit = 'HTTP ' + res.status + ' → ' + p.kind +
+          (p.newIp ? ' new_ip=' + p.newIp : '') + (p.rt ? ' rt=' + p.rt + 'с' : '') +
+          (p.title ? ' title=«' + p.title + '»' : '') +
+          (p.kind === 'text' || p.kind === 'ok-text' ? ' «' + p.text.slice(0, 60) + '»' : '')
+        if (res.status >= 200 && res.status < 400 && p.kind !== 'html' && p.kind !== 'empty') break
+        if (p.kind === 'html' || p.kind === 'empty') break   // повторять бессмысленно — ссылка не та
+      } catch (e) { hit = 'ERR ' + ((e && e.message) || e); p = null }
+      if (t < 2) { step('changeIp: ' + hit + ' — повтор через 3с'); await sleep(3000) }
     }
-    step('changeIp: ' + hit)
-    const t0 = Date.now(); let newIp = null
-    const waitMs = Math.max(8000, (Number(PROXY.waitSec) || 12) * 1000)
-    while (Date.now() - t0 < waitMs) { await sleep(2000); newIp = await currentIp(); if (newIp && (!oldIp || newIp !== oldIp)) break }
+    lastChangeAt = Date.now()
+    step('changeIp (' + describeChangeIpUrl(reqUrl) + '): ' + hit)
+    if (p && p.hint) step('  ℹ️ ' + p.hint)
+    if (p && p.kind === 'html') {
+      step('  ⚠️ IP так НЕ меняют: сервер отдал веб-страницу. Нужна ссылка из панели «Мои прокси» → колонка «Смена IP»' +
+        ' (вид https://changeip.mobileproxy.space/?proxy_key=XXXX), желательно с &format=json.')
+      step('  ⚠️ Без рабочей смены IP бот будет каждый раз заходить с одного и того же адреса — FunTime его быстро забанит.')
+      // ссылка заведомо не рабочая — ждать смену и крутить второй круг бессмысленно
+      currentRunIp = oldIp || await currentIp({ quiet: true })
+      return currentRunIp
+    }
+    lastChangeWasLimited = !!(p && p.rateLimited)
+
+    // ждём подтверждения: сначала из ответа API (быстро и не зависит от прокси), потом опросом
+    const t0 = Date.now(); let newIp = (p && p.newIp) || null
+    const waitMs = Math.max(8000, (Number(PROXY.waitSec) || 12) * 1000) * (lastChangeWasLimited ? 2 : 1)
+    while (!(newIp && (!oldIp || newIp !== oldIp)) && Date.now() - t0 < waitMs) {
+      await sleep(2000)
+      const q = await currentIp({ quiet: true })
+      if (q && (!oldIp || q !== oldIp)) newIp = q
+    }
     if (newIp && (!oldIp || newIp !== oldIp)) {
       if (oldIp && badIPs.has(newIp)) { step('новый IP ' + newIp + ' уже плох — кручу'); continue }
-      step('IP СМЕНЁН: ' + (oldIp || '?') + ' -> ' + newIp)
+      step('IP СМЕНЁН: ' + (oldIp || '?') + ' -> ' + newIp + (PROXY_STATE === 'dead' ? ' (⚠️ сам прокси по-прежнему не отвечает — раунд не подключится)' : ''))
       currentRunIp = newIp; return newIp
     }
-    step('IP не сменился')
+    if (PROXY_STATE === 'dead') step('IP не сменился: прокси мёртв, проверить смену нечем → node main.js --proxy-check')
+    else step('IP не сменился' + (lastChangeWasLimited ? ' (лимит 30с — следующий запрос пройдёт)' : ' (провайдер иногда выдаёт тот же адрес — это нормально, пробую ещё раз)'))
   }
-  currentRunIp = await currentIp(); return currentRunIp
+  currentRunIp = await currentIp({ quiet: true }); return currentRunIp
+}
+
+// ========================= ДИАГНОСТИКА ПРОКСИ: node main.js --proxy-check =========================
+async function mcStatusPing(sock, timeoutMs) {
+  const varint = n => { const b = []; do { let x = n & 0x7f; n >>>= 7; if (n) x |= 0x80; b.push(x) } while (n); return Buffer.from(b) }
+  const pkt = body => Buffer.concat([varint(body.length), body])
+  const hsBody = Buffer.concat([
+    varint(0x00), varint(767), varint(Buffer.byteLength(MC.host)), Buffer.from(MC.host, 'utf8'),
+    (() => { const b = Buffer.alloc(2); b.writeUInt16BE(MC.port, 0); return b })(), varint(1)
+  ])
+  return new Promise(resolve => {
+    let done = false, buf = Buffer.alloc(0), t0 = Date.now()
+    const fin = r => { if (done) return; done = true; try { clearTimeout(to) } catch (e) {}; try { sock.destroy() } catch (e) {}; resolve(r) }
+    const to = setTimeout(() => fin({ ok: false, err: 'таймаут ' + Math.round((timeoutMs || 12000) / 1000) + 'с' }), timeoutMs || 12000)
+    sock.on('error', e => fin({ ok: false, err: e.message }))
+    sock.on('data', d => {
+      buf = Buffer.concat([buf, d])
+      if (buf.length < 3) return
+      let len = 0, shift = 0, i = 0
+      for (; i < Math.min(5, buf.length); i++) { const b = buf[i]; len |= (b & 0x7f) << shift; shift += 7; if (!(b & 0x80)) { i++; break } }
+      if (buf.length < i + len) return
+      const s = buf.slice(i, i + len).toString('utf8')
+      const m = s.match(/\{[\s\S]*\}/)
+      if (m) {
+        let j = null; try { j = JSON.parse(m[0]) } catch (e) {}
+        fin({ ok: true, ms: Date.now() - t0, json: j })
+      } else fin({ ok: true, ms: Date.now() - t0, raw: s.slice(0, 120) })
+    })
+    try { sock.write(Buffer.concat([pkt(hsBody), pkt(Buffer.from([0x00]))])) } catch (e) { fin({ ok: false, err: 'write: ' + e.message }) }
+  })
+}
+
+async function runProxyCheck() {
+  const L = []
+  const say = s => { L.push(s); step(s) }
+  say('=== ДИАГНОСТИКА ПРОКСИ (v3.13.0) ===')
+  if (!PROXY.host) {
+    say('❌ в config.json нет proxy.host — бот ходит на сервер НАПРЯМУЮ.')
+    say('   Если FunTime банит ваш IP, пропишите мобильный прокси: "proxy": { "host": "bproxy.site", "port": 23750, "username": "...", "password": "..." }')
+    return false
+  }
+  say('прокси из config.json : ' + PROXY.host + ':' + PROXY.port + ' | логин ' + (PROXY.username ? '«' + PROXY.username + '» (есть)' : 'НЕТ') + ' | пароль ' + (PROXY.password ? 'есть' : 'НЕТ'))
+  say('ссылка смены IP       : ' + describeChangeIpUrl(PROXY.changeIpUrl) + (PROXY.changeIpUrl ? ' → ' + PROXY.changeIpUrl : ''))
+  say('модуль socks          : ' + (SocksClient ? 'установлен' : 'НЕТ (используется встроенный SOCKS5-клиент)'))
+
+  // 1. DNS
+  const hosts = proxyHostCandidates(PROXY.host)
+  say('')
+  say('--- 1. DNS ---')
+  for (const h of hosts) {
+    const ips = await new Promise(r => dns.lookup(h, { all: true, verbatim: true }, (e, a) => r(e ? null : a.map(x => x.address))))
+    say('  ' + h.padEnd(22) + (ips ? '→ ' + ips.join(', ') : '❌ не определяется (нет интернета/DNS или домен не существует)'))
+  }
+
+  // 2. прямой интернет
+  say('')
+  say('--- 2. интернет без прокси ---')
+  const directIp = await currentIp({ directOnly: true })
+  say('  ' + (directIp ? '✅ ваш IP напрямую: ' + directIp : '❌ не удалось выйти в интернет даже напрямую (api.ipify.org недоступен) — проверьте сеть/файрвол'))
+
+  // 3. SOCKS5 по всем кандидатам
+  say('')
+  say('--- 3. SOCKS5 handshake (подключение к api.ipify.org:80) ---')
+  let liveHost = null, liveIp = null, errs = []
+  for (const h of hosts) {
+    const t0 = Date.now()
+    try {
+      const sock = await socks5Open({ host: h, port: PROXY.port, userId: PROXY.username, password: PROXY.password }, 'api.ipify.org', 80, 10000)
+      const body = await httpThrough(sock, 'api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n', 10000)
+      const ip = String(body || '').trim()
+      say('  ✅ ' + h + ':' + PROXY.port + ' РАБОТАЕТ за ' + (Date.now() - t0) + 'мс → внешний IP ' + (isIpV4(ip) ? ip : '«' + ip.slice(0, 40) + '»'))
+      if (!liveHost) { liveHost = h; liveIp = isIpV4(ip) ? ip : null }
+    } catch (e) { errs.push({ host: h, msg: String(e.message || e) }); say('  ❌ ' + h + ':' + PROXY.port + ' — ' + String(e.message || e).slice(0, 160)) }
+  }
+
+  // 4. HTTP CONNECT на запасном хосте
+  if (!liveHost) {
+    const alt = altHostOf(PROXY.host) || PROXY.host
+    say('')
+    say('--- 4. HTTP CONNECT (протокол HTTP на том же порту) ---')
+    const t0 = Date.now()
+    try {
+      const sock = await httpConnect({ host: alt, port: PROXY.port, userId: PROXY.username, password: PROXY.password }, 'api.ipify.org', 80, 10000)
+      const body = await httpThrough(sock, 'api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n', 10000)
+      const ip = String(body || '').trim()
+      say('  ✅ HTTP-прокси ' + alt + ':' + PROXY.port + ' работает за ' + (Date.now() - t0) + 'мс → ' + ip.slice(0, 40))
+      say('  ℹ️ значит прокси ЖИВ, но в config.json нужен host=' + alt + ' (SOCKS5-порт у провайдера может отличаться)')
+    } catch (e) { say('  ❌ ' + alt + ':' + PROXY.port + ' — ' + String(e.message || e).slice(0, 160)) }
+  }
+
+  // 5. внешний IP через прокси (после выбора живого хоста)
+  if (liveHost) { PROXY_OK_HOST = liveHost; PROXY_STATE = 'alive' } else PROXY_STATE = 'dead'
+  say('')
+  say('--- 5. внешний IP ---')
+  say('  через прокси : ' + (liveIp || '—') + (liveHost ? '  (хост ' + liveHost + ')' : ''))
+  say('  напрямую     : ' + (directIp || '—'))
+  if (liveIp && directIp) say(liveIp === directIp ? '  ⚠️ IP совпадают — прокси не подменяет адрес (трафик идёт мимо него?)' : '  ✅ IP разные — трафик действительно идёт через прокси')
+
+  // 6. ссылка смены IP
+  say('')
+  say('--- 6. ссылка смены IP ---')
+  let ch = null, chUrl = ''
+  if (!PROXY.changeIpUrl || /YOUR_KEY/.test(PROXY.changeIpUrl)) {
+    say('  ⚠️ proxy.changeIpUrl не задан — IP меняться не будет, бот каждый раз заходит с одного адреса')
+  } else {
+    chUrl = ensureJsonParam(PROXY.changeIpUrl)
+    say('  проверяю: ' + chUrl + (chUrl !== PROXY.changeIpUrl ? '   (автоматически добавил format=json)' : ''))
+    const t0 = Date.now()
+    try {
+      const r = await plainGet(chUrl, 15000)
+      ch = parseChangeIpResponse(r.status, r.body, chUrl)
+      say('  HTTP ' + r.status + ' за ' + (Date.now() - t0) + 'мс → ответ: ' + ch.kind + (ch.newIp ? ', new_ip=' + ch.newIp : '') + (ch.rt ? ', rt=' + ch.rt + 'с' : '') + (ch.title ? ', title=«' + ch.title + '»' : ''))
+      if (ch.text && ch.kind !== 'html') say('  текст: «' + ch.text.slice(0, 140) + '»')
+      if (ch.kind === 'html') say('  ❌ это ВЕБ-СТРАНИЦА, а не ответ API — IP так не меняется. ' + ch.hint)
+      else if (ch.rateLimited) say('  ⚠️ ' + ch.hint + ' (это не ошибка, просто подождите)')
+      else if (ch.newIp) say('  ✅ ссылка рабочая, провайдер выдал ' + ch.newIp)
+      else if (ch.kind === 'ok-text' || ch.kind === 'json') say('  ✅ ссылка отвечает; новый IP придёт следующим запросом (лимит 30 секунд)')
+      else say('  ⚠️ ответ непонятный — сверьте ссылку с панелью провайдера')
+    } catch (e) { say('  ❌ запрос не прошёл: ' + String(e.message || e).slice(0, 160)) }
+    if (liveHost && ch && ch.newIp) {
+      await sleep(4000)
+      const nowIp = await currentIp({ proxyOnly: true, timeoutMs: 10000 })
+      say('  проверка через прокси: текущий IP ' + (nowIp || '?') + (nowIp === ch.newIp ? ' ✅ совпал с new_ip' : (nowIp ? ' (отличается — провайдер ещё меняет адрес или new_ip устарел)' : '')))
+    } else if (!liveHost) say('  ℹ️ проверить смену IP через прокси не могу — прокси не отвечает')
+  }
+
+  // 7. пинг MC-сервера через прокси
+  say('')
+  say('--- 7. Minecraft-сервер через прокси ---')
+  if (!liveHost) say('  ⏭ пропущено: нет живого прокси')
+  else {
+    const t0 = Date.now()
+    try {
+      const sock = await socks5Open({ host: liveHost, port: PROXY.port, userId: PROXY.username, password: PROXY.password }, MC.host, MC.port, 15000)
+      const r = await mcStatusPing(sock, 12000)
+      if (r.ok) {
+        const v = r.json && (r.json.version || {})
+        say('  ✅ ' + MC.host + ':' + MC.port + ' отвечает через прокси за ' + r.ms + 'мс' + (v.name ? ' (сервер: ' + v.name + ', protocol ' + v.protocol + ')' : ''))
+        const pl = r.json && r.json.players
+        if (pl) say('     игроков: ' + pl.online + '/' + pl.max)
+      } else say('  ❌ туннель открылся, но сервер не ответил на status-пинг: ' + r.err)
+    } catch (e) { say('  ❌ не удалось: ' + String(e.message || e).slice(0, 160)) }
+    say('  (замер ' + (Date.now() - t0) + 'мс)')
+  }
+
+  // 8. вердикт
+  say('')
+  say('=== ВЕРДИКТ ===')
+  if (liveHost) {
+    say('✅ ПРОКСИ ЖИВ: ' + liveHost + ':' + PROXY.port + ', внешний IP ' + (liveIp || '?') + '.')
+    if (ch && ch.kind === 'html') say('⚠️ осталось починить смену IP: замените proxy.changeIpUrl на ссылку из панели «Мои прокси» → «Смена IP» (вид https://changeip.mobileproxy.space/?proxy_key=XXXX&format=json).')
+    else if (!chUrl) say('⚠️ добавьте proxy.changeIpUrl — иначе после бана IP бот не сможет его сменить.')
+    else say('Можно запускать: node main.js --rounds 10')
+    return true
+  }
+  const refused = errs.filter(e => /ОТКАЗАЛ|ECONNREFUSED/i.test(e.msg)).length
+  if (refused >= 1 && errs.length === hosts.length) {
+    say('❌ ПРОКСИ МЁРТВ: ни ' + hosts.join(', ') + ' на порту ' + PROXY.port + ' не принимают TCP-соединение.')
+    say('   Это НЕ ошибка бота: на том конце никто не слушает порт. Диагноз в 9 случаях из 10:')
+    say('     • аренда мобильного прокси ИСТЕКЛА → панель «Мои прокси» → включить «Показать истёкшие» → «Продлить»')
+    say('     • оборудование выключено/зависло → «Операции» → «Перезагрузить оборудование», затем «Сменить оборудование»')
+    say('     • порт/логин/пароль в config.json не совпадают с тем, что сейчас в панели')
+    say('   Пока прокси не оживёт, раунды будут падать с «socks fail: ... ConnectionRefused», а ротация IP бессмысленна.')
+    if (directIp) say('   Временно можно убрать секцию proxy из config.json — бот пойдёт напрямую с IP ' + directIp + ' (FunTime может быстро забанить такой IP).')
+  } else {
+    say('❌ прокси не работает. Ошибки по хостам:')
+    for (const e of errs) say('   • ' + e.host + ' — ' + e.msg.slice(0, 160))
+    say('   Проверьте: прокси включён в панели? порт тот же? логин/пароль свежие? ваш провайдер не блокирует исходящие на порт ' + PROXY.port + '?')
+  }
+  return false
 }
 
 // ========================= РАСПОЗНАВАТЕЛЬ ЦИФР (встроен, без внешних файлов) =========================
@@ -3954,8 +4567,6 @@ function connectAndCapture(tag) {
     }
 
     if (!mineflayer) { finish(false, 'mineflayer не установлен (npm i mineflayer)'); return }
-    if (!SocksClient) { finish(false, 'модуль socks не установлен'); return }
-
     hardT = setTimeout(() => {
       const r = readiness()
       ev('жёсткий таймаут ' + (CAP.timeoutMs / 1000) + 'с: have=' + r.have + '/' + (r.total || '?'))
@@ -3964,11 +4575,10 @@ function connectAndCapture(tag) {
 
     if (!PROXY.host) { finish(false, 'нет proxy.host в конфиге'); return }
 
-    SocksClient.createConnection({
-      proxy: { host: PROXY.host, port: PROXY.port, type: 5, userId: PROXY.username, password: PROXY.password },
-      command: 'connect', destination: { host: MC.host, port: MC.port }
-    }).then(conn => {
-      ev('socks ok -> ' + MC.host + ':' + MC.port)
+    // прокси с резервными хостами: bproxy.site <-> mproxy.site (тот же порт у MobileProxy.Space)
+    proxyConnect(MC.host, MC.port, CONNECT_TIMEOUT_MS).then(sock => {
+      const conn = { socket: sock }
+      ev('socks ok -> ' + MC.host + ':' + MC.port + (PROXY_OK_HOST && PROXY_OK_HOST !== PROXY.host ? ' (через резерв ' + PROXY_OK_HOST + ')' : ''))
       const nick = (NICK_PREFIX + Math.floor(Math.random() * 9000 + 1000)).slice(0, 16)
       const tConn = Date.now()
       spawnT = setTimeout(() => { if (!finished) finish(false, 'spawn timeout') }, CONNECT_TIMEOUT_MS)
@@ -4164,7 +4774,13 @@ function connectAndCapture(tag) {
           if (col.dead && rd.have >= CAP.minTiles) finish(true, 'captured-before-kick ' + rd.have)
         }
       }, 300)
-    }).catch(e => { ev('socks fail: ' + e.message); finish(false, 'socks: ' + e.message) })
+    }).catch(e => {
+      const msg = String((e && e.message) || e)
+      ev('socks fail: ' + msg)
+      const hint = socksHint(msg)
+      if (hint) hint.split('\n').forEach(l => ev(l))
+      finish(false, 'socks: ' + msg)
+    })
   })
 }
 
@@ -4285,7 +4901,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.12.0: геометрия сборки ===')
+  console.log('=== SELFTEST v3.13.0: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -4996,6 +5612,122 @@ async function selftest() {
     try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
   }
 
+  // ============ v3.13.0: прокси — парсинг ответа смены IP, SOCKS5, HTTP CONNECT, MC-пинг ============
+  console.log('--- v3.13.0: диагностика прокси (parseChangeIpResponse, SOCKS5, HTTP CONNECT, MC status) ---')
+  {
+    // 1) чистые функции разбора
+    const cj = parseChangeIpResponse(200, '{"status":"OK","new_ip":"94.25.229.79","rt":"5.15"}', 'https://changeip.mobileproxy.space/?proxy_key=X&format=json')
+    const ch = parseChangeIpResponse(200, '<!DOCTYPE html><html><head><title>Мои прокси</title></head>', 'https://mobileproxy.space/user.html')
+    const ci = parseChangeIpResponse(200, '94.25.229.79', 'x')
+    const cr = parseChangeIpResponse(200, 'Please wait 30 seconds', 'x')
+    const ce = parseChangeIpResponse(200, '', 'x')
+    const okParse = cj.kind === 'json' && cj.newIp === '94.25.229.79' && cj.rt === '5.15' &&
+      ch.kind === 'html' && ch.title === 'Мои прокси' && /ВЕБ-СТРАНИЦУ/.test(ch.hint) &&
+      ci.kind === 'ip' && ci.newIp === '94.25.229.79' &&
+      cr.rateLimited === true && ce.kind === 'empty'
+    if (!okParse) fails++
+    console.log('  ' + (okParse ? '✅' : '❌') + ' parseChangeIpResponse: json/html(«' + ch.title + '»)/ip/rate/empty')
+
+    const okAlt = altHostOf('bproxy.site') === 'mproxy.site' && altHostOf('mproxy.site') === 'bproxy.site' && altHostOf('x.com') === null
+    if (!okAlt) fails++
+    console.log('  ' + (okAlt ? '✅' : '❌') + ' altHostOf: bproxy↔mproxy, чужой хост → null')
+
+    const okJson = ensureJsonParam('https://x/?k=1') === 'https://x/?k=1&format=json' &&
+      ensureJsonParam('https://x/?format=json') === 'https://x/?format=json' &&
+      ensureJsonParam('https://x') === 'https://x?format=json'
+    if (!okJson) fails++
+    console.log('  ' + (okJson ? '✅' : '❌') + ' ensureJsonParam: дописывает format=json, не дублирует')
+
+    const okHint = /proxy-check/.test(socksHint('ConnectionRefused')) && /password|авториз/i.test(socksHint('прокси ОТВЕРГ логин/пароль'))
+    if (!okHint) fails++
+    console.log('  ' + (okHint ? '✅' : '❌') + ' socksHint: подсказка для ECONNREFUSED и для отказа авторизации')
+
+    // 2) живой SOCKS5 handshake против мок-сервера (с авторизацией, домен-бинд, «лишние» байты одним сегментом)
+    const mkSocks = (bindAtyp, creds) => net.createServer(sock => {
+      let stage = 0
+      sock.on('data', d => {
+        if (stage === 0) { const ms = Array.from(d.slice(2, 2 + d[1])); if (ms.includes(0x02)) { sock.write(Buffer.from([0x05, 0x02])); stage = 1 } else { sock.write(Buffer.from([0x05, 0x00])); stage = 2 }; return }
+        if (stage === 1) { const ul = d[1], u = d.slice(2, 2 + ul).toString(), pl = d[2 + ul], p = d.slice(3 + ul, 3 + ul + pl).toString(); if (u === creds[0] && p === creds[1]) { sock.write(Buffer.from([0x01, 0x00])); stage = 2 } else { sock.write(Buffer.from([0x01, 0x01])); sock.end() }; return }
+        if (stage === 2) {
+          stage = 3
+          let reply
+          if (bindAtyp === 1) reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50])
+          else { const h = Buffer.from('api.ipify.org'); reply = Buffer.concat([Buffer.from([0x05, 0x00, 0x00, 0x03, h.length]), h, Buffer.from([0x00, 0x50])]) }
+          sock.write(Buffer.concat([reply, Buffer.from('HTTP/1.1 200 OK\r\n\r\n9.9.9.9')]))
+          setTimeout(() => sock.end(), 80)
+        }
+      })
+    })
+    const srv1 = mkSocks(3, ['good', 'pass'])
+    await new Promise(r => srv1.listen(0, '127.0.0.1', r))
+    const p1 = srv1.address().port
+    let s1body = null, s1err = null
+    try { const s = await socks5Open({ host: '127.0.0.1', port: p1, userId: 'good', password: 'pass' }, 'api.ipify.org', 80, 5000); s1body = await httpThrough(s, 'api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\n\r\n', 3000) } catch (e) { s1err = e.message }
+    srv1.close()
+    const okSocks = !s1err && /9\.9\.9\.9/.test(String(s1body))
+    if (!okSocks) fails++
+    console.log('  ' + (okSocks ? '✅' : '❌') + ' socks5Open+httpThrough: handshake с auth, домен-бинд, «лишние» байты не потеряны → «' + String(s1body || s1err).slice(0, 30) + '»')
+
+    // 3) SOCKS5 отвергает неверный пароль
+    const srv2 = mkSocks(1, ['good', 'pass'])
+    await new Promise(r => srv2.listen(0, '127.0.0.1', r))
+    const p2 = srv2.address().port
+    let s2err = null
+    try { await socks5Open({ host: '127.0.0.1', port: p2, userId: 'bad', password: 'x' }, 'api.ipify.org', 80, 5000) } catch (e) { s2err = e.message }
+    srv2.close()
+    const okReject = /ОТВЕРГ логин/.test(String(s2err))
+    if (!okReject) fails++
+    console.log('  ' + (okReject ? '✅' : '❌') + ' socks5Open: неверный пароль отвергнут → «' + String(s2err || 'НЕ ОТВЕРГНУТ').slice(0, 50) + '»')
+
+    // 4) ConnectionRefused → понятная ошибка (как в логе 21:19)
+    let s3err = null
+    try { await socks5Open({ host: '127.0.0.1', port: p2 + 1, userId: 'a', password: 'b' }, 'x', 80, 3000) } catch (e) { s3err = e.message }
+    const okRefused = /ОТКАЗАЛ в соединении \(ECONNREFUSED\)/.test(String(s3err))
+    if (!okRefused) fails++
+    console.log('  ' + (okRefused ? '✅' : '❌') + ' socks5Open: мёртвый порт → «' + String(s3err || 'нет ошибки').slice(0, 70) + '»')
+
+    // 5) HTTP CONNECT (mproxy.site) + авторизация Basic
+    const srvH = net.createServer(sock => {
+      let head = ''
+      sock.on('data', d => {
+        head += d.toString('latin1')
+        if (head.indexOf('\r\n\r\n') < 0) return
+        if (!/^CONNECT /.test(head)) { sock.end('HTTP/1.1 400 Bad\r\n\r\n'); return }
+        const okAuth = /Proxy-Authorization: Basic /.test(head)
+        if (!okAuth) { sock.end('HTTP/1.1 407 Proxy Auth Required\r\n\r\n'); return }
+        sock.write('HTTP/1.1 200 Connection established\r\n\r\n')
+        sock.write('HTTP/1.1 200 OK\r\n\r\n7.7.7.7'); setTimeout(() => sock.end(), 80)
+      })
+    })
+    await new Promise(r => srvH.listen(0, '127.0.0.1', r))
+    const pH = srvH.address().port
+    let hbody = null, herr = null
+    try { const s = await httpConnect({ host: '127.0.0.1', port: pH, userId: 'u', password: 'p' }, 'api.ipify.org', 80, 5000); hbody = await httpThrough(s, 'api.ipify.org', 'GET / HTTP/1.1\r\nHost: api.ipify.org\r\n\r\n', 3000) } catch (e) { herr = e.message }
+    srvH.close()
+    const okHttp = !herr && /7\.7\.7\.7/.test(String(hbody))
+    if (!okHttp) fails++
+    console.log('  ' + (okHttp ? '✅' : '❌') + ' httpConnect: HTTP-прокси + Basic-auth → «' + String(hbody || herr).slice(0, 30) + '»')
+
+    // 6) mcStatusPing: мок MC-сервера отдаёт status JSON
+    const varint = n => { const b = []; do { let x = n & 0x7f; n >>>= 7; if (n) x |= 0x80; b.push(x) } while (n); return Buffer.from(b) }
+    const srvM = net.createServer(sock => {
+      sock.on('data', () => {
+        const json = JSON.stringify({ version: { name: '1.21.1', protocol: 767 }, players: { max: 100, online: 42 }, description: { text: 'FunTime' } })
+        const body = Buffer.concat([varint(0x00), Buffer.from(json, 'utf8')])
+        sock.write(Buffer.concat([varint(body.length), body])); setTimeout(() => sock.end(), 60)
+      })
+    })
+    await new Promise(r => srvM.listen(0, '127.0.0.1', r))
+    const pM = srvM.address().port
+    const msock = net.connect({ host: '127.0.0.1', port: pM })
+    await new Promise(r => msock.once('connect', r))
+    const mp = await mcStatusPing(msock, 5000)
+    srvM.close()
+    const okMc = mp.ok && mp.json && mp.json.version && mp.json.version.protocol === 767 && mp.json.players.online === 42
+    if (!okMc) fails++
+    console.log('  ' + (okMc ? '✅' : '❌') + ' mcStatusPing: разобрал status-ответ сервера (protocol ' + (mp.json && mp.json.version ? mp.json.version.protocol : '?') + ', online ' + (mp.json && mp.json.players ? mp.json.players.online : '?') + ')')
+  }
+
   LEARN_DIR = learnWas
   if (!CLI.debug) {
     for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest']) {
@@ -5068,25 +5800,45 @@ function parseSocksUrl(s) {
   } catch (e) { return null }
 }
 
+// открывает туннель до (host:port) через SOCKS и возвращает «голый» сокет.
+// type 4 → модуль socks (если есть); type 5 → встроенный клиент (работает без npm-пакета socks).
+async function openSocksTunnel(host, port, socks, timeoutMs) {
+  const type = Number(socks.type) || 5
+  if (type !== 5 && SocksClient) {
+    const conn = await SocksClient.createConnection({
+      proxy: { host: socks.host, port: socks.port, type, userId: socks.username, password: socks.password },
+      command: 'connect', destination: { host, port }
+    })
+    return conn.socket
+  }
+  if (SocksClient && type === 5) {
+    try {
+      const conn = await SocksClient.createConnection({
+        proxy: { host: socks.host, port: socks.port, type: 5, userId: socks.username, password: socks.password },
+        command: 'connect', destination: { host, port }
+      })
+      return conn.socket
+    } catch (e) { /* пробуем встроенный клиент (резервный хост и т.п.) */ }
+  }
+  return await socks5Open({ host: socks.host, port: socks.port, userId: socks.username, password: socks.password }, host, port, timeoutMs || 25000)
+}
+
 function socksTlsConnect(host, port, socks, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (!SocksClient) { reject(new Error('модуль socks не установлен')); return }
-    let done = false
-    const to = setTimeout(() => { if (!done) { done = true; reject(new Error('SOCKS timeout')) } }, timeoutMs || 25000)
-    SocksClient.createConnection({
-      proxy: { host: socks.host, port: socks.port, type: socks.type || 5, userId: socks.username, password: socks.password },
-      command: 'connect', destination: { host, port }
-    }).then(conn => {
-      if (done) { try { conn.socket.destroy() } catch (e) {} return }
+    let done = false, raw = null
+    const to = setTimeout(() => { if (!done) { done = true; try { if (raw) raw.destroy() } catch (e) {}; reject(new Error('SOCKS timeout')) } }, timeoutMs || 25000)
+    openSocksTunnel(host, port, socks, timeoutMs || 25000).then(sock => {
+      raw = sock
+      if (done) { try { sock.destroy() } catch (e) {} return }
       let secure = null
       try {
-        secure = tls.connect({ socket: conn.socket, servername: host, minVersion: 'TLSv1.2' }, () => {
+        secure = tls.connect({ socket: sock, servername: host, minVersion: 'TLSv1.2' }, () => {
           if (done) return
           done = true; clearTimeout(to)
-          resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {} try { conn.socket.destroy() } catch (e) {} } })
+          resolve({ socket: secure, cleanup() { try { secure.destroy() } catch (e) {} try { sock.destroy() } catch (e) {} } })
         })
-      } catch (e) { if (!done) { done = true; clearTimeout(to); try { conn.socket.destroy() } catch (x) {}; reject(e) } ; return }
-      secure.on('error', e => { if (!done) { done = true; clearTimeout(to); try { conn.socket.destroy() } catch (x) {}; reject(e) } })
+      } catch (e) { if (!done) { done = true; clearTimeout(to); try { sock.destroy() } catch (x) {}; reject(e) }; return }
+      secure.on('error', e => { if (!done) { done = true; clearTimeout(to); try { sock.destroy() } catch (x) {}; reject(e) } })
     }).catch(e => { if (!done) { done = true; clearTimeout(to); reject(e) } })
   })
 }
@@ -6157,7 +6909,7 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.12.0 ===')
+  step('=== СТАРТ v3.13.0 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
@@ -6171,6 +6923,12 @@ async function main() {
     if (r) step('✅ ответ: «' + r.digits + '» от ' + r.host + ' [' + r.field + '] за ' + r.ms + 'мс (всего ' + (Date.now() - t0) + 'мс)')
     else step('❌ ни один эндпоинт не ответил. Поднимите свой: python yolo_server.py')
     setTimeout(() => process.exit(r ? 0 : 1), 300)
+    return
+  }
+  if (CLI.proxyCheck) {
+    step('config: ' + (CFG_PATH || 'НЕТ') + ' parse=' + CFG_STRATEGY)
+    const ok = await runProxyCheck()
+    setTimeout(() => process.exit(ok ? 0 : 1), 300)
     return
   }
   if (CLI.label) { runLabelTool(); return }
@@ -6251,7 +7009,7 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.12.0) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.13.0) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
@@ -6274,7 +7032,7 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.11.1', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.13.0', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
@@ -6317,5 +7075,9 @@ module.exports = {
   // v3.12.0: офлайн-тюнинг сегментации и «золотая» разметка ответов
   answersFile, appendAnswer, loadAnswers, parseAnswersFromLog, importAnswersFromFile,
   listRoundDirs, loadRawImage, matchAnswersToDirs, cropsFromSegResult, looImageAccuracy,
-  contactSheetPng, asciiRow, runAutotune, runDiag, stampOfDir
+  contactSheetPng, asciiRow, runAutotune, runDiag, stampOfDir,
+  // v3.13.0: диагностика и отказоустойчивость прокси
+  isIpV4, altHostOf, proxyHostCandidates, socks5Open, httpConnect, httpThrough, proxyTunnel,
+  proxyConnect, proxyAlive, currentIp, socksHint, parseChangeIpResponse, ensureJsonParam,
+  describeChangeIpUrl, runProxyCheck, mcStatusPing, PROXY, rotateIp
 }
