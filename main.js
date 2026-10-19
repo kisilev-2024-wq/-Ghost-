@@ -1,5 +1,25 @@
-// VERSION: 3.13.0
+// VERSION: 3.13.1
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ============ ЧТО ИСПРАВЛЕНО В v3.13.1 (по вашему логу/скриншоту 10:07–19:54) ============
+// I1. УСТАНОВЩИК (START.bat) ОТБРАКОВЫВАЛ ЭТОТ ФАЙЛ: «file0: source ... gave invalid
+//     D:\captcha\env\main.js: size=415962 head=[// VERSION: 3.13.0 ...]» и далее
+//     «процесс завершился с кодом 1». Причина: установщик защищает вас от скачивания
+//     веб-страницы вместо файла и ищет HTML-маркеры (doctype / html в угловых
+//     скобках) в первых 3000 символах, а у v3.13.0 такой маркер стоял ПРЯМО В
+//     КОММЕНТАРИИ (пункт P2 ниже цитировал ответ провайдера) — валидный файл
+//     принимался за HTML и улетал в main.js.bad. Теперь:
+//       • из комментария маркер убран (цитата переписана безопасной формулировкой);
+//       • в selftest добавлена проверка «installer-safe header»: если в первых
+//         4096 байтах main.js снова появится HTML-маркер — самопроверка упадёт и
+//         не даст залить файл, который установщик отвергнет;
+//       • START.bat v9.9: проверка «похоже на HTML» ужесточена — маркеры ищутся
+//         ТОЛЬКО в начале текста, а файл, начинающийся с «//», «/*», «{» и т.п.,
+//         считается кодом без дальнейших проверок (комментарии больше не вредят).
+// I2. Версия поднята до 3.13.1: установщик обновит файл поверх 3.12.0/3.13.0
+//     (защита от отката версии сработает в нужную сторону).
+// I3. Никаких изменений в логике бота: сбор стены, сегментация, обучение, Telegram,
+//     прокси — ровно как в v3.13.0.
 //
 // ============ ЧТО ИСПРАВЛЕНО В v3.13.0 (по вашему логу 21:19) ============
 // P1. «socks fail: Socks5 proxy rejected connection - ConnectionRefused».
@@ -13,7 +33,7 @@
 //       • при ConnectionRefused в лог печатается пошаговая инструкция (что проверить);
 //       • node main.js --proxy-check — полная диагностика: DNS, SOCKS5, HTTP-резерв,
 //         внешний IP, ссылка смены IP, пинг MC-сервера и ВЕРДИКТ с причиной.
-// P2. «changeIp: direct:200 body=<!DOCTYPE html>...» — ссылка смены IP вернула
+// P2. «changeIp: direct:200 body=[doctype html]...» — ссылка смены IP вернула
 //     ВЕБ-СТРАНИЦУ, а не ответ API. Значит IP фактически НЕ менялся (провайдеру
 //     нужен формат API). Теперь:
 //       • к ссылке автоматически дописывается format=json;
@@ -242,7 +262,7 @@
 //   node main.js --autotune [--apply]  # офлайн-подбор маски сегментации по сохранённым картинкам
 //   node main.js --diag [DIR]    # диагностика одной картинки (топ стратегий, ASCII-кропы, фото с рамками)
 //   node main.js --import-answers learn\telegram.log  # импорт старых ответов человека
-//   node main.js --selftest      # 72 проверки без сервера
+//   node main.js --selftest      # 73 проверки без сервера
 //   node main.js --replay DIR    # пересобрать картинку из старой записи
 //   node main.js --rounds 3      # короткий прогон
 //   node main.js --debug         # подробный лог
@@ -4901,7 +4921,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.13.0: геометрия сборки ===')
+  console.log('=== SELFTEST v3.13.1: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -5726,6 +5746,27 @@ async function selftest() {
     const okMc = mp.ok && mp.json && mp.json.version && mp.json.version.protocol === 767 && mp.json.players.online === 42
     if (!okMc) fails++
     console.log('  ' + (okMc ? '✅' : '❌') + ' mcStatusPing: разобрал status-ответ сервера (protocol ' + (mp.json && mp.json.version ? mp.json.version.protocol : '?') + ', online ' + (mp.json && mp.json.players ? mp.json.players.online : '?') + ')')
+  }
+
+  // ============ v3.13.1: installer-safe header (защита от брака установщика) ============
+  console.log('--- v3.13.1: installer-safe header (START.bat не должен отвергнуть файл) ---')
+  {
+    // Установщик (looksLikeHtmlFile в START.bat) читает первые 4096 байт файла и
+    // ищет HTML-маркеры; если найдёт — отбракует скачанный main.js («gave invalid»).
+    // В v3.13.0 маркер doctype стоял в комментарии P2 — установщик падал с кодом 1.
+    // Здесь ловим рецидив: ни одного маркера в первых 4096 байтах быть не должно.
+    const mfp = path.join(__dirname, 'main.js')
+    const fd = fs.openSync(mfp, 'r')
+    const hb = Buffer.alloc(4096)
+    const hn = fs.readSync(fd, hb, 0, 4096, 0)
+    fs.closeSync(fd)
+    const head = hb.slice(0, hn).toString('utf8').replace(/^\uFEFF/, '').trim().slice(0, 3000).toLowerCase()
+    const markers = ['<!doctype', '<html', '<head', '<body', '<title', 'you signed in', 'reload to refresh your session', 'switched accounts']
+    const hit = markers.filter(m => head.indexOf(m) >= 0)
+    const okHead = hit.length === 0
+    if (!okHead) fails++
+    console.log('  ' + (okHead ? '✅' : '❌') + ' installer-safe header: HTML-маркеров в первых 4096 байтах нет' +
+      (okHead ? '' : ' → найдены: ' + hit.join(', ') + ' (перепишите комментарий, установщик отвергнет файл)'))
   }
 
   LEARN_DIR = learnWas
