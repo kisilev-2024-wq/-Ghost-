@@ -12,7 +12,7 @@
   },
   "accounts": { "nickPrefix": "Player", "countDefault": 1, "sessionMinutes": 10 },
   "telegram": {
-    "token": "8721400315:AAEiBnTIAEErXDuRO9T_vDlJe9Fn9pzIv4I",
+    "token": "8684910936:AAGweF83tqT_RKSzdyQLrbT9IZRbNX7YcgI",
     "chatId": 5370523250,
     "apiProxy": "socks5h://5xBLgY:S8hzBU@45.130.129.70:8000",
     "targetStreak": 10,
