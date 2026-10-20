@@ -1,5 +1,34 @@
-// VERSION: 3.13.3
+// VERSION: 3.14.0
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ============ ЧТО ДОБАВЛЕНО В v3.14.0 (ХОСТ-МОДЕЛЬ ROBOFLOW YOLOv12 captcha-funtime/2) ============
+// R1. Картинка капчи теперь уходит НАПРЯМУЮ в облако Roboflow:
+//       POST https://serverless.roboflow.com/captcha-funtime/2?api_key=...&confidence=..&overlap=..
+//     multipart/form-data, поле ОБЯЗАТЕЛЬНО называется "file" (не "image"!) — иначе 400
+//     «Expected image to be send in part named 'file'». Ответ: {predictions:[{x,y,width,
+//     height,confidence,class,class_id}]}, где x/y — ЦЕНТР рамки в координатах присланной
+//     картинки. Бот сам переводит центры в рамки, гасит дубли (overlap), сортирует слева
+//     направо и склеивает class → 5 цифр.
+//     Замер на 12 реальных капчах FunTime с независимой разметкой: 12/12 = 100%
+//     (модель из вашего прежнего конфига captchas-gz2yx/funtimecaptcha/1 на тех же картинках: 0/12).
+// R2. Roboflow вызывается ПЕРВЫМ внутри yoloRecognize — то есть его ответ автоматически
+//     становится «ответом бота» в Telegram-сессии обучения (telegram.streakSource=auto/yolo)
+//     и пишется в лог/сводку. Локальные YOLO-серверы (yolo_server.py) остались запасным путём.
+// R3. Мёртвый публичный сервер 212.22.70.39:5000 убран из YOLO_DEFAULT_URLS — он не отвечает
+//     (ECONNREFUSED) и съедал ~4 секунды каждого раунда.
+// R4. Понятные сообщения об ошибках облака: 401/403 — неверный ключ (дальше не дёргаем,
+//     чтобы не жечь запросы), 402/413 — кончились кредиты, 429 — слишком часто, 5xx — повтор.
+//     Ключ в логи НЕ печатается (только первые 4 символа).
+// R5. Режимы проверки: node main.js --rf-test [файл.png|jpg] — прогнать картинку через облако
+//     и показать рамки/цифры; node main.js --rf-test — возьмёт последнюю капчу из records/.
+//     В Telegram команда /yolo теперь показывает и статус Roboflow.
+// R6. roboflow.autoLabel=true — ответы облака (когда ровно 5 цифр и нарезка не вырождена)
+//     автоматически размечают глифы локальной базы, т.е. локальная модель учится без человека.
+//     По умолчанию выключено: база растёт только из ваших ответов в Telegram.
+// R7. Конфиг: секция roboflow {enabled, apiKey, modelId, confidence, overlap, timeoutMs,
+//     autoLabel, digits, field, useSocks}. Секции detectUrl/serverlessUrl больше не нужны
+//     (они вели на localhost:9001, которого у вас нет) — бот ходит в облако сам.
+// ================================================================================================
 //
 // ============ ЧТО ДОБАВЛЕНО В v3.13.3 (найденные датасеты Roboflow Universe) ============
 // 1) Исправлен pngRgba: PNG писался БЕЗ фильтр-байта по строкам — такие файлы не открывали
@@ -12,7 +41,8 @@
 //      rf_import.js  — нарезка глифов по боксам -> glyphs.jsonl + честный bench (LOO по картинкам);
 //      rf_infer.js   — проба хостовой YOLOv12 captcha-funtime/2 на вашей картинке;
 //      jpg2raw.py    — JPEG->RGB через Pillow (запасной путь — tools/jpeg_dec.js, baseline JPEG).
-//    ВАЖНО: всё это офлайн-инструменты. В рантайме бота Roboflow по-прежнему НЕ используется.
+//    ВАЖНО: это офлайн-инструменты. (С v3.14.0 хост-модель Roboflow подключена и в рантайме —
+//    см. шапку v3.14.0 и блок ROBOFLOW: captcha-funtime/2 дала 12/12 на реальных капчах.)
 // 3) README: раздел «001. Датасеты Roboflow Universe по FunTime» — что нашлось, как тянуть,
 //    как мерять, как обучить свою YOLO на 3.5k реальных капч.
 // =========================================================================================
@@ -266,6 +296,8 @@
 // A2. [v3.9.1] seam-штраф не может стать бонусом; порог предупреждения 40
 //     (по вашему прогону seam правильной стены = 6..24).
 // A. [ФИКС РАУНДА 6] Roboflow УДАЛЁН полностью (403/405, ключ не тот — «яма»).
+//    ОБНОВЛЕНО v3.14.0: подобран рабочий ключ и ПРАВИЛЬНАЯ модель (captcha-funtime/2),
+//    облако возвращено как ОСНОВНОЙ распознаватель — см. шапку файла.
 //    Распознавание теперь локальное и самообучающееся: digits.js + label.js.
 // B. [ФИКС РАУНДА 6] Выбран правильный детектор стены. На сервере две
 //    параллельные стены капчи, поэтому рамки обеих стен с одинаковым x
@@ -334,6 +366,10 @@ const CLI = {
   train: ARGV.includes('--train'),
   tgTest: ARGV.includes('--tg-test'),
   yoloTest: typeof argVal('yolo-test', '') === 'string' ? argVal('yolo-test', '') : '',
+  // v3.14.0: разовая проверка хост-модели Roboflow на картинке (без подключения к серверу)
+  rfTest: ARGV.includes('--rf-test') || ARGV.includes('--roboflow-test'),
+  rfTestFile: (typeof argVal('rf-test', '') === 'string' && argVal('rf-test', '') !== '') ? argVal('rf-test', '')
+    : ((typeof argVal('roboflow-test', '') === 'string' && argVal('roboflow-test', '') !== '') ? argVal('roboflow-test', '') : ''),
   perms: ARGV.includes('--perms'),
   label: ARGV.includes('--label'),
   debug: ARGV.includes('--debug'),
@@ -477,7 +513,20 @@ function regexCfg(raw) {
   const ac = sectionBody(raw, 'accounts')
   if (ac) { put('accounts', 'nickPrefix', grabIn(ac, 'nickPrefix')) }
   const rf = sectionBody(raw, 'roboflow')
-  if (rf) { put('roboflow', 'enabled', /"enabled"\s*:\s*true/.test(rf)); put('roboflow', 'apiKey', grabIn(rf, 'apiKey')); put('roboflow', 'modelId', grabIn(rf, 'modelId')) }
+  if (rf) {
+    put('roboflow', 'enabled', /"enabled"\s*:\s*true/.test(rf))
+    put('roboflow', 'apiKey', grabIn(rf, 'apiKey'))
+    put('roboflow', 'modelId', grabIn(rf, 'modelId'))
+    put('roboflow', 'host', grabIn(rf, 'host'))
+    put('roboflow', 'field', grabIn(rf, 'field'))
+    put('roboflow', 'confidence', grabNumIn(rf, 'confidence'))
+    put('roboflow', 'overlap', grabNumIn(rf, 'overlap'))
+    put('roboflow', 'timeoutMs', grabNumIn(rf, 'timeoutMs'))
+    put('roboflow', 'digits', grabNumIn(rf, 'digits'))
+    put('roboflow', 'askConf', grabNumIn(rf, 'askConf'))
+    put('roboflow', 'autoLabel', /"autoLabel"\s*:\s*true/.test(rf))
+    put('roboflow', 'useSocks', /"useSocks"\s*:\s*true/.test(rf))
+  }
   return cfg
 }
 try {
@@ -507,16 +556,18 @@ const PROXY = {
 const NICK_PREFIX = String(cfgGet(CFG, 'accounts.nickPrefix', 'Player')).replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'Player'
 
 // ========================= YOLO API (распознавание капчи FunTime) =========================
+// v3.14.0: основной распознаватель — ХОСТ-МОДЕЛЬ ROBOFLOW (см. блок ROBOFLOW ниже).
+// Здесь остались запасные локальные серверы на случай, если облако недоступно.
 // Источники: github.com/mmeerrkkaa/funtime-captcha-verifed (lib/localOCR.js) и
 // тред yougame.biz/threads/368895 (YOLO12n, ~91% на FunTime).
 // Контракт: POST multipart/form-data, поле "image" (PNG) ->
 //   { "success": true, "answer": "12345" }   (публичный сервер /recognize)
 //   { "result": "12345" }                    (Flask-бэк из треда, /solve)
-// Публичный бесплатный сервер: http://212.22.70.39:5000/recognize (~85%)
 // Своя модель (91%): python yolo_server.py -> http://localhost:5000/recognize
+// v3.14.0: 212.22.70.39:5000 УБРАН — сервер мёртв (ECONNREFUSED и в песочнице, и в логах
+// пользователя), а попытка подключения съедала ~4 секунды каждого раунда.
 const YOLO_DEFAULT_URLS = [
-  'http://127.0.0.1:5000/recognize',       // свой локальный сервер (если запущен)
-  'http://212.22.70.39:5000/recognize'     // публичный бесплатный (из README плагина)
+  'http://127.0.0.1:5000/recognize'        // свой локальный сервер (если запущен)
 ]
 function yoloUrls() {
   const out = []
@@ -537,6 +588,239 @@ const YOLO = {
   digitsCfg: Number(cfgGet(CFG, 'yolo.digits', 0)) || 0
 }
 const yoloWantDigits = () => YOLO.digitsCfg || DIGITS_EXPECTED || 5
+
+// ========================= ROBOFLOW: хост-модель YOLOv12 (captcha-funtime/2) =========================
+// Как это работает (проверено живьём 2026-10-20):
+//   POST https://serverless.roboflow.com/<modelId>?api_key=<ключ>&confidence=<0..100>&overlap=<0..100>
+//   тело: multipart/form-data, ОДНО файловое поле с именем "file" (именно "file" — при "image"
+//         сервер отвечает 400 «Expected image to be send in part named 'file'»);
+//   ответ: { image:{width,height}, predictions:[{x,y,width,height,confidence,class,class_id}], ... }
+//         x,y — ЦЕНТР рамки, координаты в пикселях ПРИСЛАННОЙ картинки (не 640×640).
+// Точность на 12 реальных капчах FunTime с независимой разметкой: 12/12 = 100%.
+const RF_DEFAULT_MODEL = 'captcha-funtime/2'
+const RF_DEFAULT_HOST = 'serverless.roboflow.com'
+function rfMaskKey(k) { const s = String(k || ''); return s ? (s.slice(0, 4) + '…(' + s.length + ' симв.)') : '(нет)' }
+function rfCfg() {
+  const key = String(cfgGet(CFG, 'roboflow.apiKey', '') || '').trim()
+  const model = String(cfgGet(CFG, 'roboflow.modelId', RF_DEFAULT_MODEL) || RF_DEFAULT_MODEL).trim().replace(/^\/+|\/+$/g, '')
+  // confidence/overlap в конфиге лежат в процентах (как в веб-интерфейсе Roboflow): 25 -> 0.25
+  const pc = v => { const n = Number(v); if (!isFinite(n)) return null; return n > 1 ? n / 100 : n }
+  const clamp = (v, a, b, d) => (v === null || v === undefined ? d : Math.max(a, Math.min(b, v)))
+  const conf = clamp(pc(cfgGet(CFG, 'roboflow.confidence', 25)), 0.01, 0.95, 0.25)
+  const overlap = clamp(pc(cfgGet(CFG, 'roboflow.overlap', 20)), 0.05, 0.9, 0.2)
+  return {
+    enabled: cfgGet(CFG, 'roboflow.enabled', !!key) !== false,
+    apiKey: key,
+    model: model,
+    host: String(cfgGet(CFG, 'roboflow.host', RF_DEFAULT_HOST) || RF_DEFAULT_HOST).replace(/^https?:\/\//i, '').replace(/\/+$/, ''),
+    field: String(cfgGet(CFG, 'roboflow.field', 'file') || 'file'),
+    conf, overlap,
+    timeoutMs: Math.max(5000, Number(cfgGet(CFG, 'roboflow.timeoutMs', 20000)) || 20000),
+    digits: Number(cfgGet(CFG, 'roboflow.digits', 0)) || 0,
+    // просить у сервера НИЗКИЙ порог, а отбор делать здесь: так мы сами подбираем
+    // порог, при котором получается ровно N цифр (см. rfBoxesToDigits)
+    askConf: Math.max(1, Math.round(100 * clamp(pc(cfgGet(CFG, 'roboflow.askConf', 10)), 0.01, 0.2, 0.1))),
+    // сколько раз повторить запрос при временных сбоях (Cloudflare 403/429/5xx/обрыв)
+    retries: Math.max(1, Math.min(6, Number(cfgGet(CFG, 'roboflow.retries', 3)) || 3)),
+    // минимальная пауза между запросами в облако: Cloudflare блокирует СЕРИИ запросов,
+    // а не сами запросы (замер: 12 подряд -> 2 блока 403 HTML). Бот шлёт 1 картинку за раунд,
+    // так что в бою пауза почти никогда не срабатывает — она защищает тесты и догоняющие раунды.
+    paceMs: Math.max(0, Math.min(10000, Number(cfgGet(CFG, 'roboflow.paceMs', 1200)) || 0)),
+    // запасной транспорт: SOCKS-прокси Telegram, если прямой доступ к облаку закрыт
+    useSocks: cfgGet(CFG, 'roboflow.useSocks', true) !== false,
+    // автоматически размечать глифы локальной базы ответами облака (только если ровно N цифр
+    // и нарезка не вырождена). По умолчанию ВЫКЛ: база растёт из ответов человека в Telegram.
+    autoLabel: cfgGet(CFG, 'roboflow.autoLabel', false) === true
+  }
+}
+const RF = rfCfg()
+RF.ready = !!(RF.enabled && RF.apiKey && RF.model && !/YOUR_|CHANGE_ME|XXXX/i.test(RF.apiKey))
+RF.calls = 0            // сколько картинок ушло в облако (инференс = кредиты Roboflow)
+RF.lastCallAt = 0       // для темпа запросов (roboflow.paceMs)
+RF.fails = 0            // ошибки подряд
+RF.lastError = ''
+RF.disabledReason = ''  // если облако отключено насовсем (например, 401 — неверный ключ)
+const RF_MAX_FAILS = 8
+
+// полный URL запроса (ключ — в query, как требует Roboflow; в логи НЕ печатаем)
+function rfUrl(askConf) {
+  const c = Number.isFinite(askConf) ? askConf : RF.askConf
+  return 'https://' + RF.host + '/' + RF.model + '?api_key=' + encodeURIComponent(RF.apiKey) +
+    '&confidence=' + c + '&overlap=' + Math.round(RF.overlap * 100)
+}
+function rfIoU(a, b) {
+  const ix = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+  const iy = Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1))
+  const inter = ix * iy
+  const uni = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter
+  return uni > 0 ? inter / uni : 0
+}
+// горизонтальное перекрытие (доля от меньшей ширины): одна и та же цифра часто даёт
+// две рамки с разным IoU, но почти совпадающие по x
+function rfXov(a, b) {
+  const ix = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+  const mw = Math.min(a.x2 - a.x1, b.x2 - b.x1)
+  return mw > 0 ? ix / mw : 0
+}
+// жадный отбор: самые уверенные рамки, дубли (IoU > overlap или x-перекрытие > 0.6) гасятся
+function rfSelect(boxes, want, overlap) {
+  const kept = []
+  for (const b of boxes.slice().sort((p, q) => q.conf - p.conf)) {
+    if (kept.some(k => rfIoU(k, b) > overlap || rfXov(k, b) > 0.6)) continue
+    kept.push(b)
+    if (want > 0 && kept.length >= want) break
+  }
+  return kept.sort((p, q) => p.cx - q.cx)   // порядок цифр — слева направо
+}
+// predictions -> строка цифр. Порог уверенности ПОДБИРАЕТСЯ: первым берётся вариант,
+// где получилось ровно want цифр (иначе на капче с шумом ответ «уезжает»).
+function rfBoxesToDigits(preds, opts) {
+  const o = opts || {}
+  const want = Number(o.want) || 0
+  const overlap = o.overlap != null ? o.overlap : RF.overlap
+  const boxes = (Array.isArray(preds) ? preds : []).filter(p => p && isFinite(p.x) && isFinite(p.y)).map(p => {
+    const w = Math.max(1, Number(p.width) || 1), h = Math.max(1, Number(p.height) || 1)
+    const cx = Number(p.x), cy = Number(p.y)
+    const cls = String(p.class !== undefined && p.class !== null && p.class !== '' ? p.class : (p.class_id !== undefined ? p.class_id : ''))
+    return { x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2, cx, cy, w, h, conf: Number(p.confidence) || 0, cls }
+  }).filter(b => /^[0-9]$/.test(b.cls))     // классы-не-цифры игнорируем
+  const confs = Array.isArray(o.confs) && o.confs.length ? o.confs : [0.6, 0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05]
+  for (const c of confs) {
+    const sel = rfSelect(boxes.filter(b => b.conf >= c), want, overlap)
+    if (!want || sel.length === want) return { digits: sel.map(b => b.cls).join(''), boxes: sel, conf: c, rawBoxes: boxes.length, exact: !want || sel.length === want }
+  }
+  const mc = o.minConf != null ? o.minConf : RF.conf
+  const sel = rfSelect(boxes.filter(b => b.conf >= mc), want, overlap)
+  return { digits: sel.map(b => b.cls).join(''), boxes: sel, conf: mc, rawBoxes: boxes.length, exact: !want || sel.length === want, incomplete: true }
+}
+function rfReset() { RF.fails = 0; RF.lastError = ''; RF.disabledReason = '' }
+
+// v3.14.0: roboflow.autoLabel — ответы облака размечают глифы локальной базы сами
+// (только когда облако дало ровно N цифр и нарезка не вырождена).
+let rfLabelStore = null
+function rfAutoLabel(rec, round) {
+  if (!DIG || !rec) return { ok: false, reason: 'нет распознавателя' }
+  const digits = String((rec.yolo && rec.yolo.digits) || '')
+  const items = (rec.digitItems || []).filter(it => it.feat)
+  if (!digits.length) return { ok: false, reason: 'облако не дало цифр' }
+  if (digits.length !== items.length) return { ok: false, reason: 'цифр ' + digits.length + ', глифов ' + items.length }
+  if (rec.segDegenerate) return { ok: false, reason: 'нарезка вырождена — в базу нельзя' }
+  try { if (!rfLabelStore) rfLabelStore = new DIG.GlyphStore(LEARN_DIR, { augment: DIG_AUGMENT }) } catch (e) { return { ok: false, reason: e.message } }
+  let added = 0
+  items.forEach((it, i) => {
+    try {
+      rfLabelStore.addAugmented(Number(digits[i]), it.feat, { src: 'rf:round' + round + ':' + i, aspect: it.w / Math.max(1, it.h) })
+      added++
+    } catch (e) {}
+  })
+  return { ok: added > 0, n: added, digits }
+}
+// ответ Cloudflare (HTML) — это НЕ отказ ключа, а временная блокировка/лимит: надо повторить
+function rfIsHtml(t) {
+  const s = String(t || '').trim()
+  return /^</.test(s) || /<html|<!doctype|cloudflare/i.test(s.slice(0, 400))
+}
+// Ответ Cloudflare (HTML-страница, чаще 403) — это НЕ «плохой ключ», а временный блок
+// на частые запросы. Настоящий отказ ключа приходит JSON'ом: {"status":401,"message":
+// "Unauthorized api_key. This key is not authorized for serverless inference."}
+// Различаем их, иначе один случайный блок навсегда выключил бы облако на всю сессию.
+function rfIsHtml(t) { return /^\s*<(!doctype|html)/i.test(String(t || '').slice(0, 300)) }
+function rfHint(status, text) {
+  const s = String(text || '')
+  if (rfIsHtml(s)) return 'Cloudflare вернул HTML вместо JSON (HTTP ' + status + ') — временный блок частых запросов'
+  if (status === 401 || status === 403) return 'ключ отклонён (' + status + '): ' + (s.slice(0, 140) || 'проверьте roboflow.apiKey — app.roboflow.com → Settings → API key (Private API Key)')
+  if (status === 402) return 'кончились кредиты Roboflow (402): бесплатный лимит исчерпан, нужен другой ключ/тариф'
+  if (status === 404) return 'модель не найдена (404): roboflow.modelId должен быть вида «' + RF_DEFAULT_MODEL + '» (workspace/model/version)'
+  if (status === 413) return 'картинка слишком большая (413)'
+  if (status === 429) return 'слишком много запросов (429) — облако тормозит нас, пауза и повтор'
+  if (status === 400) return 'сервер не принял запрос (400): ' + (/part named 'file'/.test(s) ? 'поле должно называться "file" (roboflow.field)' : s.slice(0, 120))
+  if (status >= 500) return 'сбой на стороне Roboflow (' + status + ')'
+  return s.slice(0, 160) || ('HTTP ' + status)
+}
+// фатально = повторять бессмысленно, пока не поправишь конфиг
+function rfFatal(status, text) {
+  if (rfIsHtml(text)) return false
+  if (status === 404 || status === 402 || status === 413) return true
+  if (status === 401 || status === 403) return /api_key|unauthoriz|not authorized|invalid|forbidden/i.test(String(text))
+  return false
+}
+
+// основной вызов облака. Возвращает тот же формат, что yoloRecognize (+ boxes/provider),
+// либо null, если облако не ответило — тогда yoloRecognize пойдёт по запасным серверам.
+async function rfRecognize(png, label, fileOpts) {
+  if (!RF.ready || RF.disabledReason) return null
+  if (RF.fails >= RF_MAX_FAILS) {
+    if (RF.fails === RF_MAX_FAILS) { yoloLog('⚠️ Roboflow: ' + RF_MAX_FAILS + ' ошибок подряд — облако в этой сессии больше не дёргаю'); RF.fails++ }
+    return null
+  }
+  if (!png || !png.length) return null
+  const want = RF.digits || yoloWantDigits()
+  const fo = fileOpts || { name: 'captcha.png', type: 'image/png' }
+  const mp = multipart({}, { field: RF.field, name: fo.name, type: fo.type, data: png })
+  let u
+  try { u = new URL(rfUrl()) } catch (e) { RF.lastError = 'не собрался URL: ' + e.message; return null }
+  // транспорты: сначала напрямую, потом (если разрешено) через SOCKS-прокси Telegram
+  const socks = RF.useSocks ? parseSocksUrl(TG_PROXY_CFG ? TG_PROXY_CFG.url : '') : null
+  const routes = [{ name: 'direct', socks: null }]
+  if (socks) routes.push({ name: 'socks(' + socks.host + ')', socks })
+  let lastErr = '', lastStatus = 0, waitNext = 0
+  for (let attempt = 1; attempt <= RF.retries; attempt++) {
+    // темп: Cloudflare блокирует серии запросов чаще, чем сами запросы
+    if (RF.paceMs > 0) {
+      const since = Date.now() - RF.lastCallAt
+      if (RF.lastCallAt && since < RF.paceMs) await sleep(RF.paceMs - since)
+    }
+    for (const route of routes) {
+      RF.lastCallAt = Date.now()
+      const t0 = RF.lastCallAt
+      const r = await httpsRequest({
+        // порт берём из URL: roboflow.host можно задать как «example.com:8443» (по умолчанию 443)
+        host: u.hostname, port: Number(u.port || 443), path: u.pathname + u.search, method: 'POST', secure: true,
+        headers: { 'Content-Type': mp.contentType, 'Accept': 'application/json', 'User-Agent': 'mc-captcha/3.14' },
+        body: mp.body, timeoutMs: RF.timeoutMs, socks: route.socks || undefined
+      })
+      const ms = Date.now() - t0
+      RF.calls++
+      if (!r.ok) { lastErr = route.name + ': ' + (r.error || 'нет ответа'); waitNext = 700 * attempt; dbg('[RF] ' + lastErr); continue }
+      lastStatus = r.status
+      const body = r.body ? r.body.toString('utf8') : ''
+      if (r.status === 200) {
+        let j = null
+        try { j = JSON.parse(body) } catch (e) {}
+        if (!j || !Array.isArray(j.predictions)) { lastErr = 'ответ без predictions: ' + body.slice(0, 120); waitNext = 700 * attempt; dbg('[RF] ' + lastErr); continue }
+        const out = rfBoxesToDigits(j.predictions, { want, overlap: RF.overlap })
+        RF.fails = 0; RF.lastError = ''
+        const img = j.image || {}
+        yoloLog((label || '') + ' ☁️ Roboflow ' + RF.model + ' -> «' + (out.digits || '—') + '»' +
+          (out.exact ? '' : ' ⚠️ цифр ' + out.digits.length + ' вместо ' + want) +
+          ' рамок=' + (out.boxes || []).length + '/' + out.rawBoxes + ' порог=' + out.conf +
+          ' img=' + (img.width || '?') + '×' + (img.height || '?') + ' за ' + ms + 'мс (' + route.name +
+          (attempt > 1 ? ', попытка ' + attempt : '') + ', всего в облако ушло ' + RF.calls + ' картинок)')
+        return {
+          digits: out.digits, exact: !!out.exact, boxes: out.boxes, conf: out.conf,
+          url: 'https://' + RF.host + '/' + RF.model, host: 'roboflow:' + RF.model,
+          field: RF.field, ms, status: 200, provider: 'roboflow', model: RF.model,
+          imgW: img.width || 0, imgH: img.height || 0, inferenceId: j.inference_id || ''
+        }
+      }
+      if (rfFatal(r.status, body)) {
+        RF.disabledReason = rfHint(r.status, body)
+        yoloLog((label || '') + ' ❌ Roboflow: ' + RF.disabledReason + ' — облако отключено до перезапуска (дальше пойдут запасные серверы)')
+        return null
+      }
+      lastErr = rfHint(r.status, body)
+      // блок Cloudflare/лимит запросов держится секунды — ждём дольше, чем при обрыве связи
+      waitNext = (r.status === 429 || rfIsHtml(body)) ? Math.max(2000, 2000 * attempt) : 700 * attempt
+      dbg('[RF] ' + route.name + ' HTTP ' + r.status + ': ' + lastErr)
+    }
+    if (attempt < RF.retries) { dbg('[RF] временная ошибка, повтор через ' + waitNext + 'мс'); await sleep(waitNext) }
+  }
+  RF.fails++
+  RF.lastError = lastErr || ('HTTP ' + lastStatus) || 'нет соединения'
+  yoloLog((label || '') + ' Roboflow не ответил после ' + RF.retries + ' попыток: ' + RF.lastError + ' (ошибок подряд ' + RF.fails + ')')
+  return null
+}
+
 let yoloAlive = null      // запомненный рабочий url
 let yoloFails = 0
 const yoloUrlFails = {}   // сколько раз каждый url не ответил (чтобы не ждать таймаут заново)
@@ -586,6 +870,13 @@ function parseYoloAnswer(text) {
 
 async function yoloRecognize(png, label) {
   if (!YOLO.enabled || !png || !png.length) return null
+  // v3.14.0: ПЕРВЫМ идёт хост-модель Roboflow (100% на контрольных 12 капчах).
+  // Если облако не ответило/не настроено — падаем на локальные YOLO-серверы ниже.
+  if (RF.ready) {
+    const rr = await rfRecognize(png, label)
+    if (rr && rr.digits && rr.digits.length >= 3) return rr
+    if (rr) dbg('[YOLO] Roboflow дал ' + (rr.digits || 0) + ' цифр — пробую запасные серверы')
+  }
   if (yoloFails >= YOLO_MAX_FAILS) {
     if (yoloFails === YOLO_MAX_FAILS) { yoloLog('⚠️ ' + YOLO_MAX_FAILS + ' ошибок подряд — API больше не дёргаю в этой сессии (локальная модель продолжит)'); yoloFails++ }
     return null
@@ -627,6 +918,94 @@ async function yoloRecognize(png, label) {
   yoloFails++
   yoloLog((label || '') + ' ❌ ни один YOLO-эндпоинт не ответил (ошибок подряд: ' + yoloFails + ') — работаем локальной моделью')
   return null
+}
+
+
+// v3.14.0: ответ облака — в learn/rf_answers.jsonl и rf_boxes.json в папке раунда.
+// Это бесплатная разметка РЕАЛЬНЫХ капч: из неё потом можно обучить свою YOLO
+// (--export-yolo берёт ответы человека; rf_answers.jsonl — тот же формат, но ещё и с рамками).
+function rfSaveAnswer(rec, round) {
+  try {
+    const y = rec && rec.yolo
+    if (!y || y.provider !== 'roboflow') return false
+    fs.mkdirSync(LEARN_DIR, { recursive: true })
+    const boxes = (y.boxes || []).map(b => ({
+      digit: b.cls, conf: Math.round(b.conf * 1000) / 1000,
+      x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2),
+      // нормированные cx cy w h — формат меток YOLO
+      n: (y.imgW && y.imgH)
+        ? [((b.x1 + b.x2) / 2 / y.imgW), ((b.y1 + b.y2) / 2 / y.imgH), ((b.x2 - b.x1) / y.imgW), ((b.y2 - b.y1) / y.imgH)].map(v => Math.round(v * 1e6) / 1e6)
+        : null
+    }))
+    const line = {
+      round: Number(round) || null, dir: rec.dir ? path.basename(rec.dir) : '', answer: y.digits,
+      model: y.model || RF.model, conf: y.conf, ms: y.ms, imgW: y.imgW, imgH: y.imgH,
+      inferenceId: y.inferenceId || '', boxes, ts: new Date().toISOString()
+    }
+    fs.appendFileSync(path.join(LEARN_DIR, 'rf_answers.jsonl'), JSON.stringify(line) + '\n')
+    if (rec.dir) { try { fs.writeFileSync(path.join(rec.dir, 'rf_boxes.json'), JSON.stringify(line, null, 1)) } catch (e) {} }
+    return true
+  } catch (e) { dbg('rfSaveAnswer: ' + e.message); return false }
+}
+
+// самая свежая собранная картинка капчи — для node main.js --rf-test без аргумента
+function rfNewestCaptcha() {
+  const cands = []
+  const roots = []
+  try { if (REC_ROOT) roots.push(REC_ROOT) } catch (e) {}
+  try { roots.push(path.join(__dirname, 'records')) } catch (e) {}
+  for (const root of roots) {
+    let dirs = []
+    try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => path.join(root, d.name)) } catch (e) {}
+    for (const d of dirs) {
+      for (const n of ['ORIGINAL_CAPTCHA_x1.png', 'ORIGINAL_CAPTCHA.png']) {
+        const p = path.join(d, n)
+        try { if (fs.existsSync(p)) cands.push({ p, m: fs.statSync(p).mtimeMs }) } catch (e) {}
+      }
+    }
+    try {
+      const cd = path.join(root, 'captchas')
+      for (const n of fs.readdirSync(cd)) if (/\.png$/i.test(n)) { const p = path.join(cd, n); cands.push({ p, m: fs.statSync(p).mtimeMs }) }
+    } catch (e) {}
+  }
+  if (!cands.length) return ''
+  cands.sort((a, b) => b.m - a.m)
+  return cands[0].p
+}
+
+// node main.js --rf-test [файл] — разовая проверка облака Roboflow (без подключения к MC)
+async function runRfTest(fileArg) {
+  step('=== ПРОВЕРКА ХОСТ-МОДЕЛИ ROBOFLOW (--rf-test) ===')
+  step('config: ' + (CFG_PATH || 'НЕТ') + ' parse=' + CFG_STRATEGY)
+  step('roboflow: enabled=' + RF.enabled + ' ключ=' + rfMaskKey(RF.apiKey) + ' модель=' + RF.model +
+    ' поле="' + RF.field + '" порог-запрос=' + RF.askConf + '% overlap=' + Math.round(RF.overlap * 100) + '% таймаут=' + RF.timeoutMs + 'мс')
+  if (!RF.ready) {
+    step('❌ облако не готово: ' + (RF.disabledReason || (!RF.apiKey ? 'нет roboflow.apiKey в config.json (app.roboflow.com → Settings → API key)' : 'roboflow.enabled=false или ключ-заглушка')))
+    step('   подсказка: модель задаётся как roboflow.modelId="captcha-funtime/2"')
+    return false
+  }
+  let f = String(fileArg || '').trim()
+  if (!f) { f = rfNewestCaptcha(); step('файл не указан — беру последнюю собранную капчу') }
+  if (!f || !fs.existsSync(f)) { step('❌ картинка не найдена: ' + (f || '(в records/ пусто — сначала соберите раунд)')); return false }
+  const buf = fs.readFileSync(f)
+  const isJpg = /\.jpe?g$/i.test(f)
+  step('файл: ' + f + ' (' + buf.length + ' байт, ' + (isJpg ? 'JPEG' : 'PNG') + ')')
+  const t0 = Date.now()
+  const r = await rfRecognize(buf, 'RF-TEST', { name: isJpg ? 'captcha.jpg' : 'captcha.png', type: isJpg ? 'image/jpeg' : 'image/png' })
+  if (!r) {
+    step('❌ облако не ответило за ' + (Date.now() - t0) + 'мс: ' + (RF.disabledReason || RF.lastError || 'неизвестная ошибка'))
+    step('   если ошибка соединения — проверьте, открывается ли https://roboflow.com в браузере (или включите roboflow.useSocks=true)')
+    return false
+  }
+  const want = RF.digits || yoloWantDigits()
+  step('✅ Roboflow: «' + r.digits + '»' + (r.exact ? '' : ' ⚠️ цифр ' + r.digits.length + ' вместо ' + want) +
+    ' за ' + r.ms + 'мс (inference ' + (r.inferenceId || '?') + ')')
+  step('   картинка в облаке ' + r.imgW + '×' + r.imgH + ', рамок выбрано ' + (r.boxes || []).length + ', порог отбора ' + r.conf)
+  for (const b of (r.boxes || [])) {
+    step('   «' + b.cls + '» x=' + Math.round(b.x1) + '..' + Math.round(b.x2) + ' y=' + Math.round(b.y1) + '..' + Math.round(b.y2) + ' conf=' + b.conf.toFixed(3))
+  }
+  step('   всего картинок ушло в облако за процесс: ' + RF.calls)
+  return true
 }
 
 // ========================= TELEGRAM (бот-разметчик) =========================
@@ -5208,7 +5587,13 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.13.3: геометрия сборки ===')
+  console.log('=== SELFTEST v3.14.0: геометрия сборки ===')
+  // самопроверка НЕ выходит в интернет: хост-модель Roboflow на это время выключаем,
+  // иначе yoloRecognize сходил бы в облако вместо локального мок-сервера (и потратил кредиты)
+  const rfReadyWas = RF.ready
+  const rfDisabledWas = RF.disabledReason
+  RF.ready = false
+  RF.disabledReason = 'selftest: облако отключено (офлайн-режим)'
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -6157,7 +6542,83 @@ async function selftest() {
     console.log('  ' + (ok ? '✅' : '❌') + ' pngRgba: IDAT распаковывается в ' + raw.length + ' байт = (W*4+1)*H, фильтр-байт 0 в каждой строке')
   }
 
+  // ============ v3.14.0: хост-модель Roboflow (рамки -> 5 цифр, контракт запроса) ============
+  console.log('--- v3.14.0: Roboflow captcha-funtime/2 (predictions -> цифры, поле "file") ---')
+  {
+    // ответ облака ровно в том виде, в каком он пришёл 2026-10-20 (капча 58656)
+    const resp = {
+      image: { width: 512, height: 384 },
+      predictions: [
+        { x: 364.5, y: 216.0, width: 135, height: 196, confidence: 0.97, class: '5', class_id: 5 },
+        { x: 157.5, y: 148.0, width: 97, height: 104, confidence: 0.96, class: '8', class_id: 8 },
+        { x: 460.5, y: 128.5, width: 69, height: 93, confidence: 0.96, class: '6', class_id: 6 },
+        { x: 55.5, y: 238.0, width: 105, height: 152, confidence: 0.96, class: '5', class_id: 5 },
+        { x: 262.5, y: 290.0, width: 55, height: 100, confidence: 0.95, class: '6', class_id: 6 }
+      ]
+    }
+    const a = rfBoxesToDigits(resp.predictions, { want: 5, overlap: 0.2 })
+    const okOrder = a.digits === '58656' && a.exact === true
+    if (!okOrder) fails++
+    console.log('  ' + (okOrder ? '✅' : '❌') + ' реальный ответ облака -> «' + a.digits + '» (жду 58656), рамок ' + a.boxes.length + '/5, порядок слева направо')
+
+    // мусорные рамки той же цифры должны гаситься overlap'ом, а не удваивать цифру
+    const noisy = resp.predictions.concat([
+      { x: 160, y: 150, width: 100, height: 108, confidence: 0.41, class: '8', class_id: 8 },   // дубль «8»
+      { x: 366, y: 218, width: 130, height: 190, confidence: 0.33, class: '5', class_id: 5 },   // дубль «5»
+      { x: 300, y: 330, width: 40, height: 40, confidence: 0.12, class: '1', class_id: 1 }       // шум
+    ])
+    const b = rfBoxesToDigits(noisy, { want: 5, overlap: 0.2 })
+    const okNoise = b.digits === '58656' && b.rawBoxes === 8
+    if (!okNoise) fails++
+    console.log('  ' + (okNoise ? '✅' : '❌') + ' 8 рамок с дублями/шумом -> «' + b.digits + '» (порог ' + b.conf + '), лишнее подавлено overlap')
+
+    // не-цифровые классы и пустой ответ не должны ронять разбор
+    const c = rfBoxesToDigits([{ x: 10, y: 10, width: 5, height: 5, confidence: 0.9, class: 'digit', class_id: 0 }], { want: 5 })
+    const d = rfBoxesToDigits([], { want: 5 })
+    const okEmpty = c.digits === '' && c.exact === false && d.digits === '' && d.incomplete === true
+    if (!okEmpty) fails++
+    console.log('  ' + (okEmpty ? '✅' : '❌') + ' классы-не-цифры и пустой predictions -> цифр нет, exact=false (бот пойдёт запасным путём)')
+
+    // запрос: поле ОБЯЗАНО называться "file", ключ — в query, в логах ключа нет
+    const mp = multipart({}, { field: RF.field, name: 'captcha.png', type: 'image/png', data: Buffer.from([1, 2, 3]) })
+    const body = mp.body.toString('latin1')
+    const u = rfUrl()
+    const okReq = /name="file"/.test(body) && /^https:\/\/serverless\.roboflow\.com\/captcha-funtime\/2\?api_key=/.test(u.replace(RF.apiKey || '@@@', 'KEY')) &&
+      /confidence=\d+/.test(u) && /overlap=\d+/.test(u) && RF.field === 'file'
+    if (!okReq) fails++
+    console.log('  ' + (okReq ? '✅' : '❌') + ' запрос: multipart-поле «' + RF.field + '», URL ' + u.replace(/api_key=[^&]*/, 'api_key=***') +
+      ' (ключ в лог не печатаем: ' + rfMaskKey(RF.apiKey) + ')')
+
+    // сообщения об ошибках облака понятные и не содержат ключ
+    const h401 = rfHint(401, '{"message":"Unauthorized api_key"}')
+    const okHint = /ключ/i.test(h401) && rfHint(404, '').indexOf('modelId') > 0 && rfHint(402, '').indexOf('кредит') > 0 && rfHint(429, '').length > 5
+    if (!okHint) fails++
+    console.log('  ' + (okHint ? '✅' : '❌') + ' подсказки: 401 -> «' + h401.slice(0, 60) + '…»')
+
+    // Cloudflare-блок (HTML 403) НЕ должен навсегда выключать облако, а JSON-401 — должен
+    const okClass = rfFatal(403, '<!DOCTYPE html><html>Sorry</html>') === false &&
+      rfFatal(401, '{"status":401,"message":"Unauthorized api_key. This key is not authorized for serverless inference."}') === true &&
+      rfFatal(404, '{"message":"Requested Roboflow resource not found."}') === true &&
+      rfFatal(429, '{"message":"slow down"}') === false
+    if (!okClass) fails++
+    console.log('  ' + (okClass ? '✅' : '❌') + ' классификация ошибок: HTML-403 (Cloudflare) = временно, JSON-401 (ключ) и 404 (модель) = фатально, 429 = повтор')
+
+    // недоступное облако: rfRecognize обязан вернуть null быстро и не уронить бота
+    const sv = { ready: RF.ready, host: RF.host, retries: RF.retries, fails: RF.fails, dis: RF.disabledReason, key: RF.apiKey, useSocks: RF.useSocks }
+    RF.ready = true; RF.apiKey = 'TESTKEY'; RF.host = '127.0.0.1:1'; RF.retries = 1; RF.fails = 0; RF.disabledReason = ''; RF.useSocks = false
+    let dead = 'не вернул null', tDead = Date.now()
+    try { dead = await rfRecognize(Buffer.from([0x89, 0x50, 0x4e, 0x47]), 'SELFTEST-DEAD') } catch (e) { dead = 'исключение: ' + e.message }
+    const msDead = Date.now() - tDead
+    const okDead = dead === null && RF.fails === 1 && !!RF.lastError && msDead < 8000
+    if (!okDead) fails++
+    console.log('  ' + (okDead ? '✅' : '❌') + ' облако недоступно -> null за ' + msDead + 'мс, ошибок подряд ' + RF.fails +
+      ', причина: «' + String(RF.lastError).slice(0, 50) + '» (бот уйдёт на локальную модель)')
+    RF.ready = sv.ready; RF.apiKey = sv.key; RF.host = sv.host; RF.retries = sv.retries; RF.fails = sv.fails; RF.disabledReason = sv.dis; RF.useSocks = sv.useSocks
+  }
+
   LEARN_DIR = learnWas
+  RF.ready = rfReadyWas
+  RF.disabledReason = rfDisabledWas
   if (!CLI.debug) {
     for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest_yolo', 'selftest']) {
       try { fs.rmSync(path.join(REC_ROOT || __dirname, d), { recursive: true, force: true }) } catch (e) {}
@@ -6571,7 +7032,10 @@ async function runTelegramSession(ctx, captureFn) {
     tgLog('⚠️ найдена model.json от старой версии признаков (fv=' + DIG.MLP._staleFv + ', сейчас fv=' + DIG.FEAT_VERSION +
       ') — НЕ загружена, иначе давала бы уверенный бред. Обучите заново: /train или node main.js --train')
   }
-  tgLog('YOLO API: ' + (YOLO.enabled ? 'ВКЛ, порядок: ' + YOLO.urls.join(' → ') : 'ВЫКЛ') +
+  tgLog('☁️ Roboflow: ' + (RF.ready ? ('ВКЛ → https://' + RF.host + '/' + RF.model + ' (поле "' + RF.field + '", порог ' + RF.askConf +
+    '%, overlap ' + Math.round(RF.overlap * 100) + '%, ключ ' + rfMaskKey(RF.apiKey) + ', авто-разметка ' + (RF.autoLabel ? 'ВКЛ' : 'выкл') + ')')
+    : (RF.enabled ? 'ВКЛ, но НЕТ КЛЮЧА (roboflow.apiKey) — облако не используется' : 'ВЫКЛ (roboflow.enabled=false)')))
+  tgLog('YOLO API (запасные локальные серверы): ' + (YOLO.enabled ? 'ВКЛ, порядок: ' + YOLO.urls.join(' → ') : 'ВЫКЛ') +
     ' | счётчик «подряд» считает: ' + TG.streakSource)
   tgLog('цифр в капче: ' + DIGITS_EXPECTED + ' | цель: ' + TG.targetStreak + ' совпадений подряд | лимит раундов: ' + TG.maxRounds)
 
@@ -6662,7 +7126,8 @@ async function runTelegramSession(ctx, captureFn) {
         if (srcMode === 'yolo') botAnswer = yoloOk ? yoloDigits : ''
         else if (srcMode === 'local') botAnswer = complete ? pred : ''
         else botAnswer = yoloOk ? yoloDigits : (complete ? pred : '')
-        botSrc = (yoloOk && botAnswer === yoloDigits) ? 'YOLO' : (botAnswer ? 'локально' : 'нет')
+        const apiIsRf = !!(rec.yolo && rec.yolo.provider === 'roboflow')
+        botSrc = (yoloOk && botAnswer === yoloDigits) ? (apiIsRf ? 'Roboflow' : 'YOLO') : (botAnswer ? 'локально' : 'нет')
         const disagree = yoloOk && complete && yoloDigits !== pred
 
         const segLine = rec.segStrategy
@@ -6677,7 +7142,9 @@ async function runTelegramSession(ctx, captureFn) {
              '   node main.js --autotune --apply\n')
           : ''
         const cap = '🖼 Раунд ' + round + ' · стена ' + rec.wall + ' ' + rec.cols + '×' + rec.rows + ' · seam ' + rec.seamCost + '\n' +
-          '🌐 YOLO API: ' + (yoloDigits ? yoloDigits + (yoloOk ? '' : ' ⚠️не 5 цифр') + '  (' + rec.yolo.host + ', ' + rec.yolo.ms + 'мс)' : 'нет ответа') + '\n' +
+          (apiIsRf ? '☁️ Roboflow ' + (rec.yolo.model || '') + ': ' : '🌐 YOLO API: ') +
+          (yoloDigits ? yoloDigits + (yoloOk ? '' : ' ⚠️не 5 цифр') + '  (' + rec.yolo.host + ', ' + rec.yolo.ms + 'мс' +
+            (apiIsRf && rec.yolo.conf ? ', порог ' + rec.yolo.conf : '') + ')' : 'нет ответа') + '\n' +
           '🤖 Локально: ' + (pred || '—') + '  (уверенность ' + avgConf + ', база ' + store.size + ')\n' +
           (disagree ? '⚠️ YOLO и локальная модель расходятся — сверьте глазами\n' : '') +
           '🔤 Найдено цифр: ' + items.length + ' из ' + DIGITS_EXPECTED +
@@ -6731,13 +7198,16 @@ async function runTelegramSession(ctx, captureFn) {
             await tgSendText('Пришлите ' + DIGITS_EXPECTED + ' цифр — это истина, она идёт в обучение.\n' +
               '«+» — моё предсказание верное\n/skip — пропустить картинку\n/glyphs — показать вырезанные глифы\n' +
               '/diag — диагностика нарезки (какая маска, что в кропах, топ стратегий)\n' +
-              '/status — база, точность, счётчик совпадений\n/yolo — проверить YOLO API на этой картинке\n' +
+              '/status — база, точность, счётчик совпадений\n/yolo — проверить облако Roboflow (и запасные YOLO API) на этой картинке\n' +
               '/train — обучить MLP сейчас\n/stop — остановить')
             continue
           }
           if (cmdOk && cmd === '/status') {
             await tgSendText('📊 Совпадений подряд: ' + st.streak + '/' + TG.targetStreak + ' (рекорд ' + st.bestStreak + ')\n' +
-              'YOLO API: ' + (YOLO.enabled ? ((yoloAlive || 'не отвечал') + ' | угадал ' + (st.yoloHits || 0) + ' раз') : 'выключен') + '\n' +
+              '☁️ Roboflow: ' + (RF.ready ? (RF.model + ' — картинок ушло ' + RF.calls + ', ошибок подряд ' + RF.fails +
+                (RF.disabledReason ? '\n   ⚠️ ОТКЛЮЧЕНО: ' + RF.disabledReason : (RF.lastError ? '\n   последняя ошибка: ' + RF.lastError : '')))
+                : 'не настроен (roboflow.apiKey)') + '\n' +
+              'YOLO API (запасной): ' + (YOLO.enabled ? ((yoloAlive || 'не отвечал') + ' | угадал ' + (st.yoloHits || 0) + ' раз') : 'выключен') + '\n' +
               'Совпало: ' + st.matches + ' | не совпало: ' + st.mismatches + ' | неполных картинок: ' + st.incomplete + '\n' +
               'Раундов: ' + st.rounds + ' | размечено глифов: ' + st.labeled + ' | пропущено: ' + st.skipped +
                 (st.degenerate ? ' | 🧨 выродившаяся нарезка: ' + st.degenerate : '') + '\n' +
@@ -6817,17 +7287,24 @@ async function runTelegramSession(ctx, captureFn) {
           }
           if (cmdOk && cmd === '/yolo') {
             if (!YOLO.enabled) { await tgSendText('🌐 YOLO API выключен (yolo.enabled=false) — работаем локальной моделью'); continue }
-            await tgSendText('🌐 Проверяю YOLO API на картинке раунда ' + round + '…')
-            yoloReset()
+            await tgSendText('☁️ Проверяю хост-модель Roboflow на картинке раунда ' + round + '…')
+            yoloReset(); rfReset()
             const t0 = Date.now()
             const rr = await yoloRecognize(png, 'команда /yolo')
+            const isRf = !!(rr && rr.provider === 'roboflow')
             const rep = rr
-              ? ('✅ YOLO ответил: «' + rr.digits + '»' + (rr.exact ? '' : ' ⚠️ не ' + DIGITS_EXPECTED + ' цифр') +
-                 '\nСервер: ' + rr.host + ' (' + rr.field + '), ' + rr.ms + 'мс\nЛокальная модель: «' + (pred || '—') + '»')
-              : '❌ YOLO API не ответил за ' + Math.round((Date.now() - t0) / 1000) + 'с.\nПроверялись: ' + YOLO.urls.join('\n') +
+              ? ((isRf ? '✅ Roboflow (' + rr.model + ') ответил: «' + rr.digits + '»' : '✅ YOLO ответил: «' + rr.digits + '»') +
+                 (rr.exact ? '' : ' ⚠️ не ' + DIGITS_EXPECTED + ' цифр') +
+                 '\nСервер: ' + rr.host + ' (поле "' + rr.field + '"), ' + rr.ms + 'мс' +
+                 (isRf ? '\nРамок: ' + (rr.boxes || []).length + ', порог отбора ' + rr.conf + ', всего в облако ушло ' + RF.calls + ' картинок' : '') +
+                 '\nЛокальная модель: «' + (pred || '—') + '»')
+              : '❌ Ни Roboflow, ни YOLO API не ответили за ' + Math.round((Date.now() - t0) / 1000) + 'с.\n' +
+                (RF.ready ? '' : 'Roboflow: ' + (RF.disabledReason || (RF.apiKey ? 'выключен (roboflow.enabled=false)' : 'НЕТ КЛЮЧА — пропишите roboflow.apiKey в config.json')) + '\n') +
+                (RF.lastError ? 'Последняя ошибка облака: ' + RF.lastError + '\n' : '') +
+                'Локальные серверы: ' + YOLO.urls.join('\n') +
                 '\n\nРаботаем локальной моделью. Свой сервер: python yolo_server.py'
             await tgSendText(rep)
-            tgLog('/yolo: ' + (rr ? 'ответ «' + rr.digits + '» от ' + rr.host : 'нет ответа'))
+            tgLog('/yolo: ' + (rr ? 'ответ «' + rr.digits + '» от ' + rr.host : 'нет ответа' + (RF.lastError ? ' (Roboflow: ' + RF.lastError + ')' : '')))
             continue
           }
           if (cmdOk && cmd === '/train') {
@@ -7290,6 +7767,15 @@ async function captureRound(r, ctx) {
           const t0 = Date.now()
           candidate.yolo = await yoloRecognize(png, 'РАУНД' + r)
           ctx.lastTimings.yolo = Date.now() - t0
+          // v3.14.0: ответ облака (цифры + рамки) складываем в learn/rf_answers.jsonl —
+          // это готовая разметка реальных капч для обучения своей модели
+          if (candidate.yolo && candidate.yolo.provider === 'roboflow') rfSaveAnswer(candidate, r)
+          // v3.14.0: roboflow.autoLabel=true — разметить глифы ответом облака (без человека)
+          if (RF.autoLabel && candidate.yolo && candidate.yolo.provider === 'roboflow' && candidate.yolo.exact) {
+            const al = rfAutoLabel(candidate, r)
+            if (al.ok) step('РАУНД ' + r + ': ☁️ авто-разметка по Roboflow: +' + al.n + ' глифов («' + al.digits + '»)')
+            else dbg('РАУНД ' + r + ': авто-разметка не сделана: ' + al.reason)
+          }
         } catch (e) { dbg('yolo err ' + e.message) }
       }
       if (candidate) {
@@ -7338,10 +7824,11 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.13.3 ===')
+  step('=== СТАРТ v3.14.0 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
+  if (CLI.rfTest) { const okRf = await runRfTest(CLI.rfTestFile); setTimeout(() => process.exit(okRf ? 0 : 1), 300); return }
   if (CLI.yoloTest) {
     const f = CLI.yoloTest
     if (!fs.existsSync(f)) { step('файл не найден: ' + f); process.exit(1) }
@@ -7400,7 +7887,12 @@ async function main() {
   if (!CFG_PATH && !CLI.replay && !CLI.replayAll) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
   step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
   step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version + ' | прокси MC: ' + (PROXY.host || 'НЕТ') + ':' + PROXY.port)
-  step('YOLO API: ' + (YOLO.enabled ? 'ВКЛ → ' + YOLO.urls.join(' → ') + ' (поле "' + YOLO.field + '", таймаут ' + YOLO.timeoutMs + 'мс)' : 'ВЫКЛ (yolo.enabled=false)'))
+  step('☁️ ROBOFLOW: ' + (RF.ready
+    ? 'ВКЛ → https://' + RF.host + '/' + RF.model + ' (поле "' + RF.field + '", порог ' + RF.askConf + '%, overlap ' +
+      Math.round(RF.overlap * 100) + '%, таймаут ' + RF.timeoutMs + 'мс, ключ ' + rfMaskKey(RF.apiKey) +
+      ', авто-разметка ' + (RF.autoLabel ? 'ВКЛ' : 'выкл') + ', SOCKS-резерв ' + (RF.useSocks ? 'ВКЛ' : 'выкл') + ')'
+    : (RF.enabled ? 'ВКЛ, но нет roboflow.apiKey — облако не используется' : 'ВЫКЛ (roboflow.enabled=false)')))
+  step('YOLO API (запасной): ' + (YOLO.enabled ? 'ВКЛ → ' + YOLO.urls.join(' → ') + ' (поле "' + YOLO.field + '", таймаут ' + YOLO.timeoutMs + 'мс)' : 'ВЫКЛ (yolo.enabled=false)'))
   step('ЦИФРЫ: локальный распознаватель (встроен в main.js), база ' + LEARN_DIR)
   try {
     const st = DIG ? new DIG.GlyphStore(LEARN_DIR) : null
@@ -7443,7 +7935,7 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.13.3) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.14.0) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
@@ -7466,7 +7958,7 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.13.3', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.14.0', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
@@ -7474,7 +7966,7 @@ function printSummary(ctx) {
         orientation: x.rec.ori, rotationRule: x.rec.rotRule, permUsed: x.rec.permUsed,
         seamCost: x.rec.seamCost, score: x.rec.score, dot: x.rec.dot, dist: x.rec.dist,
         digits: x.rec.digits, digitsAll: x.rec.digitsAll, prediction: x.rec.prediction,
-        yolo: x.rec.yolo ? { digits: x.rec.yolo.digits, host: x.rec.yolo.host, ms: x.rec.yolo.ms } : null, needLabel: x.rec.needLabel,
+        yolo: x.rec.yolo ? { digits: x.rec.yolo.digits, host: x.rec.yolo.host, ms: x.rec.yolo.ms, provider: x.rec.yolo.provider || 'yolo', model: x.rec.yolo.model || '', conf: x.rec.yolo.conf } : null, needLabel: x.rec.needLabel,
         candidates: (x.rec.candidates || []).map(c => ({ wall: c.wall, score: c.score })),
         file: x.rec.capFile, dir: x.rec.dir
       } : { round: x.n, ok: false, note: x.note })
@@ -7503,6 +7995,10 @@ module.exports = {
   selftest, makeSyntheticCaptcha, makeSyntheticDigits, makeWallSnapshot, saveRecord,
   runTrain, runLabel: runLabelTool, replayAll, replayDir, captureRound, runClassic, trainModel,
   YOLO, yoloRecognize, parseYoloAnswer, multipart, yoloReset,
+  // v3.14.0: хост-модель Roboflow YOLOv12 (captcha-funtime/2)
+  RF, RF_DEFAULT_MODEL, RF_DEFAULT_HOST, rfCfg, rfUrl, rfMaskKey, rfHint, rfReset, rfSaveAnswer,
+  rfIsHtml, rfFatal,
+  rfIoU, rfXov, rfSelect, rfBoxesToDigits, rfRecognize, rfAutoLabel, rfNewestCaptcha, runRfTest,
   DIGITS_EXPECTED, finishSession, refreshPrediction,
   TG, tgApi, tgSendText, tgSendPhoto, runTelegramSession, runTgTest, parseSocksUrl, tgTransports, AsyncQueue, glyphStripPng,
   labelRoundWithDigits, dropQueueRound, httpsRequest, printSummary,
