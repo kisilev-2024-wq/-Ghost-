@@ -1,5 +1,37 @@
-// VERSION: 3.13.1
+// VERSION: 3.13.3
 // main.js — сбор картинки капчи со стены item_frame'ов + ЛОКАЛЬНОЕ распознавание цифр
+//
+// ============ ЧТО ДОБАВЛЕНО В v3.13.3 (найденные датасеты Roboflow Universe) ============
+// 1) Исправлен pngRgba: PNG писался БЕЗ фильтр-байта по строкам — такие файлы не открывали
+//    ни PIL, ни просмотрщики (контактные листы выглядели пустыми). Теперь байт 0 в каждой строке.
+//    Selftest-проверка: IDAT pngRgba обязан распаковываться в (W*4+1)*H байт.
+// 2) Комплект офлайн-инструментов под найденные датасеты FunTime (tools/):
+//      rf_pull.js    — разовая скачка датасета zip'ом по бесплатному ключу Roboflow;
+//      rf_anon.js    — мини-датасет БЕЗ ключа: оверлеи рамок + множества цифр из alt-текстов,
+//                      биекция цвет->цифра решается ограничениями;
+//      rf_import.js  — нарезка глифов по боксам -> glyphs.jsonl + честный bench (LOO по картинкам);
+//      rf_infer.js   — проба хостовой YOLOv12 captcha-funtime/2 на вашей картинке;
+//      jpg2raw.py    — JPEG->RGB через Pillow (запасной путь — tools/jpeg_dec.js, baseline JPEG).
+//    ВАЖНО: всё это офлайн-инструменты. В рантайме бота Roboflow по-прежнему НЕ используется.
+// 3) README: раздел «001. Датасеты Roboflow Universe по FunTime» — что нашлось, как тянуть,
+//    как мерять, как обучить свою YOLO на 3.5k реальных капч.
+// =========================================================================================
+// ============ ЧТО ДОБАВЛЕНО В v3.13.2 (по совету «обучить свою YOLO») ============
+// Y1. node main.js --export-yolo — экспорт СОБСТВЕННОГО датасета в формат YOLO.
+//     Чужие модели (Captcha-Digit-Detector, CRNN «Yara», nantibot CRNN) обучены на
+//     ДРУГИХ капчах: у нас стена из 12 карт 512×384 со своей текстурой — они её не
+//     возьмут. Рабочий путь — дообучить YOLOv8n/YOLO11n на своих картинках, а они
+//     уже копятся сами: records/roundNN_*/ORIGINAL_raw.bin + ответы человека в
+//     learn/answers.jsonl. Экспорт делает из этого images/ + labels/ (класс 0..9,
+//     нормированные cx cy w h), data.yaml, разбиение train/val 85/15, README с
+//     командой обучения и отчёт export_report.json.
+// Y2. Защита от мусорной разметки: если наша сегментация на картинке выродилась
+//     (degenerate / равномерная нарезка / не ровно 5 рамок), картинка НЕ попадает в
+//     train, а уходит в review/ с нарисованными рамками и черновиком в
+//     review_labels/ — иначе YOLO выучит шум (та же болезнь, что дала «88888»).
+//     --yolo-weak — осознанно положить такие в train (для добора редких классов).
+// Y3. Логика бота не изменена: сбор стены, k-NN/MLP, Telegram, прокси, YOLO API —
+//     как в v3.13.1. Экспорт полностью офлайн и ничего не подключает.
 //
 // ============ ЧТО ИСПРАВЛЕНО В v3.13.1 (по вашему логу/скриншоту 10:07–19:54) ============
 // I1. УСТАНОВЩИК (START.bat) ОТБРАКОВЫВАЛ ЭТОТ ФАЙЛ: «file0: source ... gave invalid
@@ -262,7 +294,7 @@
 //   node main.js --autotune [--apply]  # офлайн-подбор маски сегментации по сохранённым картинкам
 //   node main.js --diag [DIR]    # диагностика одной картинки (топ стратегий, ASCII-кропы, фото с рамками)
 //   node main.js --import-answers learn\telegram.log  # импорт старых ответов человека
-//   node main.js --selftest      # 73 проверки без сервера
+//   node main.js --selftest      # 75 проверок без сервера
 //   node main.js --replay DIR    # пересобрать картинку из старой записи
 //   node main.js --rounds 3      # короткий прогон
 //   node main.js --debug         # подробный лог
@@ -316,7 +348,12 @@ const CLI = {
   apply: ARGV.includes('--apply'),
   proxyCheck: ARGV.includes('--proxy-check') || ARGV.includes('--proxy'),
   diag: ARGV.includes('--diag'),
-  diagDir: (typeof argVal('diag', '') === 'string' && argVal('diag', '') !== '') ? argVal('diag', '') : ''
+  diagDir: (typeof argVal('diag', '') === 'string' && argVal('diag', '') !== '') ? argVal('diag', '') : '',
+  // экспорт датасета YOLO из уже собранных раундов + ответов человека (офлайн)
+  exportYolo: ARGV.includes('--export-yolo'),
+  exportYoloDir: (typeof argVal('export-yolo', '') === 'string' && argVal('export-yolo', '') !== '') ? argVal('export-yolo', '') : '',
+  yoloWeak: ARGV.includes('--yolo-weak'),
+  yoloOut: (typeof argVal('yolo-out', '') === 'string' && argVal('yolo-out', '') !== '') ? argVal('yolo-out', '') : ''
 }
 
 // ========================= КОНСТАНТЫ ЗАБЕГА =========================
@@ -1432,17 +1469,19 @@ function pngGray(w, h, scale, pixelFn) {
 // rgba8
 function pngRgba(w, h, scale, pixelFn) {
   const SW = w * scale, SH = h * scale
-  const rgba = Buffer.alloc(SW * SH * 4)
+  // v3.13.3: ПО СТРОКАМ НУЖЕН БАЙТ ФИЛЬТРА (0), иначе PNG не читают ни PIL, ни просмотрщики
+  const raw = Buffer.alloc((SW * 4 + 1) * SH)
   for (let y = 0; y < SH; y++) {
+    raw[y * (SW * 4 + 1)] = 0
     const sy = Math.floor(y / scale)
     for (let x = 0; x < SW; x++) {
       const c = pixelFn(Math.floor(x / scale), sy)
-      const i = (y * SW + x) * 4
-      rgba[i] = c[0]; rgba[i + 1] = c[1]; rgba[i + 2] = c[2]; rgba[i + 3] = 255
+      const i = y * (SW * 4 + 1) + 1 + x * 4
+      raw[i] = c[0]; raw[i + 1] = c[1]; raw[i + 2] = c[2]; raw[i + 3] = 255
     }
   }
   return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', pngHeader(SW, SH, 6)), pngChunk('IDAT', zlib.deflateSync(rgba, 6)), pngChunk('IEND', Buffer.alloc(0))])
+    pngChunk('IHDR', pngHeader(SW, SH, 6)), pngChunk('IDAT', zlib.deflateSync(raw, 6)), pngChunk('IEND', Buffer.alloc(0))])
 }
 function pngFromNorm(norm, scale) {
   return pngGray(GW, GH, scale || 8, (x, y) => Math.max(0, Math.min(255, Math.round(255 * (1 - norm[y * GW + x])))))
@@ -4184,6 +4223,254 @@ function runDiag(target) {
   step('   Скопируйте в чат ASCII-блоки выше — по ним видно, цифра в кропе или шум.')
 }
 
+// ========================= ЭКСПОРТ ДАТАСЕТА YOLO =========================
+// Зачем: внешние модели (Captcha-Digit-Detector, Yara CRNN, nantibot CRNN) обучены
+// на ДРУГИХ капчах и на нашей стене из карт не работают. Рабочий путь — дообучить
+// свою YOLOv8n/YOLO11n на 10 классов (0..9) по СОБСТВЕННЫМ картинкам. Всё нужное
+// уже собирается само: records/roundNN_*/ORIGINAL_raw.bin (стена 512×384) +
+// learn/answers.jsonl (ответ человека = «золотая» подпись всей картинки).
+//
+//   node main.js --export-yolo                  → yolo_dataset/ из всех раундов
+//   node main.js --export-yolo records --yolo-out d:\yolo
+//   node main.js --export-yolo --yolo-weak      → брать и картинки с ненадёжной нарезкой
+//
+// ВАЖНО про рамки: подпись человека — это ПОРЯДОК цифр, а координаты рамок берёт
+// наша же сегментация. Поэтому картинки, где сегментация выродилась (degenerate,
+// равномерная нарезка, не ровно 5 рамок), в train НЕ попадают — иначе модель
+// выучит шум. Они складываются в review/ с нарисованными рамками: glance-проверка
+// глазами, после чего рамку можно поправить вручную в labels/*.txt.
+function yoloLabelLines(W, H, boxes, digits) {
+  const out = []
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i]
+    if (!b) continue
+    const d = Number(String(digits)[i])
+    if (!isFinite(d) || d < 0 || d > 9) continue
+    const x0 = Math.max(0, Math.min(W - 1, b.mnX)), x1 = Math.max(0, Math.min(W - 1, b.mxX))
+    const y0 = Math.max(0, Math.min(H - 1, b.mnY)), y1 = Math.max(0, Math.min(H - 1, b.mxY))
+    if (x1 <= x0 || y1 <= y0) continue
+    const cx = (x0 + x1 + 1) / 2 / W, cy = (y0 + y1 + 1) / 2 / H
+    const bw = (x1 - x0 + 1) / W, bh = (y1 - y0 + 1) / H
+    out.push(d + ' ' + cx.toFixed(6) + ' ' + cy.toFixed(6) + ' ' + bw.toFixed(6) + ' ' + bh.toFixed(6))
+  }
+  return out
+}
+
+// рамка поверх копии стены — для review/ и контрольных листов
+function boxesOverlayPng(data, W, H, boxes) {
+  try {
+    const inBox = new Uint8Array(W * H)
+    for (const b of (boxes || [])) {
+      if (!b) continue
+      for (let x = Math.max(0, b.mnX); x <= Math.min(W - 1, b.mxX); x++) {
+        if (b.mnY >= 0 && b.mnY < H) inBox[b.mnY * W + x] = 1
+        if (b.mxY >= 0 && b.mxY < H) inBox[b.mxY * W + x] = 1
+      }
+      for (let y = Math.max(0, b.mnY); y <= Math.min(H - 1, b.mxY); y++) {
+        if (b.mnX >= 0 && b.mnX < W) inBox[y * W + b.mnX] = 1
+        if (b.mxX >= 0 && b.mxX < W) inBox[y * W + b.mxX] = 1
+      }
+    }
+    return DIG.pngRgba(W, H, 1, (x, y) => {
+      const v = data[y * W + x]
+      if (inBox[y * W + x]) return [255, 40, 40]
+      return [PALETTE[v * 3], PALETTE[v * 3 + 1], PALETTE[v * 3 + 2]]
+    })
+  } catch (e) { return null }
+}
+
+async function runExportYolo(rootDir, opts) {
+  opts = opts || {}
+  const root = rootDir && typeof rootDir === 'string' ? rootDir : (REC_ROOT || path.join(__dirname, 'records'))
+  const out = opts.out && typeof opts.out === 'string'
+    ? (path.isAbsolute(opts.out) ? opts.out : path.join(__dirname, opts.out))
+    : path.join(__dirname, 'yolo_dataset')
+  step('📦 ЭКСПОРТ ДАТАСЕТА YOLO | картинки: ' + root + ' → датасет: ' + out)
+  const dirs = listRoundDirs(root)
+  if (!dirs.length) {
+    step('❌ в ' + root + ' нет каталогов roundNN_aN_* с ORIGINAL_raw.bin — нечего экспортировать.')
+    step('   Сначала соберите раунды: node main.js --rounds 30')
+    return { ok: false, reason: 'no dirs', train: 0, review: 0 }
+  }
+  const answers = loadAnswers()
+  if (!answers.length) {
+    step('❌ нет ни одного ответа человека (learn/answers.jsonl пуст) — подписи брать неоткуда.')
+    step('   Импортируйте из лога:  node main.js --import-answers learn\\telegram.log')
+    return { ok: false, reason: 'no answers', dirs: dirs.length, train: 0, review: 0 }
+  }
+  const mt = matchAnswersToDirs(answers, dirs)
+  const pairs = mt.matched.slice(0, opts.maxImages || 4000)
+  step('📚 ответов: ' + answers.length + ' | картинок: ' + dirs.length + ' | сопоставлено пар: ' + mt.matched.length)
+  if (!pairs.length) {
+    step('❌ ни одной пары «картинка + ответ». Проверьте, что ответы из того же прогона, что и records/.')
+    return { ok: false, reason: 'no pairs', train: 0, review: 0 }
+  }
+
+  const dImg = path.join(out, 'images'), dLbl = path.join(out, 'labels')
+  const dRev = path.join(out, 'review'), dRevL = path.join(out, 'review_labels')
+  for (const d of [dImg, dLbl, dRev, dRevL]) fs.mkdirSync(d, { recursive: true })
+
+  const perClass = new Array(10).fill(0)
+  const report = []
+  let train = 0, review = 0, skipped = 0, boxes = 0
+  let t0 = Date.now()
+  for (const p of pairs) {
+    const img = loadRawImage(p.dir.dir)
+    const digits = String(p.answer.answer)
+    if (!img) { skipped++; continue }
+    if (digits.length !== DIGITS_EXPECTED) { skipped++; continue }
+    const name = 'cap_' + String(train + review + 1).padStart(5, '0')
+    let seg = null
+    try { seg = DIG.extractDigitsSmart(img.data, img.W, img.H, DIGITS_EXPECTED, {}) } catch (e) { seg = null }
+    const segOk = !!seg && seg.glyphs.length === DIGITS_EXPECTED
+    const good = segOk && !seg.degenerate && !seg.fallback
+    const bx = good ? seg.glyphs.map(g => g.bbox) : null
+    if (bx) {
+      // train: рамка от нашей сегментации + цифра от человека (слабая подпись, но не мусор)
+      const lines = yoloLabelLines(img.W, img.H, bx, digits)
+      if (lines.length !== DIGITS_EXPECTED) { skipped++; continue }
+      fs.writeFileSync(path.join(dImg, name + '.png'), colorPng(img.data, img.W, img.H, 1))
+      fs.writeFileSync(path.join(dLbl, name + '.txt'), lines.join('\n') + '\n')
+      digits.split('').forEach(d => { perClass[Number(d)]++ })
+      boxes += lines.length
+      train++
+      report.push({ name: name + '.png', src: p.dir.name, digits, split: 'train', strategy: seg.strategy, score: seg.score, sameFrac: seg.sameFrac })
+    } else {
+      // Рамка ненадёжна. Картинка всё равно полезна (ответ человека есть), но
+      // координаты надо подтвердить глазами: кладём в review/ с нарисованными рамками.
+      // --yolo-weak — разрешает отправить их в train как есть (осознанно грязно).
+      const weak = segOk ? seg.glyphs.map(g => g.bbox) : uniformBoxes(img.W, img.H, DIGITS_EXPECTED)
+      const why = segOk
+        ? ('сегментация «' + seg.strategy + '»: degenerate=' + seg.degenerate + ' fallback=' + seg.fallback)
+        : (seg ? 'не ровно ' + DIGITS_EXPECTED + ' рамок (' + seg.glyphs.length + ')' : 'сегментация упала')
+      const lines = yoloLabelLines(img.W, img.H, weak, digits)
+      if (opts.weak && lines.length === DIGITS_EXPECTED) {
+        fs.writeFileSync(path.join(dImg, name + '.png'), colorPng(img.data, img.W, img.H, 1))
+        fs.writeFileSync(path.join(dLbl, name + '.txt'), lines.join('\n') + '\n')
+        digits.split('').forEach(d => { perClass[Number(d)]++ })
+        boxes += lines.length
+        train++
+        report.push({ name: name + '.png', src: p.dir.name, digits, split: 'train-weak', reason: why })
+      } else {
+        fs.writeFileSync(path.join(dRev, name + '.png'), boxesOverlayPng(img.data, img.W, img.H, weak) || colorPng(img.data, img.W, img.H, 1))
+        if (lines.length === DIGITS_EXPECTED) {
+          fs.writeFileSync(path.join(dRevL, name + '.txt'),
+            '# ЧЕРНОВИК: рамка от ' + (segOk ? 'сегментации' : 'равномерной нарезки') + ' — ' + why +
+            '\n# проверьте глазами, поправьте координаты и перенесите в images/ + labels/' +
+            '\n# ответ человека: ' + digits + '\n' + lines.join('\n') + '\n')
+        }
+        review++
+        report.push({ name: name + '.png', src: p.dir.name, digits, split: 'review', reason: why })
+      }
+    }
+  }
+  step('🖼 обработано за ' + ((Date.now() - t0) / 1000).toFixed(1) + 'с: train=' + train + ' review=' + review + ' пропущено=' + skipped + ' рамок=' + boxes)
+  if (!train && !review) {
+    step('❌ ничего не экспортировано.')
+    return { ok: false, reason: 'nothing', train: 0, review: 0 }
+  }
+
+  // ---- data.yaml + train/test разбиение ----
+  // ultralytics ждёт в data.yaml КАТАЛОГИ (train: train/images), а не списки файлов,
+  // поэтому раскладываем картинки по подкаталогам split'ов. Рядом с data.yaml
+  // лежат и «плоские» images/ + labels/ — их можно открыть в LabelImg/Roboflow.
+  const names = fs.readdirSync(dImg).filter(f => /\.png$/i.test(f)).sort()
+  const nTest = names.length > 3 ? Math.max(1, Math.round(names.length * 0.15)) : 0
+  const testSet = new Set(names.slice(names.length - nTest))
+  const splitOf = n => testSet.has(n) ? 'val' : 'train'
+  for (const sp of ['train', 'val']) {
+    fs.mkdirSync(path.join(out, sp, 'images'), { recursive: true })
+    fs.mkdirSync(path.join(out, sp, 'labels'), { recursive: true })
+  }
+  for (const n of names) {
+    const sp = splitOf(n)
+    try {
+      fs.copyFileSync(path.join(dImg, n), path.join(out, sp, 'images', n))
+      const t = n.replace(/\.png$/i, '.txt')
+      if (fs.existsSync(path.join(dLbl, t))) fs.copyFileSync(path.join(dLbl, t), path.join(out, sp, 'labels', t))
+    } catch (e) { step('   ⚠️ не скопировал ' + n + ' в ' + sp + '/: ' + e.message) }
+  }
+  fs.writeFileSync(path.join(out, 'train.txt'), names.filter(n => !testSet.has(n)).join('\n') + '\n')
+  fs.writeFileSync(path.join(out, 'val.txt'), names.filter(n => testSet.has(n)).join('\n') + '\n')
+  fs.writeFileSync(path.join(out, 'classes.txt'), Array.from({ length: 10 }, (_, i) => String(i)).join('\n') + '\n')
+  fs.writeFileSync(path.join(out, 'data.yaml'), [
+    '# датасет собран: node main.js --export-yolo  (FunTime, стена из карт 512x384)',
+    'path: ' + out.split(path.sep).join('/'),
+    'train: train/images',
+    'val: ' + (testSet.size ? 'val/images' : 'train/images'),
+    'names:',
+    Array.from({ length: 10 }, (_, i) => '  ' + i + ": '" + i + "'").join('\n'),
+    ''
+  ].join('\n'))
+  fs.writeFileSync(path.join(out, 'export_report.json'), JSON.stringify({
+    exportedAt: new Date().toISOString(), root, pairs: pairs.length, train, review, skipped, boxes,
+    perClass, splitTrain: names.length - testSet.size, splitVal: testSet.size,
+    imageW: 512, imageH: 384, digitsExpected: DIGITS_EXPECTED, items: report
+  }, null, 2))
+  fs.writeFileSync(path.join(out, 'README.txt'), [
+    'ДАТАСЕТ YOLO — FunTime (стена из карт item_frame, 512×384, ровно 5 цифр)',
+    '',
+    'train/images + train/labels  — обучающая часть (готово для ultralytics).',
+    'val/images   + val/labels    — контрольная часть (~15%).',
+    'images/ + labels/            — то же самое «плоской» кучей: удобно открыть в',
+    '                               LabelImg, залить в Roboflow или править вручную.',
+    'review/                      — картинки, где наша сегментация НЕ дала надёжных рамок.',
+    'review_labels/               — черновики рамок к ним (первая строка — почему черновик).',
+    '                               Проверьте глазами, поправьте координаты и перенесите',
+    '                               пару в images/ + labels/ и в train/... — это самый',
+    '                               быстрый способ добить датасет.',
+    'data.yaml                    — конфиг ultralytics (train: train/images, val: val/images).',
+    'train.txt / val.txt          — списки имён файлов по разбиению.',
+    'export_report.json           — кто откуда: картинка, каталог раунда, ответ человека,',
+    '                               стратегия сегментации, балл, доля одинаковых кропов.',
+    '',
+    'ФОРМАТ МЕТКИ (labels/*.txt), 5 строк на картинку:',
+    '  <класс 0..9> <cx> <cy> <w> <h>   — центры и размеры в долях ширины/высоты.',
+    'Цифры идут слева направо; подпись — ответ человека из learn/answers.jsonl.',
+    '',
+    'ОБУЧЕНИЕ (Windows, нужна видеокарта; на CPU тоже работает, но долго):',
+    '  pip install ultralytics',
+    '  yolo detect train data="' + path.join(out, 'data.yaml') + '" model=yolov8n.pt epochs=120 imgsz=640 batch=8 patience=40',
+    '  (или model=yolo11n.pt — то же самое, свежее)',
+    '',
+    'ПРОГОН / СЕРВЕР: скопируйте runs/detect/train/weights/best.pt рядом с yolo_server.py и',
+    '  python yolo_server.py --model best.pt',
+    'бот сам подхватит http://127.0.0.1:5000/recognize (см. config.json → yolo.url).',
+    '',
+    'СКОЛЬКО НАДО КАРТИНОК: 300–500 размеченных обычно дают 95%+ по цифре.',
+    'Сейчас в train: ' + train + '. Не хватает — соберите ещё раундов (--rounds 50) и',
+    'повторите экспорт (каталог датасета перед этим лучше очистить: имена файлов',
+    'пересчитываются заново, и хвосты от прошлого прогона останутся без подписей).',
+    '',
+    'ПО КЛАССАМ: ' + perClass.map((n, i) => i + '→' + n).join('  '),
+    'Если какого-то класса мало (<20) — модель его выучит плохо: добирайте раунды,',
+    'пока не появятся все цифры.',
+    ''
+  ].join('\n'))
+
+  step('✅ датасет: ' + out)
+  step('   train=' + train + ' картинок (' + boxes + ' рамок), review=' + review + ', разбиение ' + (names.length - testSet.size) + '/' + testSet.size + ' (train/val)')
+  step('   по классам: ' + perClass.map((n, i) => i + '→' + n).join(' '))
+  const rare = perClass.map((n, i) => ({ i, n })).filter(c => c.n > 0 && c.n < 20).map(c => String(c.i))
+  if (rare.length) step('   ⚠️ редких классов мало (' + rare.join(',') + ') — доберите раундов, иначе YOLO их не выучит')
+  if (!perClass.some(n => n === 0)) step('   ℹ️ все 10 классов присутствуют')
+  else step('   ⚠️ классов с нулём примеров: ' + perClass.map((n, i) => n ? null : i).filter(x => x !== null).join(','))
+  if (review) step('   👀 в review/ ' + review + ' картинок с ненадёжной нарезкой — это главный сигнал, что сегментация ещё не настроена (--autotune --apply)')
+  step('   обучение: yolo detect train data="' + path.join(out, 'data.yaml') + '" model=yolov8n.pt epochs=120 imgsz=640')
+  return { ok: true, out, train, review, skipped, boxes, perClass, pairs: pairs.length }
+}
+
+// равномерная нарезка полосы на expected колонок — только как ЧЕРНОВИК для review/
+function uniformBoxes(W, H, expected) {
+  const y0 = Math.round(H * 0.15), y1 = Math.round(H * 0.85)
+  const cw = W / expected
+  const out = []
+  for (let i = 0; i < expected; i++) {
+    out.push({ mnX: Math.round(i * cw + cw * 0.1), mxX: Math.round((i + 1) * cw - cw * 0.1) - 1, mnY: y0, mxY: y1 - 1, w: Math.round(cw * 0.8), h: y1 - y0 })
+  }
+  return out
+}
+
 // ========================= ЗАПИСЬ РАУНДА =========================
 function readStyle() {
   try {
@@ -4921,7 +5208,7 @@ async function selftest() {
   const learnWas = LEARN_DIR
   LEARN_DIR = path.join(__dirname, 'records', 'selftest_learn')
   try { fs.rmSync(LEARN_DIR, { recursive: true, force: true }) } catch (e) {}
-  console.log('=== SELFTEST v3.13.1: геометрия сборки ===')
+  console.log('=== SELFTEST v3.13.3: геометрия сборки ===')
   let fails = 0
   // сначала — чистая проверка правила «с какой стороны смотрим → где лево»
   const hAscCases = [
@@ -5459,7 +5746,7 @@ async function selftest() {
     // node main.js уходил бы в офлайн-тюнинг вместо сбора капчи.
     const srcSelf = fs.readFileSync(__filename, 'utf8')
     const a = srcSelf.indexOf('const ARGV = process.argv.slice(2)')
-    const b = srcSelf.indexOf('\n}\n', srcSelf.indexOf('diagDir:')) + 3
+    const b = srcSelf.indexOf('\n}\n', srcSelf.indexOf('yoloOut:')) + 3
     const cases = [
       { argv: [], want: { autotune: false, diag: false, importAnswers: '', apply: false } },
       { argv: ['--autotune'], want: { autotune: true } },
@@ -5468,7 +5755,10 @@ async function selftest() {
       { argv: ['--diag', 'records/round01'], want: { diag: true, diagDir: 'records/round01' } },
       { argv: ['--import-answers'], want: { importAnswers: 'log' } },
       { argv: ['--autotune', '--apply'], want: { autotune: true, apply: true } },
-      { argv: ['--rounds', '5'], want: { autotune: false, diag: false, apply: false, importAnswers: '' } }
+      { argv: ['--export-yolo'], want: { exportYolo: true, exportYoloDir: '', yoloWeak: false, autotune: false } },
+      { argv: ['--export-yolo', 'records'], want: { exportYolo: true, exportYoloDir: 'records' } },
+      { argv: ['--export-yolo', '--yolo-weak', '--yolo-out', 'd:\\yolo'], want: { exportYolo: true, yoloWeak: true, yoloOut: 'd:\\yolo' } },
+      { argv: ['--rounds', '5'], want: { autotune: false, diag: false, apply: false, importAnswers: '', exportYolo: false, yoloWeak: false, yoloOut: '' } }
     ]
     let cliBad = 0
     for (const c of cases) {
@@ -5769,9 +6059,107 @@ async function selftest() {
       (okHead ? '' : ' → найдены: ' + hit.join(', ') + ' (перепишите комментарий, установщик отвергнет файл)'))
   }
 
+  // ============ v3.13.2: экспорт датасета YOLO (--export-yolo) ============
+  console.log('--- v3.13.2: экспорт датасета YOLO (формат рамок + фильтр мусора) ---')
+  {
+    // 1) формат строки YOLO: класс cx cy w h, всё в долях размера картинки
+    const L = yoloLabelLines(512, 384, [{ mnX: 100, mxX: 199, mnY: 100, mxY: 299 }], '7')
+    const f = L.length === 1 ? L[0].split(' ').map(Number) : []
+    const okF = f.length === 5 && f[0] === 7 &&
+      Math.abs(f[1] - 150 / 512) < 1e-6 && Math.abs(f[2] - 200 / 384) < 1e-6 &&
+      Math.abs(f[3] - 100 / 512) < 1e-6 && Math.abs(f[4] - 200 / 384) < 1e-6
+    // 2) 5 рамок → 5 строк, порядок = порядку цифр; мусор (не цифра, нулевая рамка) отсеивается
+    const bx5 = []
+    for (let i = 0; i < 5; i++) bx5.push({ mnX: 20 + i * 90, mxX: 79 + i * 90, mnY: 120, mxY: 260 })
+    const L5 = yoloLabelLines(512, 384, bx5, '01234')
+    const ordOk = L5.length === 5 && L5.map(s => s.split(' ')[0]).join('') === '01234'
+    const junk = yoloLabelLines(512, 384, [{ mnX: 10, mxX: 10, mnY: 10, mxY: 40 }], '9')
+    const okJunk = junk.length === 0 && yoloLabelLines(512, 384, [{ mnX: 0, mxX: 511, mnY: 0, mxY: 383 }], '3')[0].split(' ')[0] === '3'
+    const ok = okF && ordOk && okJunk
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' yoloLabelLines: нормировка ' + (okF ? 'верная' : 'СБИТА') +
+      ', порядок цифр ' + (ordOk ? 'соблюдён' : 'СБИТ') + ', мусор ' + (okJunk ? 'отсеивается' : 'ПРОПУЩЕН') +
+      ' → ' + JSON.stringify(L[0] || null))
+  }
+  {
+    // 3) полный прогон экспорта на синтетике: 2 честные картинки → train,
+    //    плоский шум (вырожденная нарезка) → review, а НЕ в train
+    const root = path.join(REC_ROOT || __dirname, 'selftest_yolo', 'records')
+    const outD = path.join(REC_ROOT || __dirname, 'selftest_yolo', 'ds')
+    try { fs.rmSync(path.dirname(root), { recursive: true, force: true }) } catch (e) {}
+    const ST = '2026-10-17T14-38-29-000Z'
+    const mk = (rname, img, W, H) => {
+      const d = path.join(root, rname)
+      fs.mkdirSync(d, { recursive: true })
+      fs.writeFileSync(path.join(d, 'ORIGINAL_raw.bin'), Buffer.from(img))
+      fs.writeFileSync(path.join(d, 'layout.json'), JSON.stringify({ cols: W / 128, rows: H / 128, W, H }))
+    }
+    const g1 = makeSyntheticDigits(4, 3, '12345', 909)
+    const g2 = makeSyntheticDigits(4, 3, '67890', 1234)
+    mk('round01_a1_' + ST, g1.img, g1.W, g1.H)
+    mk('round02_a1_' + ST, g2.img, g2.W, g2.H)
+    const NW = 512, NH = 384
+    const flat = new Uint8Array(NW * NH)
+    let fs2 = 777
+    for (let i = 0; i < flat.length; i++) { fs2 = (fs2 * 1103515245 + 12345) & 0x7fffffff; flat[i] = (fs2 / 0x7fffffff) < 0.5 ? 34 : 118 }
+    mk('round03_a1_' + ST, flat, NW, NH)
+    const ansFile = path.join(LEARN_DIR, 'answers.jsonl')
+    let ansWas = null
+    try { ansWas = fs.existsSync(ansFile) ? fs.readFileSync(ansFile, 'utf8') : null } catch (e) {}
+    fs.mkdirSync(LEARN_DIR, { recursive: true })
+    fs.writeFileSync(ansFile, [
+      JSON.stringify({ round: 1, answer: '12345', dir: 'round01_a1_' + ST, ts: '2026-10-17T14:38:29.000Z' }),
+      JSON.stringify({ round: 2, answer: '67890', dir: 'round02_a1_' + ST, ts: '2026-10-17T14:38:41.000Z' }),
+      JSON.stringify({ round: 3, answer: '11111', dir: 'round03_a1_' + ST, ts: '2026-10-17T14:38:53.000Z' })
+    ].join('\n') + '\n')
+    let r = null
+    try { r = await runExportYolo(root, { out: outD }) } catch (e) { console.log('     ⚠️ runExportYolo: ' + e.message) }
+    const cnt = (p, re) => { try { return fs.readdirSync(p).filter(x => re.test(x)).length } catch (e) { return -1 } }
+    const PNG = /\.png$/i, TXT = /\.txt$/i
+    const lblTxt = (() => { try { return fs.readFileSync(path.join(outD, 'labels', fs.readdirSync(path.join(outD, 'labels'))[0]), 'utf8') } catch (e) { return '' } })()
+    const yaml = (() => { try { return fs.readFileSync(path.join(outD, 'data.yaml'), 'utf8') } catch (e) { return '' } })()
+    const ok = !!r && r.ok && r.train === 2 && r.review === 1 &&
+      cnt(path.join(outD, 'images'), PNG) === 2 && cnt(path.join(outD, 'labels'), TXT) === 2 && cnt(path.join(outD, 'review'), PNG) === 1 &&
+      lblTxt.trim().split('\n').length === 5 && /names:/.test(yaml) &&
+      fs.existsSync(path.join(outD, 'train', 'images')) && fs.existsSync(path.join(outD, 'val', 'images')) &&
+      fs.existsSync(path.join(outD, 'README.txt')) && fs.existsSync(path.join(outD, 'export_report.json'))
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' --export-yolo: train=' + (r ? r.train : '?') + '/2, review=' + (r ? r.review : '?') + '/1' +
+      ' (вырожденная нарезка в train не попала), images=' + cnt(path.join(outD, 'images'), PNG) +
+      ', labels=' + cnt(path.join(outD, 'labels'), TXT) + ', строк в метке=' + lblTxt.trim().split('\n').filter(x => x).length + '/5' +
+      ', data.yaml=' + (/names:/.test(yaml) ? 'есть' : 'НЕТ'))
+    if (!ok && r) console.log('     ⚠️ ' + JSON.stringify({ ok: r.ok, train: r.train, review: r.review, skipped: r.skipped, reason: r.reason, perClass: r.perClass }))
+    // 4) без ответов человека экспорт обязан отказать, а не наплодить мусор без подписей
+    fs.writeFileSync(ansFile, '')
+    let r2 = null
+    try { r2 = await runExportYolo(root, { out: outD + '_empty' }) } catch (e) {}
+    const okNoAns = !!r2 && r2.ok === false && r2.reason === 'no answers' && !fs.existsSync(path.join(outD + '_empty', 'images'))
+    if (!okNoAns) fails++
+    console.log('  ' + (okNoAns ? '✅' : '❌') + ' --export-yolo без answers.jsonl: ' + (r2 ? ('отказ («' + r2.reason + '»), файлов не создал') : 'сбой'))
+    // чистим за собой
+    try { if (ansWas === null) fs.rmSync(ansFile, { force: true }); else fs.writeFileSync(ansFile, ansWas) } catch (e) {}
+    try { fs.rmSync(path.dirname(root), { recursive: true, force: true }) } catch (e) {}
+    try { fs.rmSync(outD + '_empty', { recursive: true, force: true }) } catch (e) {}
+  }
+
+  // ============ v3.13.3: PNG-энкодер pngRgba (байт фильтра по строкам) ============
+  console.log('--- v3.13.3: pngRgba даёт читаемый PNG (фильтр-байт по строкам) ---')
+  {
+    const png = DIG.pngRgba(6, 5, 2, (x, y) => [x * 40, y * 40, 128])
+    const iIdat = png.indexOf(Buffer.from('IDAT', 'ascii'));
+    const len = png.readUInt32BE(iIdat - 4)
+    const raw = zlib.inflateSync(png.slice(iIdat + 4, iIdat + 4 + len))
+    const SW = 12, SH = 10
+    let rowsOk = true
+    for (let y = 0; y < SH; y++) if (raw[y * (SW * 4 + 1)] !== 0) rowsOk = false
+    const ok = raw.length === (SW * 4 + 1) * SH && rowsOk && png.readUInt32BE(16) === SW && png.readUInt32BE(20) === SH
+    if (!ok) fails++
+    console.log('  ' + (ok ? '✅' : '❌') + ' pngRgba: IDAT распаковывается в ' + raw.length + ' байт = (W*4+1)*H, фильтр-байт 0 в каждой строке')
+  }
+
   LEARN_DIR = learnWas
   if (!CLI.debug) {
-    for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest']) {
+    for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest_yolo', 'selftest']) {
       try { fs.rmSync(path.join(REC_ROOT || __dirname, d), { recursive: true, force: true }) } catch (e) {}
     }
   } else console.log('  (--debug: артефакты самопроверки оставлены в ' + path.join(REC_ROOT || __dirname, 'selftest_learn') + ')')
@@ -6950,7 +7338,7 @@ async function runClassic(ctx) {
 
 // ========================= MAIN =========================
 async function main() {
-  step('=== СТАРТ v3.13.0 ===')
+  step('=== СТАРТ v3.13.3 ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const ok = await runTgTest(); setTimeout(() => process.exit(ok ? 0 : 1), 300); return }
@@ -6985,6 +7373,11 @@ async function main() {
   if (CLI.diag) { runDiag(CLI.diagDir || ''); setTimeout(() => process.exit(0), 200); return }
   if (CLI.autotune) {
     const r = await runAutotune(CLI.autotuneDir, { apply: CLI.apply })
+    setTimeout(() => process.exit(r && r.ok ? 0 : 1), 200)
+    return
+  }
+  if (CLI.exportYolo) {
+    const r = await runExportYolo(CLI.exportYoloDir, { out: CLI.yoloOut, weak: CLI.yoloWeak })
     setTimeout(() => process.exit(r && r.ok ? 0 : 1), 200)
     return
   }
@@ -7050,7 +7443,7 @@ async function main() {
 
 function printSummary(ctx) {
   const okList = ctx.results.filter(x => x.ok)
-  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.13.0) ===']
+  const L = ['=== СВОДКА ' + TARGET_ROUNDS + ' РАУНДОВ (v3.13.3) ===']
   L.push('успешных: ' + okList.length + '/' + TARGET_ROUNDS + ' | время: ' + Math.round((Date.now() - ctx.tGlobal) / 1000) + 'с')
   for (const x of ctx.results) {
     L.push('  #' + x.n + ': ' + (x.rec
@@ -7073,7 +7466,7 @@ function printSummary(ctx) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '3.13.0', rounds: TARGET_ROUNDS, ok: okList.length,
+      stamp: STAMP, version: '3.13.3', rounds: TARGET_ROUNDS, ok: okList.length,
       seconds: Math.round((Date.now() - tGlobal) / 1000),
       results: ctx.results.map(x => x.rec ? {
         round: x.n, ok: true, wall: x.rec.wall, grid: x.rec.cols + 'x' + x.rec.rows,
@@ -7117,6 +7510,8 @@ module.exports = {
   answersFile, appendAnswer, loadAnswers, parseAnswersFromLog, importAnswersFromFile,
   listRoundDirs, loadRawImage, matchAnswersToDirs, cropsFromSegResult, looImageAccuracy,
   contactSheetPng, asciiRow, runAutotune, runDiag, stampOfDir,
+  // v3.13.2: экспорт собственного датасета YOLO (images/+labels/, data.yaml, review/)
+  yoloLabelLines, boxesOverlayPng, uniformBoxes, runExportYolo,
   // v3.13.0: диагностика и отказоустойчивость прокси
   isIpV4, altHostOf, proxyHostCandidates, socks5Open, httpConnect, httpThrough, proxyTunnel,
   proxyConnect, proxyAlive, currentIp, socksHint, parseChangeIpResponse, ensureJsonParam,
