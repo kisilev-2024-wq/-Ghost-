@@ -14,17 +14,34 @@
   "telegram": {
     "token": "8721400315:AAEiBnTIAEErXDuRO9T_vDlJe9Fn9pzIv4I",
     "chatId": 5370523250,
-    "apiProxy": "socks5h://5xBLgY:S8hzBU@45.130.129.70:8000"
+    "apiProxy": "socks5h://5xBLgY:S8hzBU@45.130.129.70:8000",
+    "targetStreak": 10,
+    "streakSource": "auto",
+    "prefetch": 3
   },
   "roboflow": {
     "enabled": true,
     "apiKey": "kTAPmOyqKcxeBTyi18FD",
-    "modelId": "captchas-gz2yx/funtimecaptcha/1",
-    "detectUrl": "http://localhost:9001",
-    "serverlessUrl": "http://localhost:9001",
+    "modelId": "captcha-funtime/2",
+    "host": "serverless.roboflow.com",
+    "field": "file",
     "confidence": 25,
-    "overlap": 20
+    "overlap": 20,
+    "askConf": 10,
+    "digits": 5,
+    "timeoutMs": 20000,
+    "retries": 3,
+    "paceMs": 1200,
+    "useSocks": true,
+    "autoLabel": false
   },
+  "yolo": {
+    "enabled": true,
+    "urls": ["http://127.0.0.1:5000/recognize"],
+    "field": "image",
+    "timeoutMs": 6000
+  },
+  "digits": { "expected": 5 },
   "autostart": { "enabled": false },
   "update": {
     "urlMain": "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/main.js",
