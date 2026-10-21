@@ -1,7 +1,26 @@
-// VERSION: 5.1.1
+// VERSION: 5.2.0
 // main.js — АВТОРЕШАТЕЛЬ капчи FunTime + TELEGRAM-ПУЛЬТ управления
 //           заход → капча → /reg → HUB → /anN-анархия → релей чата из Telegram.
 //
+// ============ ЧТО ИЗМЕНЕНО В v5.2.0 ============
+// 🔴 КРИТИЧЕСКИЙ ФИКС (найден E2E-тестом): minecraft-protocol ≥1.50 (его ставит свежий
+//   npm install mineflayer) ИГНОРИРУЕТ опцию «socket» и подключается к серверу НАПРЯМУЮ —
+//   заход шёл В ОБХОД ПРОКСИ, сервер видел РЕАЛЬНЫЙ IP владельца (риск бана домашнего IP;
+//   смена IP туннеля не работала). Теперь сокет туннеля передаётся через options.connect
+//   (+socket/stream для старых версий) — mcp ЛЮБОЙ версии идёт строго через прокси.
+// ФИКС «Parse error … array size is abnormally large» в ФАЗЕ СБОРА (лог 16:08): ошибки
+//   разбора пакетов больше НЕ фатальны и до сборки картинки — minecraft-protocol
+//   переподключает стрим, сборка стены продолжается (BotFilter шлёт кастомные пакеты).
+// ЗАХОД БЕЗ КАПЧИ: если сервер не показал капчу и сразу просит авторизацию (доверенный
+//   IP/ник — аккаунт из базы) — бот уходит в живую фазу через 800мс и делает /l (или /reg);
+//   «тихий» вариант: spawn + 15с без капчи при живом чате — тоже живой заход. Раньше такой
+//   заход 75с ждал несуществующую стену и падал (лог 16:08, заход 2).
+// СТОП РАБОТАЕТ СРАЗУ: «⏹ Выключить»/stop прерывает и фазу подключения (shouldStop в poll),
+//   а не ждёт до 75с таймаута сбора.
+// РАСПРЕДЕЛЕНИЕ ПО ТУННЕЛЯМ FILL-FIRST: первые maxAccountsPerTunnel(5) сессий → туннель 1,
+//   следующие → туннель 2… (6 ботов и 2 туннеля = 5+1, как ожидает пользователь).
+// ПРИВАТНОСТЬ: IP туннеля определяется ТОЛЬКО через сам туннель (proxyOnly) — реальный IP
+//   владельца больше не может попасть ни в лог, ни в TG-статус при мёртвом прокси.
 // ============ ЧТО ИЗМЕНЕНО В v5.1.1 ============
 // ФИКС «💀 Соединение закрыто: error: Parse error for play.toClient: Read error for
 //   undefined»: (1) ошибки РАЗБОРА пакетов в живой фазе больше НЕ убивают сессию —
@@ -1617,7 +1636,7 @@ function rotateIp(T, opt) {
 async function rotateIpNow(T, opt) {
   const tag = '[' + T.name + '] '
   const url = String(T.cfg.changeIpUrl || '').trim()
-  if (!url || url.includes('YOUR_KEY')) { T.ip = await currentIp({ T, quiet: true }); return T.ip }
+  if (!url || url.includes('YOUR_KEY')) { T.ip = await currentIp({ T, quiet: true, proxyOnly: true }); return T.ip }
 
   // сначала убеждаемся, что туннель вообще жив: иначе «IP не сменился» — это не про IP,
   // а про то, что спросить не у кого
@@ -1629,7 +1648,7 @@ async function rotateIpNow(T, opt) {
   }
 
   for (let round = 1; round <= 2; round++) {
-    const oldIp = await currentIp({ T, quiet: true })
+    const oldIp = await currentIp({ T, quiet: true, proxyOnly: true })
     step(tag + 'IP до ротации: ' + (oldIp || '?') + (T.state === 'dead' ? ' (напрямую — прокси мёртв)' : ''))
 
     // лимит провайдера: 30 секунд между сменами IP (иначе запрос молча отбрасывается)
@@ -1664,7 +1683,7 @@ async function rotateIpNow(T, opt) {
       step('  ⚠️ IP так НЕ меняют: сервер отдал веб-страницу. Нужна ссылка из панели «Мои прокси» → колонка «Смена IP»' +
         ' (вид https://changeip.mobileproxy.space/?proxy_key=XXXX), желательно с &format=json.')
       step('  ⚠️ Без рабочей смены IP бот будет каждый раз заходить с одного и того же адреса — FunTime его быстро забанит.')
-      T.ip = oldIp || await currentIp({ T, quiet: true })
+      T.ip = oldIp || await currentIp({ T, quiet: true, proxyOnly: true })
       return T.ip
     }
     T.lastLimited = !!(p && p.rateLimited)
@@ -1674,7 +1693,7 @@ async function rotateIpNow(T, opt) {
     const waitMs = Math.max(8000, (Number(T.cfg.waitSec) || 12) * 1000) * (T.lastLimited ? 2 : 1)
     while (!(newIp && (!oldIp || newIp !== oldIp)) && Date.now() - t0 < waitMs) {
       await sleep(2000)
-      const q = await currentIp({ T, quiet: true })
+      const q = await currentIp({ T, quiet: true, proxyOnly: true })
       if (q && (!oldIp || q !== oldIp)) newIp = q
     }
     if (newIp && (!oldIp || newIp !== oldIp)) {
@@ -1685,7 +1704,7 @@ async function rotateIpNow(T, opt) {
     if (T.state === 'dead') step(tag + 'IP не сменился: прокси мёртв, проверить смену нечем → node main.js --proxy-check')
     else step(tag + 'IP не сменился' + (T.lastLimited ? ' (лимит 30с — следующий запрос пройдёт)' : ' (провайдер иногда выдаёт тот же адрес — это нормально, пробую ещё раз)'))
   }
-  T.ip = await currentIp({ T, quiet: true }); return T.ip
+  T.ip = await currentIp({ T, quiet: true, proxyOnly: true }); return T.ip
 }
 
 // ========================= ДИАГНОСТИКА ТУННЕЛЕЙ: node main.js --proxy-check =========================
@@ -1812,7 +1831,7 @@ async function checkOneTunnel(T) {
 }
 
 async function runProxyCheck() {
-  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v5.1.1) ===')
+  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v5.2.0) ===')
   step('модуль socks: ' + (SocksClient ? 'установлен' : 'НЕТ (используется встроенный SOCKS5-клиент)'))
   if (!TUNNELS.length) {
     step('❌ в config.json нет ни секции "tunnels", ни proxy.host — заход возможен только напрямую')
@@ -2992,7 +3011,9 @@ function connectAndSolve(tag, opt) {
       maps: new Map(), mapFilled: new Map(), mapUpdatedAt: new Map(),
       frames: [], framesById: new Map(), chats: [], events: [], prompts: 0,
       dead: false, reason: '', metaDump: [], firstFrameAt: 0, lastMapAt: 0, lastChangeAt: 0,
-      parseErrs: 0     // v5.1.1: ошибки разбора пакетов (несмертельны; признак «чужой» версии)
+      parseErrs: 0,      // v5.1.1: ошибки разбора пакетов (несмертельны; признак «чужой» версии)
+      noCaptchaAt: 0,    // v5.2: сервер просит авторизацию БЕЗ капчи (доверие IP/ника)
+      spawnedAt: 0       // v5.2: момент spawn (для «тихого» no-captcha таймаута)
     }
     const ev = s => { col.events.push(new Date().toISOString().slice(11, 23) + ' ' + s); step('[' + tag + '] ' + s) }
 
@@ -3111,7 +3132,7 @@ function connectAndSolve(tag, opt) {
           try { if (bot) bot.end(reason || 'done') } catch (e) {}
         }
       }
-      resolve({ ok: true, live, note: note || '' })
+      resolve({ ok: true, live, note: note || '', noCaptcha: /^no-captcha/.test(String(note || '')) })
     }
 
     if (!mineflayer) { finishFail('mineflayer не установлен (npm i mineflayer)'); return }
@@ -3134,7 +3155,17 @@ function connectAndSolve(tag, opt) {
 
       bot = mineflayer.createBot({
         username: nick, host: MC.host, port: MC.port, version: MC.version,
-        socket: conn.socket, hideErrors: true, auth: 'offline', keepAlive: true, checkTimeoutInterval: 60000   // v5-фикс: опция В МС (было 60 → обрыв через 60мс)
+        socket: conn.socket, stream: conn.socket,
+        // КРИТИЧЕСКИЙ фикс v5.2: minecraft-protocol ≥1.50 (ставится свежим npm install) ИГНОРИРУЕТ
+        // опцию «socket» и делает net.connect(host, port) НАПРЯМУЮ — заход в ОБХОД ПРОКСИ
+        // (сервер видит реальный IP владельца, банит его; туннель/смена IP бессмысленны).
+        // Колбэк options.connect имеет приоритет над tcp_dns в любой версии mcp — передаём
+        // именно туннельный сокет. Старые версии mcp возьмут socket/stream.
+        // emit('connect') АСИНХРОННО: createClient вызывает options.connect ДО onReady(),
+        // где setProtocol только ПОДПИСЫВАЕТСЯ на 'connect' — синхронный emit теряется,
+        // handshake не уходит (mcp 1.54: setSocket форвардит лишь будущий TCP-connect).
+        connect: c => { c.setSocket(conn.socket); setImmediate(() => c.emit('connect')) },
+        hideErrors: true, auth: 'offline', keepAlive: true, checkTimeoutInterval: 60000   // v5-фикс: опция В МС (было 60 → обрыв через 60мс)
       })
 
       // ---------- map_data ----------
@@ -3258,6 +3289,14 @@ function connectAndSolve(tag, opt) {
         col.chats.push('[' + src + '] ' + s)
         col.lastChatAt = Date.now()
         if (PROMPT_RE.test(s) && /номер|цифр|капч|captcha|код|число/i.test(s)) { col.prompts++; ev('промпт капчи #' + col.prompts + ' (' + src + '): ' + s.slice(0, 80)) }
+        // v5.2: капчи НЕТ — сервер сразу зовёт авторизоваться (BotFilter доверился IP/нику;
+        // типично для аккаунта из базы, зарегистрированного с этого же IP). Запоминаем момент:
+        // poll через 800мс уйдёт в живую фазу «no-captcha», а сессия — сразу в authPhase (/l).
+        if (col.prompts === 0 && col.frames.length === 0 && !col.noCaptchaAt &&
+            (matchAny(s, SOLVER.authWords) || matchAny(s, SOLVER.successWords))) {
+          col.noCaptchaAt = Date.now()
+          ev('🚪 сервер НЕ показал капчу и просит авторизацию — живой заход без капчи (доверенный IP/ник)')
+        }
       }
       bot.on('message', m => { let t = ''; try { t = m.toString() } catch (e) {}; onText(t, 'chat') })
       try { bot.on('messagestr', s => onText(s, 'chatstr')) } catch (e) {}
@@ -3277,7 +3316,7 @@ function connectAndSolve(tag, opt) {
       }
 
       bot.on('login', () => { try { clearTimeout(loginT) } catch (e) {}; ev('login ok (' + nick + ') за ' + (Date.now() - tConn) + 'мс') })
-      bot.on('spawn', () => { try { clearTimeout(spawnT) } catch (e) {}; ev('spawn ok за ' + (Date.now() - tConn) + 'мс') })
+      bot.on('spawn', () => { try { clearTimeout(spawnT) } catch (e) {}; col.spawnedAt = Date.now(); ev('spawn ok за ' + (Date.now() - tConn) + 'мс') })
       bot.on('kicked', r => {
         col.dead = true; col.reason = 'kicked'
         const why = String((r && (r.reason || r.message)) || r || '').slice(0, 200)
@@ -3319,6 +3358,15 @@ function connectAndSolve(tag, opt) {
           }
           return
         }
+        // v5.2: ошибки разбора в фазе СБОРА тоже не фатальны: minecraft-protocol
+        // переподключает стрим, следующий пакет читается — продолжаем собирать стену.
+        // (Лог пользователя 16:08: «Parse error … array size is abnormally large» через 0.5с
+        // после login ронял заход, хотя соединение оставалось живым.)
+        if (isProtocolParseError(msg)) {
+          col.parseErrs++
+          ev('⚠️ ошибка разбора пакета #' + col.parseErrs + ' в фазе сбора (НЕ фатально, продолжаю): ' + msg.slice(0, 170))
+          return
+        }
         col.dead = true
         if (!col.reason) col.reason = 'error: ' + msg
         ev(col.reason)
@@ -3329,6 +3377,13 @@ function connectAndSolve(tag, opt) {
       pollT = setInterval(() => {
         try { scanEntities() } catch (e) {}
         if (finished) return          // живая фаза: только сканим сущности, готовность не проверяем
+        // v5.2: стоп по команде пользователя — выходим сразу, не дожидаясь сбора/таймаутов
+        if (opt.shouldStop && opt.shouldStop()) { finishFail('stopped by user'); return }
+        // v5.2: заход без капчи — сервер позвал авторизоваться (или молчит 15с после spawn,
+        // но что-то сказал в чат) — уходим в живую фазу, сессия сама сделает /l или /reg
+        if (col.noCaptchaAt && col.prompts === 0 && col.frames.length === 0 && Date.now() - col.noCaptchaAt >= 800) { goLive('no-captcha(auth-prompt)'); return }
+        if (!col.noCaptchaAt && col.spawnedAt && col.prompts === 0 && col.frames.length === 0 &&
+            col.chats.length > 0 && Date.now() - col.spawnedAt >= 15000) { goLive('no-captcha(silent-15s)'); return }
         const rd = readiness()
         if (rd.ready) {
           // v5: при ПОЛНЫХ данных всех плиток добор не нужен — 150мс вместо 800мс
@@ -4071,7 +4126,7 @@ async function runSession(S) {
       let conn = null
       try {
         conn = SESS_HOOKS.connect ? await SESS_HOOKS.connect(tag, { T: S.T, nick: S.acc.nick })
-                                  : await connectAndSolve(tag, { T: S.T, nick: S.acc.nick })
+                                  : await connectAndSolve(tag, { T: S.T, nick: S.acc.nick, shouldStop: () => S.stop })
       } catch (e) { conn = { ok: false, note: 'exception: ' + e.message } }
       // сначала назначаем live (даже при stop — чтобы finally гарантированно закрыл соединение),
       // потом проверяем стоп: иначе живой бот «повиснет» в игре после остановки
@@ -4103,12 +4158,22 @@ async function runSession(S) {
 
       let res = null
       try {
-        res = SESS_HOOKS.solve ? await SESS_HOOKS.solve(S.live, { label, tag, roundNo: S.roundNoBase + r, acc: S.acc })
-                               : await solveCaptchaOnLive(S.live, {
-                                   label, dirTag: 'sess' + S.id + '_r' + r, roundNo: S.roundNoBase + r,
-                                   acc: S.acc, loginFirst: S.acc.status === 'registered',
-                                   isStopped: () => S.stop
-                                 })
+        if (conn.noCaptcha && !SESS_HOOKS.solve) {
+          // v5.2: сервер НЕ показал капчу (доверенный IP/ник, аккаунт из базы) — сразу авторизация
+          step(label + ': 🚪 капчу не показали — сразу авторизация (' + (S.acc.status === 'registered' ? '/l, аккаунт из базы' : '/reg') + ')')
+          const auth = await authPhase(S.live, S.acc, label, { loginFirst: S.acc.status === 'registered' })
+          res = (auth && auth.ok)
+            ? { ok: true, stage: 'no-captcha', auth, attempts: [] }
+            : { ok: false, stage: 'no-captcha-auth', note: 'авторизация без капчи не прошла: ' + ((auth && (auth.kind || auth.stage)) || '?'),
+                kick: !!(auth && auth.kind === 'kick'), kickReason: (auth && auth.reason) || '', attempts: [] }
+        } else {
+          res = SESS_HOOKS.solve ? await SESS_HOOKS.solve(S.live, { label, tag, roundNo: S.roundNoBase + r, acc: S.acc })
+                                 : await solveCaptchaOnLive(S.live, {
+                                     label, dirTag: 'sess' + S.id + '_r' + r, roundNo: S.roundNoBase + r,
+                                     acc: S.acc, loginFirst: S.acc.status === 'registered',
+                                     isStopped: () => S.stop
+                                   })
+        }
       } catch (e) { res = { ok: false, stage: 'exception', note: e.message } }
       if (S.stop) break
 
@@ -4325,7 +4390,7 @@ function scheduleStatusEdit(S, force) {
   else if (!rec.timer) rec.timer = setTimeout(doEdit, wait)
 }
 
-const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.1.1\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
+const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.2.0\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
 const ALGO_STUB_TEXT = '🧩 Алгоритмы — ЗАГЛУШКА (в разработке).\n\nКаркас уже готов и работает: сессии, слоты физических каналов (≤' + SOLVER.maxAccountsPerTunnel + ' аккаунтов), приоритет алгоритмов выше личных, база аккаунтов, пресет анархии (algo.anarchy), headless-пул (--bots).\n\nВ следующей итерации здесь появится: выбор/настройка сценария (последовательность действий после анархии) и кнопка запуска.'
 
 function personalPanelText(chatId) {
@@ -4453,7 +4518,7 @@ async function onMessage(chatId, messageId, text) {
     return
   }
   if (/^\/help(\b|$)/i.test(t)) {
-    await tgSend(chatId, '🎮 Пульт v5.1.1\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
+    await tgSend(chatId, '🎮 Пульт v5.2.0\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
     return
   }
 
@@ -4549,14 +4614,14 @@ function tgUiStart() {
   TG_UI.startedAt = Math.floor(Date.now() / 1000)
   step('📱 TELEGRAM-ПУЛЬТ: запущен (бот id ' + (TG_CFG.token ? TG_CFG.token.split(':')[0] : '?') + ', whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО — никто не подключится') + ')')
   step('   кнопки «' + BTN_ALGO + '» и «' + BTN_PERSONAL + '» — на экране телефона (reply-клавиатура); отправьте /start в чат бота, если их не видно')
-  tgLog('пульт v5.1.1 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
+  tgLog('пульт v5.2.0 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
   tgUiLoop().catch(e => { tgLog('tgUiLoop fatal: ' + e.message); TG_UI.running = false })
 }
 function tgUiStop() { TG_UI.running = false }
 
 // ========================= SELFTEST (офлайн, без сервера и интернета) =========================
 async function selftest() {
-  console.log('=== SELFTEST v5.1.1: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
+  console.log('=== SELFTEST v5.2.0: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
   // самопроверка НЕ выходит в интернет: хост-модель Roboflow на это время выключаем,
   // иначе yoloRecognize сходил бы в облако вместо локального мок-сервера (и потратил кредиты)
   const rfReadyWas = RF.ready
@@ -5262,6 +5327,18 @@ async function selftest() {
     console.log('  ' + (okE ? '✅' : '❌') + ' isProtocolParseError: Parse/Deserialization/«Read error for undefined» → true; таймаут/ECONNRESET → false')
   }
 
+  // ============ v5.2.0: регрессия — туннельный сокет ОБЯЗАН уходить в mineflayer ============
+  console.log('--- v5.2.0: защита от прямого коннекта мимо прокси (mcp ≥1.50 игнорирует socket) ---')
+  {
+    const srcSelf = fs.readFileSync(__filename, 'utf8')
+    const okConn = srcSelf.indexOf('c.setSocket(conn.socket); setImmediate(() => c.emit(\'connect\'))') >= 0
+    const okStream = /stream: conn\.socket/.test(srcSelf)
+    const okSocket = /socket: conn\.socket/.test(srcSelf)
+    const okAll = okConn && okStream && okSocket
+    if (!okAll) fails++
+    console.log('  ' + (okAll ? '✅' : '❌') + ' createBot получает socket+stream+connect(сокет туннеля) — mcp любой версии пойдёт ЧЕРЕЗ ПРОКСИ [conn=' + okConn + ' stream=' + okStream + ' socket=' + okSocket + ']')
+  }
+
   // ============ v5.0.0: БАЗА АККАУНТОВ (9 кейсов, временный файл) ============
   console.log('--- v5.0.0: база аккаунтов learn/accounts_db.json (9 кейсов) ---')
   {
@@ -5522,8 +5599,8 @@ async function selftest() {
     let kb = null; try { kb = JSON.parse((menuRec.params && menuRec.params.reply_markup) || 'null') } catch (e) {}
     const okKb = !!kb && Array.isArray(kb.keyboard) && kb.resize_keyboard === true &&
       kb.keyboard[0].length === 2 && kb.keyboard[0][0].text === BTN_ALGO && kb.keyboard[0][1].text === BTN_PERSONAL
-    caseOk('1. /start → приветствие v5.1.1 + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
-      okMenu && menuText.indexOf('пульт управления v5.1.1') >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
+    caseOk('1. /start → приветствие v5.2.0 + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
+      okMenu && menuText.indexOf('пульт управления v5.2.0') >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
 
     // 2: нажатие экранной кнопки «🧩 Алгоритмы» (приходит текстом) → заглушка
     injMsg(1, 12, BTN_ALGO)
@@ -5640,8 +5717,11 @@ function buildCliSessions() {
   const n = Math.max(1, ACCOUNTS.count)
   const pool = algoTunnels().length ? algoTunnels() : TUNNELS
   const out = []
+  const cap = Math.max(1, SOLVER.maxAccountsPerTunnel)
   for (let i = 0; i < n; i++) {
-    const T = pool.length ? pool[i % pool.length] : null
+    // FILL-FIRST (v5.2): первые cap сессий → туннель 0, следующие cap → туннель 1 и т.д.
+    // (6 ботов при ёмкости 5 и двух туннелях = 5 в первом + 1 во втором, а не 3+3)
+    const T = pool.length ? pool[Math.min(pool.length - 1, Math.floor(i / cap))] : null
     let acc = T ? dbTakeFreeAlgo(T) : null
     if (!acc) acc = dbCreate('algo', T)
     out.push(makeSession({
@@ -5684,7 +5764,7 @@ async function runCliPool(sessions) {
 function printSummary(sessions, t0) {
   const solved = sessions.filter(S => S.solved).length
   const online = sessions.filter(S => ['hub', 'anarchy'].indexOf(S.state) >= 0).length
-  const L = ['=== СВОДКА v5.1.1 ===']
+  const L = ['=== СВОДКА v5.2.0 ===']
   L.push('сессий: ' + sessions.length + ' | решено капч: ' + solved + '/' + sessions.length + ' | в игре: ' + online + ' | время: ' + Math.round((Date.now() - t0) / 1000) + 'с')
   for (const l of sessionsSummary()) L.push(l)
   L.push('')
@@ -5735,7 +5815,7 @@ function printConfigSummary() {
 }
 
 async function main() {
-  step('=== СТАРТ v5.1.1 (авторешатель капчи FunTime + Telegram-пульт) ===')
+  step('=== СТАРТ v5.2.0 (авторешатель капчи FunTime + Telegram-пульт) ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const okTg = await runTgTest(); setTimeout(() => process.exit(okTg ? 0 : 1), 300); return }
@@ -5781,7 +5861,7 @@ async function main() {
     if (SOLVER.rotateOnStart) {
       try { T.ip = await rotateIp(T) } catch (e) { step('ротация IP ' + names + ': ' + e.message) }
     } else {
-      try { T.ip = await currentIp({ T, quiet: true }) } catch (e) {}
+      try { T.ip = await currentIp({ T, quiet: true, proxyOnly: true }) } catch (e) {}
       if (T.ip) step('туннель ' + names + ': IP ' + T.ip + ' (держится; ротация только особые случаи' + (CLI.rotate ? '' : '; --rotate = сменить при старте') + ')')
       else step('туннель ' + names + ': IP не определён' + (T.state === 'dead' ? ' (прокси не отвечает — node main.js --proxy-check)' : ''))
     }
@@ -5853,7 +5933,7 @@ if (require.main === module) {
   })
 }
 module.exports = {
-  VERSION: '5.1.1',
+  VERSION: '5.2.0',
   // палитра/PNG/геометрия (используют tools/*)
   PALETTE, SHADE_MULT, BASE_COLORS, LUM, palDist, rotQ, encodePng, colorPng, bwPng,
   clusterValues, detectWalls, wallMinFrames, buildGrid, viewpointHAsc, orientationCandidates, rotationCandidates,
