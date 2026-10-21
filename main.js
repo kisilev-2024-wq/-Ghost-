@@ -1,42 +1,43 @@
-// VERSION: 5.0.0
+// VERSION: 5.1.0
 // main.js — АВТОРЕШАТЕЛЬ капчи FunTime + TELEGRAM-ПУЛЬТ управления
 //           заход → капча → /reg → HUB → /anN-анархия → релей чата из Telegram.
 //
-// ============ ЧТО ИЗМЕНЕНО В v5.0.0 (пересборка из v4.0.0) ============
-// ИСПРАВЛЕН КРИТИЧЕСКИЙ БАГ ЗАПУСКА (лог пользователя 18:17):
-//   - checkTimeoutInterval: 60 → 60000. В minecraft-protocol опция В МИЛЛИСЕКУНДАХ:
-//     «client timed out after 60 milliseconds» рвал соединение сразу после логина.
-// ДОБАВЛЕНО:
-//   - TELEGRAM-ПУЛЬТ (основной режим): главное меню «Алгоритмы» (пока заглушка) /
-//     «Личный заход»; у каждого пользователя ТГ свой ПОСТОЯННЫЙ личный аккаунт и свой
-//     личный туннель (role=personal, приоритет слотов НИЖЕ алгоритмов); «Запуск»
-//     заменяет сообщение статус-блоком: 1-заход на сервер, 2-HUB, 3-анархия N +
-//     «написано аккаунтом» (пароль маскируется, список чистится при смене анархии) +
-//     кнопки «Выключить бота» / «Смена анархии»; whitelist telegram.allowedChatIds;
-//   - РЕЛЕЙ ЧАТА: в анархии любой текст из ТГ уходит в игровой чат, а сообщение в ТГ
-//     удаляется (не засорять); команда /anN (например /an304) меняет анархию — списки
-//     анархий из anarchy.ranges (премиальные не входят);
-//   - БАЗА АККАУНТОВ learn/accounts_db.json: созданный аккаунт сохраняется (ник, пароль,
-//     туннель, IP регистрации); при необходимости аккаунты БЕРУТСЯ ИЗ БАЗЫ (/l), и только
-//     потом создаются новые; личные (owner tg:CHAT) алгоритмам не выдаются;
-//   - СЛОТЫ ТУННЕЛЕЙ: не более solver.maxAccountsPerTunnel (5) одновременных аккаунтов
-//     на туннель; очередь с приоритетом algo (0) раньше personal (1);
-//   - АНТИ-АФК: в mineflayer встроенного нет (проверено по исходникам 4.25.0) — свой:
-//     swingArm + микро-поворот камеры каждые antiAfk.everyMs ± jitterMs;
-//   - АНАРХИИ: anarchy.ranges + парсер ТОЛЬКО /anN; allowAny для произвольных номеров;
-//   - --tg-test: диагностика связи с Telegram (какой транспорт живой);
-//   - headless-пул (--bots/--rounds) переведён на тот же движок сессий; algo.anarchy —
-//     анархия для headless-забега (null = остаться в HUB).
-// УСКОРЕНО (заход и решение картинки):
-//   - добор плитки при ПОЛНЫХ данных (allComplete): 800 → 150 мс;
-//   - пауза перед ответом по умолчанию: 500-1400 → 400-900 мс (solver.answerDelay*);
-//   - IP при старте ДЕРЖИТСЯ (solver.rotateOnStart=false, --rotate = сменить): меньше
-//     лишних ротаций, аккаунт из базы заходит со своего IP регистрации.
-// IP-ПРИВЯЗКА: точный IP у провайдера заказать НЕЛЬЗЯ (проверено по официальной
-//   документации MobileProxy.Space API — у changeip только proxy_key/format), поэтому:
-//   IP туннеля держится (ротация только «особые случаи»: бан-кик, серии провалов) +
-//   аккаунт запоминает IP регистрации в базе → повторный заход с тем же IP.
-// УДАЛЕНО: solveJoin/holdOnline/пул воркеров v4 (заменены движком сессий P62).
+// ============ ЧТО ИЗМЕНЕНО В v5.1.0 (над v5.0.0) ============
+// ЭКРАННЫЕ КНОПКИ: «🧩 Алгоритмы» и «👤 Личный заход» — reply-клавиатура Telegram,
+//   постоянно ВНИЗУ ЭКРАНА (не привязана к сообщению в чате); действия разделов
+//   (▶️ Запуск / 🔄 Смена ника / ⏹ Выключить / 🔀 Смена анархии) — под сообщениями.
+// ТУННЕЛИ = ФИЗИЧЕСКИЕ КАНАЛЫ MOBILEPROXY (один канал = один случайный IP из пула,
+//   смена через changeip API):
+//   - АВТОСОЗДАНИЕ ПО УМОЛЧАНИЮ: нет секции "tunnels" → из "proxy" создаётся пара
+//     «algo» (алгоритмы) + «personal» (личные заходы) на общем физканале;
+//   - личный туннель РОВНО ОДИН (лишние personal понижаются до algo; если в "tunnels"
+//     личного нет — выводится из первого); алгоритмических может быть НЕСКОЛЬКО;
+//   - связанные логические туннели делят физканал: общий IP, общий мьютекс/лимит 30с
+//     ротации, общие слоты (≤5 ЛЮБЫХ аккаунтов на канал), --proxy-check без дублей.
+// АУДИТ/ФИКСЫ: соединение закрывается даже при стопе во время захода (не «висит» в игре);
+//   date-фильтр призраков больше НЕ режет callback'и на старых сообщениях (кнопки работают
+//   после рестарта); сводка CLI-пула не зависает, если ботов больше, чем слотов (печатается
+//   через 20с после первого финиша, очередь видна в сводке); при недопустимой правке
+//   статус-блока он пересоздаётся новым сообщением; релей сообщает о закрытом соединении.
+// ИНТЕРФЕЙС: статус-блок — таймер сессии ⏱, попытка захода, подсказки по состоянию
+//   (в HUB — список анархий и /anN; в анархии — как работает релей; после стопа — повтор);
+//   панель личного захода — статус аккаунта, IP регистрации, свободные слоты; /help.
+// ПРИВАТНОСТЬ (не палим данные владельца): в Telegram НЕ уходят — пароли аккаунтов
+//   (везде ••••••), логины/пароли прокси, ключ Roboflow, токен бота, содержимое конфигов;
+//   чужие chat_id игнорируются без ответов (whitelist); сообщения релея и /anN удаляются.
+// ============ v5.0.0 (база этой сборки) ============
+// ФИКС checkTimeoutInterval 60→60000мс («client timed out after 60 milliseconds»);
+//   Telegram-пульт (статус-блоки 1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N, «написано аккаунтом»,
+//   whitelist, offset-flush + date-фильтр, троттлинг правок 1.2с); релей ТГ→игра с
+//   удалением сообщений; база аккаунтов learn/accounts_db.json (повторное использование,
+//   /l-first, приоритет «тот же IP → тот же туннель → любой»); слоты ≤5 на канал
+//   (приоритет algo > personal); анти-афк (swingArm + микро-look ~45с±15с); анархии
+//   /anN по диапазонам (102-112; 202-234; 302-323; 502-514; 902-904, премиум не входит);
+//   ускорение: settle 800→150мс при полных данных, ответ 400-900мс, IP при старте
+//   держится (rotateOnStart=false, --rotate); headless-пул --bots/--rounds через сессии
+//   (algo.anarchy); --tg-test диагностика транспортов.
+// IP-ПРИВЯЗКА: точный IP у MobileProxy заказать НЕЛЬЗЯ (у changeip только proxy_key/format)
+//   → IP туннеля держится, аккаунт запоминает IP регистрации → повторный заход с того же IP.
 // ========================================================================
 
 'use strict'
@@ -321,22 +322,9 @@ function makeTunnel(src, idx) {
     slots: { active: [], waiters: [] }   // v5: ≤maxAccountsPerTunnel одновременных аккаунтов
   }
 }
-function tunnelsFromConfig() {
-  const out = []
-  const list = cfgGet(CFG, 'tunnels', null)
-  if (Array.isArray(list) && list.length) {
-    list.forEach((t, i) => { const x = makeTunnel(t || {}, i); if (x) out.push(x) })
-  }
-  if (!out.length && PROXY.host) {
-    const x = makeTunnel({
-      name: 'proxy', host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password,
-      altHosts: cfgGet(CFG, 'proxy.altHosts', []) || [], changeIpUrl: PROXY.changeIpUrl,
-      waitAfterIpChangeSec: PROXY.waitSec, role: cfgGet(CFG, 'proxy.role', 'algo')
-    }, 0)
-    if (x) out.push(x)
-  }
-  return out
-}
+// (v5.1) tunnelsFromConfig переехал в блок «ТУННЕЛИ v5.1» ниже: автосоздание пары
+// algo+personal из "proxy", общий физканал (IP/ротация/слоты), личный туннель ровно один.
+// Объявление функции всплывает сюда, поэтому TUNNELS = tunnelsFromConfig() выше работает.
 const TUNNELS = tunnelsFromConfig()
 
 // ========================= АККАУНТЫ (ники/пароли, мультибот) =========================
@@ -419,6 +407,96 @@ function matchAny(text, words) {
 // резервный SOCKS-транспорт для облака Roboflow (roboflow.socksUrl; если пусто —
 // пробуем старый ключ telegram.apiProxy из прежних конфигов)
 const RF_SOCKS_URL = String(cfgGet(CFG, 'roboflow.socksUrl', '') || cfgGet(CFG, 'telegram.apiProxy', '') || '')
+
+// ========================= ТУННЕЛИ v5.1: ФИЗКАНАЛЫ, РОЛИ, АВТОСОЗДАНИЕ =========================
+// Туннель (глазами пользователя) = схема-прокси MobileProxy, у которой IP меняется через
+// changeip API на случайный из пула. Один купленный прокси = ОДИН физический канал (один IP
+// на всех, кто через него идёт). Логических туннелей на одном канале может быть несколько
+// (например «algo» + «personal») — тогда у них ОБЩИЕ: IP, смена IP (мьютекс + лимит 30с),
+// живой хост, ошибки и СЛОТЫ (≤maxAccountsPerTunnel ЛЮБЫХ аккаунтов на физический канал).
+// Несколько независимых каналов = несколько разных прокси в "tunnels".
+//
+// АВТОСОЗДАНИЕ ПО УМОЛЧАНИЮ: если секции "tunnels" нет — из секции "proxy" создаётся пара:
+// «algo» (для алгоритмов, может быть несколько при явной настройке) + «personal» (РОВНО ОДИН,
+// для личных заходов). Если "tunnels" заданы, но личного среди них нет — он выводится из
+// первого (общий физканал). Лишние «personal»понижаются до algo: личный туннель только один.
+function physKey(T) {
+  const c = (T && T.cfg) || {}
+  return [String(c.host || '').toLowerCase(), Number(c.port) || 0, String(c.username || ''), String(c.password || ''), String(c.changeIpUrl || '')].join('|')
+}
+// привязать логический туннель T к физическому каналу P (общее состояние через геттеры)
+function linkToPhysical(T, P) {
+  if (!T || !P || T === P) return
+  for (const k of ['okHost', 'state', 'errs', 'ip', 'lastChangeAt', 'lastLimited', 'rotating', 'failStreak']) {
+    try { Object.defineProperty(T, k, { get: () => P[k], set: v => { P[k] = v }, configurable: true, enumerable: true }) } catch (e) {}
+  }
+  T.physical = P
+  T.slots = P.slots          // общая очередь слотов: ≤5 ЛЮБЫХ аккаунтов на физический канал
+}
+// сгруппировать логические туннели по физическим каналам
+function dedupePhysical(list) {
+  const seen = new Map()
+  for (const T of list) {
+    const k = physKey(T)
+    if (seen.has(k)) linkToPhysical(T, seen.get(k))
+    else { T.physical = T; seen.set(k, T) }
+  }
+  return list
+}
+// личный туннель ТОЛЬКО ОДИН: первый остаётся personal, остальные понижаются до algo
+function enforceSinglePersonal(list, notes) {
+  let kept = null
+  for (const T of list) {
+    if (T.role !== 'personal') continue
+    if (!kept) { kept = T; continue }
+    T.role = 'algo'
+    if (notes) notes.push('туннель «' + T.name + '»: role=personal встречается больше одного раза — личный туннель только ОДИН (оставлен «' + kept.name + '»), этот переведён в algo')
+  }
+  return list
+}
+// Построение списка туннелей (функция объявлена здесь, но всплывает до вызова на уровне модуля)
+function tunnelsFromConfig(quiet) {
+  const out = []
+  const notes = quiet ? null : (out.notes = [])
+  const list = cfgGet(CFG, 'tunnels', null)
+  if (Array.isArray(list) && list.length) {
+    list.forEach((t, i) => { const x = makeTunnel(t || {}, i); if (x) out.push(x) })
+    // «tunnels» заданы, но личного нет — выводим из первого (общий физический канал)
+    if (out.length && !out.some(t => t.role === 'personal')) {
+      const base = out[0]
+      const p = makeTunnel({
+        name: base.name + '-personal', host: base.cfg.host, port: base.cfg.port,
+        username: base.cfg.username, password: base.cfg.password, altHosts: base.cfg.altHosts,
+        changeIpUrl: base.cfg.changeIpUrl, waitAfterIpChangeSec: base.cfg.waitSec, role: 'personal'
+      }, out.length)
+      if (p) {
+        out.push(p)
+        if (notes) notes.push('в "tunnels" нет туннеля с role=personal — автосоздан «' + p.name + '» (один физический канал с «' + base.name + '»: общие IP/ротация/слоты). Для ОТДЕЛЬНОГО личного IP добавьте второй прокси в "tunnels"')
+      }
+    }
+  }
+  if (!out.length && PROXY.host) {
+    // ПО УМОЛЧАНИЮ: один физический канал из "proxy" → логические «algo» + «personal»
+    const base = {
+      host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password,
+      altHosts: cfgGet(CFG, 'proxy.altHosts', []) || [], changeIpUrl: PROXY.changeIpUrl,
+      waitAfterIpChangeSec: PROXY.waitSec
+    }
+    const algo = makeTunnel(Object.assign({ name: 'algo', role: 'algo' }, base), 0)
+    const pers = makeTunnel(Object.assign({ name: 'personal', role: 'personal' }, base), 1)
+    if (algo) out.push(algo)
+    if (pers) out.push(pers)
+    if (notes && algo && pers) notes.push('нет секции "tunnels" — созданы туннели по умолчанию: «algo» (алгоритмы) + «personal» (личные заходы, ровно 1) на ОДНОМ физическом канале из "proxy" (общий IP, общая ротация, общие слоты ≤' + (Number(cfgGet(CFG, 'solver.maxAccountsPerTunnel', 5)) || 5) + '). Несколько независимых IP = несколько прокси в "tunnels"')
+  }
+  enforceSinglePersonal(out, notes)
+  dedupePhysical(out)
+  return out
+}
+function distinctPhysical(list) {
+  const seen = new Set(), out = []
+  for (const T of (list || [])) { const P = T.physical || T; if (!seen.has(P)) { seen.add(P); out.push(T) } }
+  return out
+}
 
 // ========================= КОНФИГ v5: TG-ПУЛЬТ, СЛОТЫ, АНАРХИИ, АНТИ-АФК =========================
 // дополнения SOLVER (v5)
@@ -515,7 +593,9 @@ const ACCOUNTS_DB_PATH = process.env.ACCOUNTS_DB ? path.resolve(process.env.ACCO
 function tunnelRole(src) { return String((src && src.role) || 'algo').toLowerCase() === 'personal' ? 'personal' : 'algo' }
 function personalTunnels() { return TUNNELS.filter(t => t.role === 'personal') }
 function algoTunnels() { return TUNNELS.filter(t => t.role !== 'personal') }
-// очередь слотов: algo (приоритет 0) проходит раньше personal (приоритет 1)
+// очередь слотов: algo (приоритет 0) проходит раньше personal (приоритет 1).
+// Слоты живут на ФИЗИЧЕСКОМ канале (у связанных туннелей T.slots === P.slots) —
+// ≤maxAccountsPerTunnel ЛЮБЫХ аккаунтов на один реальный прокси/IP.
 const SLOT_PRIORITY = { algo: 0, personal: 1 }
 function acquireSlot(T, kind, holder) {
   kind = SLOT_PRIORITY[kind] !== undefined ? kind : 'algo'
@@ -538,6 +618,7 @@ function releaseSlot(T, kind, holder) {
   if (w) { T.slots.active.push(w.kind); if (w.holder) w.holder.slotWaiter = null; try { w.resolve(true) } catch (e) {} }
 }
 function slotsUsed(T) { return T ? T.slots.active.length : 0 }
+function slotsFree(T) { return T ? Math.max(0, SOLVER.maxAccountsPerTunnel - T.slots.active.length) : 0 }
 
 // ========================= YOLO API (распознавание капчи FunTime) =========================
 // v3.14.0: основной распознаватель — ХОСТ-МОДЕЛЬ ROBOFLOW (см. блок ROBOFLOW ниже).
@@ -1720,7 +1801,7 @@ async function checkOneTunnel(T) {
 }
 
 async function runProxyCheck() {
-  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v4.0.0) ===')
+  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v5.1.0) ===')
   step('модуль socks: ' + (SocksClient ? 'установлен' : 'НЕТ (используется встроенный SOCKS5-клиент)'))
   if (!TUNNELS.length) {
     step('❌ в config.json нет ни секции "tunnels", ни proxy.host — заход возможен только напрямую')
@@ -1731,7 +1812,7 @@ async function runProxyCheck() {
     return !!directIp
   }
   let allOk = true
-  for (const T of TUNNELS) {
+  for (const T of distinctPhysical(TUNNELS)) {   // v5.1: один физканал не диагностируется дважды
     const ok = await checkOneTunnel(T)
     if (!ok) allOk = false
     step('')
@@ -3935,6 +4016,9 @@ async function runSession(S) {
         conn = SESS_HOOKS.connect ? await SESS_HOOKS.connect(tag, { T: S.T, nick: S.acc.nick })
                                   : await connectAndSolve(tag, { T: S.T, nick: S.acc.nick })
       } catch (e) { conn = { ok: false, note: 'exception: ' + e.message } }
+      // сначала назначаем live (даже при stop — чтобы finally гарантированно закрыл соединение),
+      // потом проверяем стоп: иначе живой бот «повиснет» в игре после остановки
+      if (conn && conn.ok) S.live = conn.live
       if (S.stop) break
       if (!conn || !conn.ok) {
         const note = (conn && conn.note) || 'connect fail'
@@ -3955,7 +4039,6 @@ async function runSession(S) {
       }
 
       // живое соединение: заворачиваем chat(), чтобы всё написанное аккаунтом попало в sentLog
-      S.live = conn.live
       const rawChat = S.live.chat.bind(S.live)
       S.live.chat = function (t) { S.logSent(t); return rawChat(t) }
       step(label + ': 🖼 картинка собрана за ' + ((Date.now() - tJoin) / 1000).toFixed(1) + 'с — решаю')
@@ -4078,9 +4161,15 @@ function sessionsSummary() {
   return L
 }
 
-// ========================= TELEGRAM-ПУЛЬТ (v5: меню, личный заход, статус-блок, релей) =========================
+// ========================= TELEGRAM-ПУЛЬТ (v5.1: экранные кнопки, статус-блок, релей) =========================
 // Основный режим запуска. whitelist — telegram.allowedChatIds; чужие chat_id игнорируются.
-// Защита от «призрачных» апдейтов: offset flush при старте + date-фильтр (порт логики v3.11.1).
+// Кнопки «Алгоритмы» и «Личный заход» — REPLY-клавиатура: она живёт ВНИЗУ ЭКРАНА Telegram
+// (постоянно на экране, не привязана к сообщению). Действия раздела (Запуск/Смена ника,
+// Выключить/Смена анархии) — inline-кнопки под соответствующим сообщением.
+// Защита от «призрачных» апдейтов: offset flush при старте + date-фильтр СООБЩЕНИЙ
+// (callback'и не фильтруем по дате: нажатие кнопки на старом сообщении — легитимно).
+// Приватность: в Telegram никогда не уходят пароли (маскировка ••••••), логины/пароли прокси,
+// ключи Roboflow, токен бота — только ник, имя туннеля, IP прокси, слоты и игровой лог.
 const TG_UI = {
   running: false,
   startedAt: 0,          // unix-секунды старта (date-фильтр призраков)
@@ -4090,18 +4179,20 @@ const TG_UI = {
   byChat: {}             // chatId → {pendingAnarchy: bool}
 }
 
-function kbInline(rows) { return { inline_keyboard: rows } }
-function kbMenu() {
-  return kbInline([[
-    { text: '🧩 Алгоритмы', callback_data: 'menu:algo' },
-    { text: '👤 Личный заход', callback_data: 'menu:personal' }
-  ]])
+// ---- экранные кнопки (reply-клавиатура, постоянно внизу экрана) ----
+const BTN_ALGO = '🧩 Алгоритмы'
+const BTN_PERSONAL = '👤 Личный заход'
+function kbScreen() {
+  return {
+    keyboard: [[{ text: BTN_ALGO }, { text: BTN_PERSONAL }]],
+    resize_keyboard: true,
+    is_persistent: true
+  }
 }
-function kbBack() { return kbInline([[{ text: '« Меню', callback_data: 'menu:back' }]]) }
+function kbInline(rows) { return { inline_keyboard: rows } }
 function kbPersonalPanel() {
   return kbInline([
-    [{ text: '▶️ Запуск', callback_data: 'p:start' }, { text: '🔄 Смена ника', callback_data: 'p:rotate' }],
-    [{ text: '« Меню', callback_data: 'menu:back' }]
+    [{ text: '▶️ Запуск', callback_data: 'p:start' }, { text: '🔄 Смена ника', callback_data: 'p:rotate' }]
   ])
 }
 function statusKb(S) {
@@ -4113,25 +4204,42 @@ function statusKb(S) {
   return kbInline(rows)
 }
 
-// текст статус-блока: статус 1/2/3 + «написано аккаунтом» между статусом и кнопками
+// время сессии в статус-блоке (мм:сс)
+function sessUptime(S) {
+  if (!S.startedAt) return ''
+  const s = Math.max(0, Math.floor(((S.finishedAt || Date.now()) - S.startedAt) / 1000))
+  const mm = String(Math.floor(s / 60)).padStart(2, '0')
+  const ss = String(s % 60).padStart(2, '0')
+  return mm + ':' + ss
+}
+
+// текст статус-блока: статус 1/2/3 + подсказка + «написано аккаунтом» (между статусом и кнопками)
 function statusBlockText(S) {
   const L = []
   L.push('👤 Личный заход — ' + (S.acc ? S.acc.nick : '?'))
   const st = S.state
-  if (st === 'queued') L.push('Статус: 1️⃣ Заход на сервер… (жду слот туннеля ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel + ')')
-  else if (st === 'joining') L.push('Статус: 1️⃣ Заход на сервер…')
-  else if (st === 'captcha') L.push('Статус: 1️⃣ Заход на сервер… (решаю капчу)')
+  if (st === 'queued') L.push('Статус: 1️⃣ Заход на сервер… (в очереди за слотом: ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel + ')')
+  else if (st === 'joining') L.push('Статус: 1️⃣ Заход на сервер… (подключение' + (S.roundNo > 1 ? ', попытка ' + S.roundNo : '') + ')')
+  else if (st === 'captcha') L.push('Статус: 1️⃣ Заход на сервер… (решаю капчу' + (S.roundNo > 1 ? ', попытка ' + S.roundNo : '') + ')')
   else if (st === 'hub') L.push('Статус: 2️⃣ HUB — выберите анархию')
   else if (st === 'anarchy') L.push('Статус: 3️⃣ Анархия ' + S.anarchy)
   else if (st === 'stopped') L.push('Статус: ⏹ Выключен')
   else if (st === 'dead') L.push('Статус: 💀 Соединение закрыто' + (S.error ? ': ' + String(S.error).slice(0, 60) : ''))
   else if (st === 'error') L.push('Статус: ❌ Ошибка: ' + String(S.error || S.lastError || '?').slice(0, 80))
   else L.push('Статус: ' + st)
-  L.push('Туннель «' + (S.T ? S.T.name : 'direct') + '» · IP ' + ((S.T && S.T.ip) || '?') + ' · слоты ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel)
+  const up = sessUptime(S)
+  L.push('Туннель «' + (S.T ? S.T.name : 'direct') + '» · IP ' + ((S.T && S.T.ip) || '?') + ' · слоты ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel + (up ? ' · ⏱ ' + up : ''))
+  L.push('────────────')
   if (st === 'hub') {
-    L.push('────────────')
     L.push('📜 Список анархий: ' + anarchyListText())
-    L.push('Отправьте команду /anN (например /an304). Премиальные в список не входят.')
+    L.push('Отправьте /anN (например /an304). Премиальные в список не входят.')
+  } else if (st === 'anarchy') {
+    L.push('✍️ Релей: всё, что напишете сюда, уходит в игровой чат (сообщения здесь удаляются).')
+    L.push('Смена анархии: /anN или кнопка 🔀.')
+  } else if (st === 'stopped' || st === 'dead' || st === 'error') {
+    L.push('Повтор: кнопка «▶️ Запустить заново» ниже.')
+  } else {
+    L.push('⏳ Идёт заход и решение капчи — статус обновляется автоматически.')
   }
   L.push('────────────')
   L.push('📝 Написано аккаунтом:')
@@ -4156,8 +4264,8 @@ function scheduleStatusEdit(S, force) {
   else if (!rec.timer) rec.timer = setTimeout(doEdit, wait)
 }
 
-const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.0.0\n\n🧩 Алгоритмы — готовые сценарии (в разработке)\n👤 Личный заход — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов'
-const ALGO_STUB_TEXT = '🧩 Алгоритмы — ЗАГЛУШКА (в разработке).\n\nКаркас готов: сессии, слоты туннелей (≤' + SOLVER.maxAccountsPerTunnel + '), приоритет алгоритмов выше личных, анархия-пресет (algo.anarchy).\nНаполнение сценариями (последовательности действий после анархии, настройка) — следующая итерация.'
+const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.1.0\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
+const ALGO_STUB_TEXT = '🧩 Алгоритмы — ЗАГЛУШКА (в разработке).\n\nКаркас уже готов и работает: сессии, слоты физических каналов (≤' + SOLVER.maxAccountsPerTunnel + ' аккаунтов), приоритет алгоритмов выше личных, база аккаунтов, пресет анархии (algo.anarchy), headless-пул (--bots).\n\nВ следующей итерации здесь появится: выбор/настройка сценария (последовательность действий после анархии) и кнопка запуска.'
 
 function personalPanelText(chatId) {
   const T = personalTunnels()[0]
@@ -4166,14 +4274,32 @@ function personalPanelText(chatId) {
   let acc = null
   for (const a of DB.accounts) if (a.owner === owner && a.status !== 'retired') acc = a
   const L = ['👤 Личный заход']
-  L.push(acc ? ('Ваш постоянный аккаунт: ' + acc.nick + ' (сам не меняется; статус: ' + acc.status + ')') : 'Личный аккаунт ещё не создан — будет создан при первом запуске.')
-  if (T) L.push('Туннель: «' + T.name + '» (role: personal)' + (T.ip ? ' · IP ' + T.ip : ''))
-  else L.push('⚠️ Личный туннель не задан — добавьте в config.json "tunnels": [ { …, "role": "personal" } ]')
-  L.push('«Смена ника» создаёт новый случайный аккаунт (старый остаётся в базе).')
+  if (acc) {
+    L.push('Ваш ПОСТОЯННЫЙ аккаунт: ' + acc.nick)
+    L.push('Статус: ' + (acc.status === 'registered' ? 'зарегистрирован (заход через /l)' : 'новый (будет /reg)') + (acc.ip ? ' · IP регистрации ' + acc.ip : '') + (acc.anarchy ? ' · анархия ' + acc.anarchy : ''))
+  } else {
+    L.push('Личный аккаунт ещё не создан — создадим при первом «▶️ Запуск».')
+  }
+  if (T) {
+    const phys = T.physical || T
+    L.push('Личный туннель: «' + T.name + '»' + (phys !== T ? ' (общий канал с «' + phys.name + '»)' : '') + ' · IP ' + (T.ip || '?') + ' · свободно слотов ' + slotsFree(T) + '/' + SOLVER.maxAccountsPerTunnel)
+  } else {
+    L.push('⚠️ Личный туннель не задан — добавьте в config.json "tunnels": [ { …, "role": "personal" } ]')
+  }
+  L.push('')
+  L.push('«🔄 Смена ника» — новый случайный аккаунт (старый остаётся в базе).')
   return L.join('\n')
 }
 
-async function sendMenu(chatId) { return await tgSend(chatId, MENU_TEXT, kbMenu()) }
+async function sendMenu(chatId) {
+  return await tgApi('sendMessage', { chat_id: chatId, text: MENU_TEXT, disable_web_page_preview: true, reply_markup: JSON.stringify(kbScreen()) })
+}
+async function sendAlgoStub(chatId) {
+  return await tgApi('sendMessage', { chat_id: chatId, text: ALGO_STUB_TEXT, disable_web_page_preview: true, reply_markup: JSON.stringify(kbScreen()) })
+}
+async function sendPersonalPanel(chatId) {
+  return await tgSend(chatId, personalPanelText(chatId), kbPersonalPanel())
+}
 
 async function startPersonal(chatId, messageId) {
   const existing = activeSessionOfChat(chatId)
@@ -4185,7 +4311,7 @@ async function startPersonal(chatId, messageId) {
   const T = personalTunnels()[0]
   if (!T) {
     tgLog('личный заход chat ' + chatId + ': личный туннель не задан')
-    await tgEdit(chatId, messageId, '⚠️ Личный туннель не задан.\n\nДобавьте в config.json второй прокси с ролью personal:\n"tunnels": [ { "name": "my", "host": "…", "port": …, "username": "…", "password": "…", "changeIpUrl": "…", "role": "personal" } ]\n\nЛичный заход использует ТОЛЬКО личный туннель (приоритет алгоритмов выше).', kbBack())
+    await tgEdit(chatId, messageId, '⚠️ Личный туннель не задан.\n\nДобавьте в config.json второй прокси с ролью personal:\n"tunnels": [ { "name": "my", "host": "…", "port": …, "username": "…", "password": "…", "changeIpUrl": "…", "role": "personal" } ]\n\n(По умолчанию бот и сам создаёт «personal» из секции "proxy" — этой надписи быть не должно, если в конфиге есть хотя бы proxy.host.)', kbInline([]))
     return
   }
   const acc = dbPersonal(chatId, T)
@@ -4193,30 +4319,35 @@ async function startPersonal(chatId, messageId) {
   SESSIONS.push(S)
   S.ui = { chatId, messageId }
   S.onChanged.push(() => scheduleStatusEdit(S))
-  await tgEdit(chatId, messageId, statusBlockText(S), statusKb(S))     // сообщение ЗАМЕНЯЕТСЯ статус-блоком
+  const r = await tgEdit(chatId, messageId, statusBlockText(S), statusKb(S))   // сообщение ЗАМЕНЯЕТСЯ статус-блоком
+  if (!r.ok) {
+    // старое сообщение править нельзя (удалено/старое) — шлём новый статус-блок
+    const r2 = await tgSend(chatId, statusBlockText(S), statusKb(S))
+    if (r2.ok && r2.result) S.ui = { chatId, messageId: r2.result.message_id }
+  }
   tgLog('личный заход запущен: chat ' + chatId + ', ник ' + acc.nick + ', туннель «' + T.name + '»')
   runSession(S).catch(e => { S.error = (e && e.message) || String(e); S.setState('error') })
 }
 
 async function rotatePersonal(chatId, messageId) {
   const existing = activeSessionOfChat(chatId)
-  if (existing) { await tgSend(chatId, '⚠️ Сначала остановите текущий заход («⏹ Выключить бота» или /stop), потом меняйте ник.'); return }
+  if (existing) { await tgSend(chatId, '⚠️ Сначала остановите текущий заход («⏹ Выключить бота» или /stop), потом меняйте ник.', kbScreen()); return }
   const T = personalTunnels()[0] || null
   const acc = dbPersonalRotate(chatId, T)
   tgLog('смена ника chat ' + chatId + ': новый аккаунт ' + acc.nick)
-  await tgEdit(chatId, messageId, personalPanelText(chatId) + '\n\n✅ Новый ник: ' + acc.nick, kbPersonalPanel())
+  await tgEdit(chatId, messageId, personalPanelText(chatId) + '\n✅ Новый ник: ' + acc.nick, kbPersonalPanel())
 }
 
 async function onCallback(chatId, data, message) {
   const mid = message && message.message_id
-  if (data === 'menu:back') { await tgEdit(chatId, mid, MENU_TEXT, kbMenu()); return }
-  if (data === 'menu:algo') { await tgEdit(chatId, mid, ALGO_STUB_TEXT, kbBack()); return }
+  if (data === 'menu:back' || data === 'menu') { await tgEdit(chatId, mid, MENU_TEXT, kbInline([])); return }
+  if (data === 'menu:algo') { await tgEdit(chatId, mid, ALGO_STUB_TEXT, kbInline([])); return }
   if (data === 'menu:personal') { await tgEdit(chatId, mid, personalPanelText(chatId), kbPersonalPanel()); return }
   if (data === 'p:start' || data === 'p:restart') { await startPersonal(chatId, mid); return }
   if (data === 'p:rotate') { await rotatePersonal(chatId, mid); return }
   if (data === 's:stop') {
     const S = activeSessionOfChat(chatId)
-    if (!S) { await tgSend(chatId, 'Активная сессия не найдена.'); return }
+    if (!S) { await tgSend(chatId, 'Активная сессия не найдена.', kbScreen()); return }
     stopSession(S, 'остановлено из Telegram')
     tgLog('стоп сессии ' + sessionLabel(S) + ' из chat ' + chatId)
     if (S.ui) scheduleStatusEdit(S, true)
@@ -4224,7 +4355,7 @@ async function onCallback(chatId, data, message) {
   }
   if (data === 's:anarchy') {
     const S = activeSessionOfChat(chatId)
-    if (!S || (S.state !== 'hub' && S.state !== 'anarchy')) { await tgSend(chatId, 'Смена анархии доступна только в активном заходе (HUB/анархия).'); return }
+    if (!S || (S.state !== 'hub' && S.state !== 'anarchy')) { await tgSend(chatId, 'Смена анархии доступна только в активном заходе (HUB/анархия).', kbScreen()); return }
     const st = TG_UI.byChat[chatId] || (TG_UI.byChat[chatId] = {})
     st.pendingAnarchy = true
     await tgSend(chatId, '🔀 Отправьте команду /anN (например /an304).\nСписок анархий: ' + anarchyListText() + '\n/cancel — отмена.')
@@ -4237,31 +4368,39 @@ async function onMessage(chatId, messageId, text) {
   const st = TG_UI.byChat[chatId] || (TG_UI.byChat[chatId] = {})
   const S = activeSessionOfChat(chatId)
 
-  if (/^\/start(\b|$)/i.test(t)) { await sendMenu(chatId); return }
+  // ---- экранные кнопки (reply-клавиатура приходит обычным текстом) ----
+  if (t === BTN_ALGO) { await sendAlgoStub(chatId); return }
+  if (t === BTN_PERSONAL) { await sendPersonalPanel(chatId); return }
+
+  // ---- команды ----
+  if (/^\/(start|menu)(\b|$)/i.test(t)) { await sendMenu(chatId); return }
   if (/^\/status(\b|$)/i.test(t)) {
-    if (!S) { await tgSend(chatId, 'Активных заходов нет. /start — меню.'); return }
+    if (!S) { await tgSend(chatId, 'Активных заходов нет. Кнопка «' + BTN_PERSONAL + '» внизу экрана — личный заход.', kbScreen()); return }
     await tgSend(chatId, statusBlockText(S), statusKb(S))
     return
   }
   if (/^\/stop(\b|$)/i.test(t)) {
-    if (!S) { await tgSend(chatId, 'Активных заходов нет.'); return }
+    if (!S) { await tgSend(chatId, 'Активных заходов нет.', kbScreen()); return }
     stopSession(S, 'остановлено из Telegram (/stop)')
     tgLog('стоп сессии ' + sessionLabel(S) + ' (/stop, chat ' + chatId + ')')
     return
   }
-  if (/^\/cancel(\b|$)/i.test(t)) { st.pendingAnarchy = false; await tgSend(chatId, 'Отменено.'); return }
+  if (/^\/cancel(\b|$)/i.test(t)) { st.pendingAnarchy = false; await tgSend(chatId, 'Отменено.', kbScreen()); return }
   if (/^\/accounts(\b|$)/i.test(t)) {
     const s = dbSummary()
-    await tgSend(chatId, '🗄 База аккаунтов (' + s.total + '): зарегистрировано ' + s.registered + ', личных ' + s.personal + ', алгоритмических ' + s.algo + ', занято ' + s.busy + ', в архиве ' + s.retired + '.\nФайл: learn/accounts_db.json')
+    await tgSend(chatId, '🗄 База аккаунтов (' + s.total + '): зарегистрировано ' + s.registered + ', личных ' + s.personal + ', алгоритмических ' + s.algo + ', занято ' + s.busy + ', в архиве ' + s.retired + '.\nФайл: learn/accounts_db.json', kbScreen())
     return
   }
-  if (/^\/help(\b|$)/i.test(t)) { await tgSend(chatId, 'Команды: /start меню · /status · /stop · /cancel · /accounts · /anN — смена анархии (в заходе) · любой текст в анархии — релей в игровой чат.'); return }
+  if (/^\/help(\b|$)/i.test(t)) {
+    await tgSend(chatId, '🎮 Пульт v5.1.0\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
+    return
+  }
 
   // /anN — смена анархии (только команда, «304» без /an — это релей)
   const n = parseAnarchyCmd(t)
   if (n !== null) {
     st.pendingAnarchy = false
-    if (!S || (S.state !== 'hub' && S.state !== 'anarchy')) { await tgSend(chatId, 'Анархию можно выбрать только в активном заходе (статус HUB или анархия).'); return }
+    if (!S || (S.state !== 'hub' && S.state !== 'anarchy')) { await tgSend(chatId, 'Анархию можно выбрать только в активном заходе (статус HUB или анархия).', kbScreen()); return }
     const r = await setAnarchy(S, n)
     if (!r.ok) { await tgSend(chatId, '⚠️ ' + r.error); return }
     await tgDelete(chatId, messageId)          // команду тоже удаляем — не засорять чат
@@ -4272,14 +4411,15 @@ async function onMessage(chatId, messageId, text) {
   // релей: в анархии любой текст → в игровой чат, сообщение в ТГ удалить
   if (S && S.state === 'anarchy' && S.live && !S.live.isDead()) {
     if (!t) return
-    S.live.chat(t)                               // обёртка chat() сама добавит строку в sentLog
+    const okChat = S.live.chat(t)              // обёртка chat() сама добавит строку в sentLog
+    if (okChat === false) { await tgSend(chatId, '⚠️ Сообщение не ушло: соединение с сервером закрыто.'); return }
     await tgDelete(chatId, messageId)
     if (S.ui) scheduleStatusEdit(S)
     return
   }
   if (S && S.state === 'hub') { await tgSend(chatId, 'Сначала выберите анархию: /anN (список: ' + anarchyListText() + ')'); return }
   if (S) { await tgSend(chatId, 'Сессия в состоянии «' + S.state + '» — релей текста доступен только в анархии.'); return }
-  await tgSend(chatId, 'Нет активного захода. /start — меню.')
+  await tgSend(chatId, 'Нет активного захода. Нажмите «' + BTN_PERSONAL + '» внизу экрана (или /start — меню).', kbScreen())
 }
 
 async function handleUpdate(u) {
@@ -4287,7 +4427,7 @@ async function handleUpdate(u) {
   const msg = u.message
   const chatId = cq ? (cq.message && cq.message.chat && cq.message.chat.id) : (msg && msg.chat && msg.chat.id)
   if (chatId === undefined || chatId === null) return
-  // whitelist: чужие chat_id игнорируются
+  // whitelist: чужие chat_id игнорируются (никаких ответов и логов содержимого)
   if (!tgAllowed(chatId)) { tgLog('запрет доступа: chat_id=' + chatId); return }
   if (cq) {
     try { await tgAnswerCb(cq.id) } catch (e) {}
@@ -4329,8 +4469,10 @@ async function tgUiLoop() {
     for (const u of list) {
       if (u && u.update_id) TG_UI.offset = u.update_id + 1     // offset сразу за апдейт (flush)
       try {
-        // date-фильтр призраков: апдейты ДО старта пульта игнорируем (date=0 — мок/локальный, пропускаем)
-        const d = u && (u.message ? u.message.date : (u.callback_query && u.callback_query.message ? u.callback_query.message.date : 0))
+        // date-фильтр призраков — ТОЛЬКО для сообщений: апдейты ДО старта пульта игнорируем
+        // (date=0 — мок/локальный endpoint, пропускаем). Callback'и не фильтруем: нажатие
+        // кнопки на «старом» статус-блоке после рестарта — легитимное действие.
+        const d = u && u.message ? u.message.date : 0
         if (d && TG_UI.startedAt && d < TG_UI.startedAt - 30) { dbg('[tg] призрачный апдейт ' + u.update_id + ' (date=' + d + ') — пропущен'); continue }
         await handleUpdate(u)
       } catch (e) { tgLog('handleUpdate ошибка: ' + e.message) }
@@ -4344,15 +4486,16 @@ function tgUiStart() {
   if (TG_UI.running) return
   TG_UI.running = true
   TG_UI.startedAt = Math.floor(Date.now() / 1000)
-  step('📱 TELEGRAM-ПУЛЬТ: запущен (бот ' + (TG_CFG.token ? TG_CFG.token.split(':')[0] : '?') + ', whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО — никто не подключится') + ')')
-  tgLog('пульт v5.0.0 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
+  step('📱 TELEGRAM-ПУЛЬТ: запущен (бот id ' + (TG_CFG.token ? TG_CFG.token.split(':')[0] : '?') + ', whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО — никто не подключится') + ')')
+  step('   кнопки «' + BTN_ALGO + '» и «' + BTN_PERSONAL + '» — на экране телефона (reply-клавиатура); отправьте /start в чат бота, если их не видно')
+  tgLog('пульт v5.1.0 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
   tgUiLoop().catch(e => { tgLog('tgUiLoop fatal: ' + e.message); TG_UI.running = false })
 }
 function tgUiStop() { TG_UI.running = false }
 
 // ========================= SELFTEST (офлайн, без сервера и интернета) =========================
 async function selftest() {
-  console.log('=== SELFTEST v5.0.0: геометрия сборки + туннели + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
+  console.log('=== SELFTEST v5.1.0: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
   // самопроверка НЕ выходит в интернет: хост-модель Roboflow на это время выключаем,
   // иначе yoloRecognize сходил бы в облако вместо локального мок-сервера (и потратил кредиты)
   const rfReadyWas = RF.ready
@@ -5002,6 +5145,41 @@ async function selftest() {
     console.log('  ' + (okList ? '✅' : '❌') + ' список анархий: «' + list + '»')
   }
 
+  // ============ v5.1.0: автосоздание туннелей (1 personal + ≥1 algo, общий физканал) ============
+  console.log('--- v5.1.0: туннели — автосоздание и физические каналы ---')
+  {
+    const tl = tunnelsFromConfig(true)          // quiet: не писать в TUNNELS.notes
+    const pers = tl.filter(t => t.role === 'personal')
+    const algo = tl.filter(t => t.role === 'algo')
+    const okAuto = PROXY.host ? (pers.length === 1 && algo.length >= 1) : tl.length === 0
+    if (!okAuto) fails++
+    console.log('  ' + (okAuto ? '✅' : '❌') + ' «tunnels» пуста → автосозданы: personal ровно 1 + algo ≥1 (proxy.host=' + (PROXY.host || 'нет') + ')')
+    if (PROXY.host && pers.length === 1 && algo.length >= 1) {
+      const okShare = pers[0].physical === algo[0].physical && pers[0].slots === algo[0].slots
+      algo[0].ip = '7.7.7.7'
+      const okIp = pers[0].ip === '7.7.7.7'
+      algo[0].ip = null
+      algo[0].lastChangeAt = 123
+      const okMutex = pers[0].lastChangeAt === 123
+      algo[0].lastChangeAt = 0
+      const okDedup = distinctPhysical(tl).length === 1
+      const okAll = okShare && okIp && okMutex && okDedup
+      if (!okAll) fails++
+      console.log('  ' + (okAll ? '✅' : '❌') + ' общий физканал: IP/ротация/слоты разделяются (запись через algo видна в personal), дедуп=1 канал')
+    }
+    // личный туннель ТОЛЬКО ОДИН: лишние personal понижаются до algo
+    const l2 = [makeTunnel({ name: 'p1', host: 'h1.example', port: 1, role: 'personal' }, 0),
+                makeTunnel({ name: 'p2', host: 'h2.example', port: 2, role: 'personal' }, 1),
+                makeTunnel({ name: 'a1', host: 'h3.example', port: 3, role: 'algo' }, 2)]
+    const notes2 = []
+    enforceSinglePersonal(l2, notes2)
+    dedupePhysical(l2)
+    const okSingle = l2.filter(t => t.role === 'personal').length === 1 && l2[0].role === 'personal' &&
+      l2[1].role === 'algo' && notes2.length === 1 && l2[0].physical !== l2[1].physical
+    if (!okSingle) fails++
+    console.log('  ' + (okSingle ? '✅' : '❌') + ' личный туннель только один: 2-й personal → algo (с заметкой); разные прокси = разные физканалы')
+  }
+
   // ============ v5.0.0: БАЗА АККАУНТОВ (9 кейсов, временный файл) ============
   console.log('--- v5.0.0: база аккаунтов learn/accounts_db.json (9 кейсов) ---')
   {
@@ -5155,8 +5333,8 @@ async function selftest() {
     try { fs.rmSync(dbDir, { recursive: true, force: true }) } catch (e) {}
   }
 
-  // ============ v5.0.0: TELEGRAM-ПУЛЬТ на мок-Bot-API (10 кейсов, офлайн) ============
-  console.log('--- v5.0.0: Telegram-пульт на мок-Bot-API (10 кейсов) ---')
+  // ============ v5.1.0: TELEGRAM-ПУЛЬТ на мок-Bot-API (10 кейсов, офлайн) ============
+  console.log('--- v5.1.0: Telegram-пульт на мок-Bot-API (10 кейсов) ---')
   {
     const dbDir2 = path.join(REC_ROOT || __dirname, 'selftest_tg_db')
     const tmpDb2 = path.join(dbDir2, 'accounts_db.json')
@@ -5204,6 +5382,9 @@ async function selftest() {
     TG_CFG.allowedChatIds = [1]
     TG_CFG.pollTimeoutSec = 0
     tgTransport = null
+    // убираем АВТОСОЗДАННЫЙ личный туннель (кейс 4 проверяет предупреждение без него)
+    const autoPers = personalTunnels().slice()
+    for (const t of autoPers) { const i = TUNNELS.indexOf(t); if (i >= 0) TUNNELS.splice(i, 1) }
     const persT = makeTunnel({ name: 'personal-test', host: '127.0.0.1', port: 9, role: 'personal' }, 900)
     persT.ip = '5.6.7.8'
 
@@ -5251,41 +5432,46 @@ async function selftest() {
     const caseOk = (name, ok, extra) => { if (!ok) fails++; results.push('  ' + (ok ? '✅' : '❌') + ' ' + name + (extra ? ' — ' + extra : '')) }
     const editWith = frag => edits.some(e => String((e.params && e.params.text) || '').indexOf(frag) >= 0)
 
-    // 1+2: /start → приветствие и меню с 2 кнопками
+    // 1: /start → приветствие + ЭКРАННАЯ reply-клавиатура (внизу экрана, не в сообщении)
     injMsg(1, 11, '/start')
     const okMenu = await waitFor(() => sent.length >= 1)
     const menuRec = sent[0] || {}
     const menuText = String((menuRec.params && menuRec.params.text) || '')
     let kb = null; try { kb = JSON.parse((menuRec.params && menuRec.params.reply_markup) || 'null') } catch (e) {}
-    caseOk('1. приветствие: /start → «пульт управления v5.0.0» в chat 1', okMenu && menuText.indexOf('пульт управления v5.0.0') >= 0 && menuRec.params && menuRec.params.chat_id === 1)
-    const okBtns = !!kb && Array.isArray(kb.inline_keyboard) && kb.inline_keyboard[0].length === 2 &&
-      kb.inline_keyboard[0][0].callback_data === 'menu:algo' && kb.inline_keyboard[0][1].callback_data === 'menu:personal' &&
-      kb.inline_keyboard[0][0].text.indexOf('Алгоритмы') >= 0 && kb.inline_keyboard[0][1].text.indexOf('Личный заход') >= 0
-    caseOk('2. меню: 2 кнопки «🧩 Алгоритмы» + «👤 Личный заход»', okBtns)
+    const okKb = !!kb && Array.isArray(kb.keyboard) && kb.resize_keyboard === true &&
+      kb.keyboard[0].length === 2 && kb.keyboard[0][0].text === BTN_ALGO && kb.keyboard[0][1].text === BTN_PERSONAL
+    caseOk('1. /start → приветствие v5.1.0 + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
+      okMenu && menuText.indexOf('пульт управления v5.1.0') >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
 
-    // 3: панель «Личный заход» (Запуск / Смена ника)
-    const menuMid = menuRec.mid
-    injCb(1, menuMid, 'menu:personal')
-    const okPanel = await waitFor(() => edits.some(e => e.mid === menuMid && String(e.params.text).indexOf('Личный заход') >= 0 &&
-      String(e.params.reply_markup || '').indexOf('p:start') >= 0 && String(e.params.reply_markup || '').indexOf('p:rotate') >= 0))
-    caseOk('3. панель личного захода: аккаунт + «▶️ Запуск»/«🔄 Смена ника»', okPanel)
+    // 2: нажатие экранной кнопки «🧩 Алгоритмы» (приходит текстом) → заглушка
+    injMsg(1, 12, BTN_ALGO)
+    const okStub = await waitFor(() => sent.some(s => String(s.params.text).indexOf('ЗАГЛУШКА') >= 0 && s.params.chat_id === 1))
+    caseOk('2. экранная кнопка «🧩 Алгоритмы» → сообщение-заглушка (каркас описан)', okStub)
+
+    // 3: нажатие «👤 Личный заход» → панель с inline-кнопками ▶️ Запуск / 🔄 Смена ника
+    injMsg(1, 13, BTN_PERSONAL)
+    const okPanel = await waitFor(() => sent.some(s => String(s.params.text).indexOf('👤 Личный заход') >= 0 &&
+      String(s.params.reply_markup || '').indexOf('p:start') >= 0 && String(s.params.reply_markup || '').indexOf('p:rotate') >= 0))
+    const panelRec = sent.find(s => String(s.params.text).indexOf('👤 Личный заход') >= 0) || {}
+    const panelMid = panelRec.mid
+    caseOk('3. экранная кнопка «👤 Личный заход» → панель аккаунта + [▶️ Запуск][🔄 Смена ника]', okPanel && !!panelMid)
 
     // 4: личного туннеля нет → предупреждение (запуск не стартует)
     const sessBefore = SESSIONS.length
-    injCb(1, menuMid, 'p:start')
+    injCb(1, panelMid, 'p:start')
     const okWarn = await waitFor(() => editWith('Личный туннель не задан'))
     caseOk('4. без туннеля role=personal: «⚠️ Личный туннель не задан», сессия не создана', okWarn && SESSIONS.length === sessBefore)
 
     // 5: добавляем личный туннель → Запуск → статус-блок 1️⃣ → 2️⃣ HUB + список анархий
     TUNNELS.push(persT)
-    injCb(1, menuMid, 'p:start')
+    injCb(1, panelMid, 'p:start')
     const okSess = await waitFor(() => SESSIONS.some(x => x.kind === 'personal' && String(x.tgChatId) === '1'))
     const S = SESSIONS.find(x => x.kind === 'personal' && String(x.tgChatId) === '1') || null
     const okBlock1 = await waitFor(() => editWith('👤 Личный заход —') && editWith('слоты'))
     const okHub = !!S && await waitFor(() => S.state === 'hub', 6000)
     const okBlock2 = await waitFor(() => edits.some(e => String(e.params.text).indexOf('2️⃣') >= 0 &&
       String(e.params.text).indexOf('Список анархий: 102-112') >= 0 && String(e.params.text).indexOf('> 48152') >= 0))
-    caseOk('5. «Запуск» → статус-блок: 1️⃣ заход → 2️⃣ HUB + список анархий + «написано аккаунтом»', okSess && okBlock1 && okHub && okBlock2, 'состояние: ' + (S ? S.state : 'нет сессии'))
+    caseOk('5. «▶️ Запуск» → статус-блок: 1️⃣ заход → 2️⃣ HUB + список анархий + «написано аккаунтом»', okSess && okBlock1 && okHub && okBlock2, 'состояние: ' + (S ? S.state : 'нет сессии'))
 
     if (S) {
       // 6: /an305 → в игру + ТГ-сообщение удалено; /an310 → смена + очистка sentLog
@@ -5309,7 +5495,6 @@ async function selftest() {
       caseOk('8. «305» без /an — это релей (анархия осталась ' + S.anarchy + ')', ok305 && S.anarchy === 310)
 
       // 9: чужой chat_id игнорируется + «призрачный» апдейт (date до старта) отброшен
-      // (сравниваем НЕ глобальные счётчики — троттлинг статус-блока может дать легальный edit в этом окне)
       const sentBefore = sent.length
       injMsg(999, 26, '/start')
       injMsg(1, 27, '/accounts', TG_UI.startedAt - 300)
@@ -5323,7 +5508,7 @@ async function selftest() {
       caseOk('9. чужой chat_id игнорируется («запрет доступа» в records/telegram.log), призрачный апдейт отброшен', okIgnore)
 
       // 10: «⏹ Выключить бота» → сессия stopped + финальный статус-блок
-      injCb(1, menuMid, 's:stop')
+      injCb(1, panelMid, 's:stop')
       const okStop = await waitFor(() => S.state === 'stopped', 5000)
       const okFinal = await waitFor(() => editWith('⏹ Выключен'))
       caseOk('10. «⏹ Выключить бота» → сессия остановлена (stopped), финальный блок', okStop && okFinal)
@@ -5333,12 +5518,13 @@ async function selftest() {
 
     for (const r of results) console.log(r)
 
-    // ---- уборка: гасим цикл, мок, хуки, туннель, конфиг, базу ----
+    // ---- уборка: гасим цикл, мок, хуки, туннели, конфиг, базу ----
     TG_UI.running = false
     try { await Promise.race([loopP, sleep(1500)]) } catch (e) {}
     try { srv.close() } catch (e) {}
     SESS_HOOKS.connect = savedHooks.c; SESS_HOOKS.solve = savedHooks.s
     const iT = TUNNELS.indexOf(persT); if (iT >= 0) TUNNELS.splice(iT, 1)
+    for (const t of autoPers) if (TUNNELS.indexOf(t) < 0) TUNNELS.push(t)
     TG_CFG.apiUrl = savedTG.apiUrl; TG_CFG.token = savedTG.token
     TG_CFG.allowedChatIds = savedTG.allowed; TG_CFG.pollTimeoutSec = savedTG.poll
     tgTransport = null
@@ -5387,9 +5573,15 @@ function buildCliSessions() {
 
 async function runCliPool(sessions) {
   const t0 = Date.now()
+  // ёмкость: слоты считаются на ФИЗИЧЕСКИЙ канал (общий IP)
+  const capacity = distinctPhysical(TUNNELS).length * SOLVER.maxAccountsPerTunnel
   step('ПУЛ v5: ' + sessions.length + ' сессия(й) × до ' + SOLVER.roundsPerBot + ' заходов | туннелей: ' + (TUNNELS.length || 0) +
-    ' (algo: ' + algoTunnels().length + ', personal: ' + personalTunnels().length + ') | слоты ≤' + SOLVER.maxAccountsPerTunnel +
+    ' (algo: ' + algoTunnels().length + ', personal: ' + personalTunnels().length + ', физканалов: ' + distinctPhysical(TUNNELS).length + ')' +
+    ' | слоты ≤' + SOLVER.maxAccountsPerTunnel + '/канал (всего ' + capacity + ')' +
     ' | старт вразнобой через ' + ACCOUNTS.staggerMs + 'мс | после успеха: HUB' + (ALGO.anarchy ? ' → /an' + ALGO.anarchy : ' (анархия не задана)'))
+  if (capacity > 0 && sessions.length > capacity) {
+    step('⚠️ сессий (' + sessions.length + ') больше, чем слотов (' + capacity + ') — остальные стартуют, когда слот освободится (сводка будет через 20с после первого финиша)')
+  }
   for (const S of sessions) {
     SESSIONS.push(S)
     step(sessionLabel(S) + ': ник «' + S.acc.nick + '» (' + (S.acc.status === 'registered' ? 'из базы, /l' : 'новый, /reg') + '), туннель «' + (S.T ? S.T.name : 'direct') + '»')
@@ -5399,15 +5591,18 @@ async function runCliPool(sessions) {
     if (S.stop) return
     await runSession(S)
   })())
-  // ждём, пока каждая сессия дойдёт до HUB/анархии или завершится (в HUB она остаётся жить)
-  await Promise.all(sessions.map(S => S.settledPromise))
+  // ждём, пока ВСЕ сессии дойдут до HUB/анархии или завершатся; но если часть стоит в очереди
+  // за слотами (ёмкость исчерпана) — сводка печатается через 20с после первого финиша
+  const allSettled = Promise.all(sessions.map(S => S.settledPromise))
+  const firstSettled = Promise.race(sessions.map(S => S.settledPromise)).then(() => sleep(20000))
+  await Promise.race([allSettled, firstSettled])
   return { t0, tasks }
 }
 
 function printSummary(sessions, t0) {
   const solved = sessions.filter(S => S.solved).length
   const online = sessions.filter(S => ['hub', 'anarchy'].indexOf(S.state) >= 0).length
-  const L = ['=== СВОДКА v5.0.0 ===']
+  const L = ['=== СВОДКА v5.1.0 ===']
   L.push('сессий: ' + sessions.length + ' | решено капч: ' + solved + '/' + sessions.length + ' | в игре: ' + online + ' | время: ' + Math.round((Date.now() - t0) / 1000) + 'с')
   for (const l of sessionsSummary()) L.push(l)
   L.push('')
@@ -5416,7 +5611,7 @@ function printSummary(sessions, t0) {
   flushReport(L.join('\n'))
   try {
     fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '5.0.0', sessions: sessions.length, solved, online,
+      stamp: STAMP, version: '5.1.0', sessions: sessions.length, solved, online,
       seconds: Math.round((Date.now() - t0) / 1000),
       results: sessions.map(S => ({
         id: S.id, kind: S.kind, nick: S.acc ? S.acc.nick : '', tunnel: S.T ? S.T.name : 'direct',
@@ -5435,7 +5630,12 @@ function printConfigSummary() {
   step('config: ' + (CFG_PATH || 'НЕТ') + ' parse=' + CFG_STRATEGY)
   step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version)
   if (TUNNELS.length) {
-    for (const T of TUNNELS) step('🔌 туннель «' + T.name + '» (role: ' + T.role + '): ' + T.cfg.host + ':' + T.cfg.port + (T.cfg.username ? ' (логин ' + T.cfg.username + ')' : '') + ' | смена IP: ' + describeChangeIpUrl(T.cfg.changeIpUrl))
+    for (const T of TUNNELS) {
+      const phys = T.physical || T
+      step('🔌 туннель «' + T.name + '» (role: ' + T.role + (phys !== T ? ', общий канал с «' + phys.name + '»' : '') + '): ' + T.cfg.host + ':' + T.cfg.port + (T.cfg.username ? ' (логин ' + T.cfg.username + ')' : '') + ' | смена IP: ' + describeChangeIpUrl(T.cfg.changeIpUrl))
+    }
+    step('   физканалов: ' + distinctPhysical(TUNNELS).length + ' | слоты: ≤' + SOLVER.maxAccountsPerTunnel + ' ЛЮБЫХ аккаунтов на физканал (приоритет algo > personal)')
+    for (const n of (TUNNELS.notes || [])) step('   ℹ️ ' + n)
     if (!personalTunnels().length) step('⚠️ нет туннеля с role=personal — «Личный заход» в Telegram не запустится (добавьте в "tunnels")')
   } else {
     step('⚠️ туннели/прокси НЕ заданы' + (CAP.allowDirect ? ' — заход НАПРЯМУЮ (proxy.allowDirect=true), FunTime может быстро забанить ваш IP' : ' — заходы невозможны (нет proxy.host; для прямого захода включите "proxy": { "allowDirect": true })'))
@@ -5453,7 +5653,7 @@ function printConfigSummary() {
 }
 
 async function main() {
-  step('=== СТАРТ v5.0.0 (авторешатель капчи FunTime + Telegram-пульт) ===')
+  step('=== СТАРТ v5.1.0 (авторешатель капчи FunTime + Telegram-пульт) ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const okTg = await runTgTest(); setTimeout(() => process.exit(okTg ? 0 : 1), 300); return }
@@ -5492,14 +5692,16 @@ async function main() {
   }
 
   // ---- IP при старте: по умолчанию ДЕРЖИТСЯ (узнаётся currentIp и фиксируется) ----
-  // ротация — только solver.rotateOnStart=true / --rotate / «особые случаи» в сессиях
-  for (const T of TUNNELS) {
+  // ротация — только solver.rotateOnStart=true / --rotate / «особые случаи» в сессиях.
+  // Опрос/ротация — по РАЗЛИЧНЫМ физическим каналам (связанные логические туннели делят IP)
+  for (const T of distinctPhysical(TUNNELS)) {
+    const names = TUNNELS.filter(x => (x.physical || x) === T).map(x => '«' + x.name + '»').join('+')
     if (SOLVER.rotateOnStart) {
-      try { T.ip = await rotateIp(T) } catch (e) { step('ротация IP «' + T.name + '»: ' + e.message) }
+      try { T.ip = await rotateIp(T) } catch (e) { step('ротация IP ' + names + ': ' + e.message) }
     } else {
       try { T.ip = await currentIp({ T, quiet: true }) } catch (e) {}
-      if (T.ip) step('туннель «' + T.name + '»: IP ' + T.ip + ' (держится; ротация только особые случаи' + (CLI.rotate ? '' : '; --rotate = сменить при старте') + ')')
-      else step('туннель «' + T.name + '»: IP не определён' + (T.state === 'dead' ? ' (прокси не отвечает — node main.js --proxy-check)' : ''))
+      if (T.ip) step('туннель ' + names + ': IP ' + T.ip + ' (держится; ротация только особые случаи' + (CLI.rotate ? '' : '; --rotate = сменить при старте') + ')')
+      else step('туннель ' + names + ': IP не определён' + (T.state === 'dead' ? ' (прокси не отвечает — node main.js --proxy-check)' : ''))
     }
   }
 
@@ -5544,7 +5746,7 @@ if (require.main === module) {
   })
 }
 module.exports = {
-  VERSION: '5.0.0',
+  VERSION: '5.1.0',
   // палитра/PNG/геометрия (используют tools/*)
   PALETTE, SHADE_MULT, BASE_COLORS, LUM, palDist, rotQ, encodePng, colorPng, bwPng,
   clusterValues, detectWalls, wallMinFrames, buildGrid, viewpointHAsc, orientationCandidates, rotationCandidates,
@@ -5563,7 +5765,8 @@ module.exports = {
   httpsRequest, parseSocksUrl, socksTlsConnect, openSocksTunnel,
   // туннели/прокси/слоты
   TUNNELS, makeTunnel, tunnelsFromConfig, tunnelRole, personalTunnels, algoTunnels,
-  SLOT_PRIORITY, acquireSlot, releaseSlot, slotsUsed,
+  physKey, linkToPhysical, dedupePhysical, enforceSinglePersonal, distinctPhysical,
+  SLOT_PRIORITY, acquireSlot, releaseSlot, slotsUsed, slotsFree,
   proxyHostCandidates, socks5Open, httpConnect, httpThrough, proxyTunnel,
   proxyConnect, proxyAlive, currentIp, socksHint, parseChangeIpResponse, ensureJsonParam,
   describeChangeIpUrl, runProxyCheck, checkOneTunnel, mcStatusPing, PROXY, rotateIp, isIpV4, altHostOf,
@@ -5573,8 +5776,8 @@ module.exports = {
   // Telegram-пульт (транспорт + UI)
   TG_CFG, tgAllowed, tgApi, tgSend, tgEdit, tgDelete, tgAnswerCb, tgGetUpdates, tgLog, tgTransports, runTgTest,
   TG_UI, tgUiStart, tgUiStop, tgUiLoop, handleUpdate, onMessage, onCallback, startPersonal, rotatePersonal, sendMenu,
-  statusBlockText, statusKb, scheduleStatusEdit, kbInline, kbMenu, kbBack, kbPersonalPanel,
-  MENU_TEXT, ALGO_STUB_TEXT, personalPanelText,
+  statusBlockText, statusKb, scheduleStatusEdit, kbInline, kbScreen, kbPersonalPanel, sessUptime,
+  MENU_TEXT, ALGO_STUB_TEXT, personalPanelText, BTN_ALGO, BTN_PERSONAL, sendAlgoStub, sendPersonalPanel,
   // база аккаунтов
   DB, DB_PATH, dbSetPath, dbLoad, dbSave, dbCreate, dbPersonal, dbPersonalRotate, dbTakeFreeAlgo,
   dbMarkBusy, dbMarkRegistered, dbSetAnarchy, dbSummary, ACCOUNTS_DB_PATH,
