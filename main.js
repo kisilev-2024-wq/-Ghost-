@@ -1,36 +1,44 @@
-// VERSION: 4.0.0
-// main.js — АВТОРЕШАТЕЛЬ капчи FunTime: заход → сборка картинки → облачное распознавание
-//           → ответ в чат сервера → /reg случайным паролем → остаётся в игре.
+// VERSION: 5.0.0
+// main.js — АВТОРЕШАТЕЛЬ капчи FunTime + TELEGRAM-ПУЛЬТ управления
+//           заход → капча → /reg → HUB → /anN-анархия → релей чата из Telegram.
 //
-// ============ ЧТО ИЗМЕНЕНО В v4.0.0 (пересборка из v3.14.0) ============
-// УБРАНО ПОД КОРЕНЬ (по требованию заказчика):
-//   - локальный распознаватель цифр целиком: сегментация «на 5», k-NN, MLP,
-//     база глифов learn/glyphs.jsonl, аугментации, «замок стиля», обучение;
-//   - Telegram-бот-разметчик целиком (транспорт, очередь, сессия обучения, /glyphs,
-//     /train, /status, streak-логика);
-//   - офлайн-инструменты местной базы: --label --train --autotune --diag
-//     --import-answers --export-yolo --replay --replay-all --tg-test;
-//   - тяжёлые артефакты раунда: tiles/, variants/, mask, glyphs/, segmentation-отчёты.
-// ОСТАВЛЕНО (проверенный боевой конвейер):
-//   - заход на сервер mineflayer'ом и СБОРКА картинки капчи со стены item_frame-карт
-//     (палитра карт, геометрия сетки, повороты плиток, швы, скоринг выбора стены);
-//   - мобильный прокси: свой SOCKS5-клиент, резервные хосты bproxy/mproxy,
-//     смена IP через changeip API (лимит 30 с), диагностика --proxy-check;
-//   - распознавание ТЕКСТА с картинки: облако Roboflow captcha-funtime/2 (основное,
-//     12/12 на контрольной выборке) → запасные YOLO HTTP-серверы (yolo_server.py);
-//   - запись раундов в records/ (облегчённая: картинка, layout, walls_debug, чат, событие).
+// ============ ЧТО ИЗМЕНЕНО В v5.0.0 (пересборка из v4.0.0) ============
+// ИСПРАВЛЕН КРИТИЧЕСКИЙ БАГ ЗАПУСКА (лог пользователя 18:17):
+//   - checkTimeoutInterval: 60 → 60000. В minecraft-protocol опция В МИЛЛИСЕКУНДАХ:
+//     «client timed out after 60 milliseconds» рвал соединение сразу после логина.
 // ДОБАВЛЕНО:
-//   - ОТПРАВКА ОТВЕТА В ЧАТ СЕРВЕРА: bot.chat(цифры) сразу после распознавания,
-//     не разрывая соединение; контроль результата по чату/кику (успех, «неверно»,
-//     новая капча, кик) и до N попыток в рамках одного захода;
-//   - АВТОРИЗАЦИЯ после капчи: /reg случайным паролем (или /l, если аккаунт уже
-//     существует). Ник и пароль генерируются случайно на каждый заход;
-//   - ТУННЕЛИ: каждый туннель = отдельный прокси-канал со своим IP и своей ротацией.
-//     Боты распределяются по туннелям round-robin. Расчёт на 2+ туннеля (обычно 1):
-//     config.json → "tunnels": [ {...}, {...} ] (без него — один туннель из "proxy");
-//   - МУЛЬТИБОТ: accounts.count ботов параллельно (расчёт на N, обычно 1), каждый со
-//     своим ником/паролем, стартуют вразнобой (accounts.staggerMs).
+//   - TELEGRAM-ПУЛЬТ (основной режим): главное меню «Алгоритмы» (пока заглушка) /
+//     «Личный заход»; у каждого пользователя ТГ свой ПОСТОЯННЫЙ личный аккаунт и свой
+//     личный туннель (role=personal, приоритет слотов НИЖЕ алгоритмов); «Запуск»
+//     заменяет сообщение статус-блоком: 1-заход на сервер, 2-HUB, 3-анархия N +
+//     «написано аккаунтом» (пароль маскируется, список чистится при смене анархии) +
+//     кнопки «Выключить бота» / «Смена анархии»; whitelist telegram.allowedChatIds;
+//   - РЕЛЕЙ ЧАТА: в анархии любой текст из ТГ уходит в игровой чат, а сообщение в ТГ
+//     удаляется (не засорять); команда /anN (например /an304) меняет анархию — списки
+//     анархий из anarchy.ranges (премиальные не входят);
+//   - БАЗА АККАУНТОВ learn/accounts_db.json: созданный аккаунт сохраняется (ник, пароль,
+//     туннель, IP регистрации); при необходимости аккаунты БЕРУТСЯ ИЗ БАЗЫ (/l), и только
+//     потом создаются новые; личные (owner tg:CHAT) алгоритмам не выдаются;
+//   - СЛОТЫ ТУННЕЛЕЙ: не более solver.maxAccountsPerTunnel (5) одновременных аккаунтов
+//     на туннель; очередь с приоритетом algo (0) раньше personal (1);
+//   - АНТИ-АФК: в mineflayer встроенного нет (проверено по исходникам 4.25.0) — свой:
+//     swingArm + микро-поворот камеры каждые antiAfk.everyMs ± jitterMs;
+//   - АНАРХИИ: anarchy.ranges + парсер ТОЛЬКО /anN; allowAny для произвольных номеров;
+//   - --tg-test: диагностика связи с Telegram (какой транспорт живой);
+//   - headless-пул (--bots/--rounds) переведён на тот же движок сессий; algo.anarchy —
+//     анархия для headless-забега (null = остаться в HUB).
+// УСКОРЕНО (заход и решение картинки):
+//   - добор плитки при ПОЛНЫХ данных (allComplete): 800 → 150 мс;
+//   - пауза перед ответом по умолчанию: 500-1400 → 400-900 мс (solver.answerDelay*);
+//   - IP при старте ДЕРЖИТСЯ (solver.rotateOnStart=false, --rotate = сменить): меньше
+//     лишних ротаций, аккаунт из базы заходит со своего IP регистрации.
+// IP-ПРИВЯЗКА: точный IP у провайдера заказать НЕЛЬЗЯ (проверено по официальной
+//   документации MobileProxy.Space API — у changeip только proxy_key/format), поэтому:
+//   IP туннеля держится (ротация только «особые случаи»: бан-кик, серии провалов) +
+//   аккаунт запоминает IP регистрации в базе → повторный заход с тем же IP.
+// УДАЛЕНО: solveJoin/holdOnline/пул воркеров v4 (заменены движком сессий P62).
 // ========================================================================
+
 'use strict'
 
 const fs = require('fs')
@@ -71,7 +79,11 @@ const CLI = {
   rfTestFile: strVal('rf-test') || strVal('roboflow-test'),
   yoloTest: strVal('yolo-test'),
   // выйти сразу после успеха (не оставаться в игре)
-  noHold: ARGV.includes('--no-hold')
+  noHold: ARGV.includes('--no-hold'),
+  // диагностика связи с Telegram (какой транспорт живой)
+  tgTest: ARGV.includes('--tg-test'),
+  // сменить IP туннелей при старте (по умолчанию IP ДЕРЖИТСЯ: solver.rotateOnStart=false)
+  rotate: ARGV.includes('--rotate')
 }
 
 // ========================= КОНСТАНТЫ ЗАБЕГА =========================
@@ -288,6 +300,7 @@ function makeTunnel(src, idx) {
   return {
     id: idx,
     name: String(src.name || ('tunnel' + (idx + 1))),
+    role: tunnelRole(src),   // 'algo' (по умолчанию) | 'personal' (v5)
     cfg: {
       host,
       port: Number(src.port) || 1080,
@@ -304,7 +317,8 @@ function makeTunnel(src, idx) {
     lastChangeAt: 0,       // лимит провайдера: 30 с между сменами IP
     lastLimited: false,
     rotating: null,        // промис текущей ротации (мьютекс)
-    failStreak: 0          // сетевые фейлы подряд (порог rotateOnNetFails)
+    failStreak: 0,         // сетевые фейлы подряд (порог rotateOnNetFails)
+    slots: { active: [], waiters: [] }   // v5: ≤maxAccountsPerTunnel одновременных аккаунтов
   }
 }
 function tunnelsFromConfig() {
@@ -317,7 +331,7 @@ function tunnelsFromConfig() {
     const x = makeTunnel({
       name: 'proxy', host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password,
       altHosts: cfgGet(CFG, 'proxy.altHosts', []) || [], changeIpUrl: PROXY.changeIpUrl,
-      waitAfterIpChangeSec: PROXY.waitSec
+      waitAfterIpChangeSec: PROXY.waitSec, role: cfgGet(CFG, 'proxy.role', 'algo')
     }, 0)
     if (x) out.push(x)
   }
@@ -371,8 +385,8 @@ const SOLVER = {
   roundsPerBot: CLI.rounds > 0 ? CLI.rounds : (Math.max(1, Number(cfgGet(CFG, 'solver.roundsPerBot', 5)) || 5)),
   // сколько раз подряд ответить на капчу в рамках ОДНОГО захода (сервер обычно даёт 2-3 попытки)
   triesPerJoin: Math.max(1, Number(cfgGet(CFG, 'solver.triesPerJoin', 3)) || 3),
-  answerDelayMin: Math.max(0, Number(cfgGet(CFG, 'solver.answerDelayMin', 500)) || 0),
-  answerDelayRnd: Math.max(0, Number(cfgGet(CFG, 'solver.answerDelayRnd', 900)) || 0),
+  answerDelayMin: Math.max(0, Number(cfgGet(CFG, 'solver.answerDelayMin', 400)) || 0),
+  answerDelayRnd: Math.max(0, Number(cfgGet(CFG, 'solver.answerDelayRnd', 500)) || 0),
   verifyMs: Math.max(2000, Number(cfgGet(CFG, 'solver.verifyMs', 10000)) || 10000),
   regDelayMs: Math.max(0, Number(cfgGet(CFG, 'solver.regDelayMs', 1500)) || 0),
   regVerifyMs: Math.max(2000, Number(cfgGet(CFG, 'solver.regVerifyMs', 9000)) || 9000),
@@ -405,6 +419,126 @@ function matchAny(text, words) {
 // резервный SOCKS-транспорт для облака Roboflow (roboflow.socksUrl; если пусто —
 // пробуем старый ключ telegram.apiProxy из прежних конфигов)
 const RF_SOCKS_URL = String(cfgGet(CFG, 'roboflow.socksUrl', '') || cfgGet(CFG, 'telegram.apiProxy', '') || '')
+
+// ========================= КОНФИГ v5: TG-ПУЛЬТ, СЛОТЫ, АНАРХИИ, АНТИ-АФК =========================
+// дополнения SOLVER (v5)
+SOLVER.rotateOnStart = CLI.rotate ? true : cfgGet(CFG, 'solver.rotateOnStart', false) === true
+SOLVER.maxAccountsPerTunnel = Math.max(1, Number(cfgGet(CFG, 'solver.maxAccountsPerTunnel', 5)) || 5)
+SOLVER.regNotRegWords = wordsCfg('regNotRegWords', ['не зарегистрирован', 'незарегистрирован', 'вы не зарег', 'сначала зарегистрир', 'not registered', 'register first'])
+
+// ---- Telegram-пульт ----
+const TG_CFG = {
+  enabled: cfgGet(CFG, 'telegram.enabled', true) !== false,
+  token: String(cfgGet(CFG, 'telegram.token', '') || ''),
+  // apiUrl меняется только в selftest (мок на 127.0.0.1) — не выносить в конфиг-документацию
+  apiUrl: String(cfgGet(CFG, 'telegram.apiUrl', 'https://api.telegram.org') || 'https://api.telegram.org'),
+  socksUrl: String(cfgGet(CFG, 'telegram.apiProxy', '') || ''),
+  preferSocks: cfgGet(CFG, 'telegram.preferSocks', true) !== false,
+  useMcProxy: cfgGet(CFG, 'telegram.useMcProxy', true) !== false,
+  pollTimeoutSec: Math.max(3, Math.min(50, Number(cfgGet(CFG, 'telegram.pollTimeoutSec', 25)) || 25)),
+  timeoutMs: 35000,
+  // whitelist: кому разрешено управлять. Одиночный telegram.chatId принимается как наследие v3.
+  allowedChatIds: (() => {
+    const v = cfgGet(CFG, 'telegram.allowedChatIds', null)
+    const out = []
+    if (Array.isArray(v)) for (const x of v) { const n = Number(x); if (Number.isFinite(n)) out.push(n) }
+    else if (v !== null && v !== undefined && v !== '') { const n = Number(v); if (Number.isFinite(n)) out.push(n) }
+    else { const c = cfgGet(CFG, 'telegram.chatId', null); const n = Number(c); if (c !== null && Number.isFinite(n)) out.push(n) }
+    return out
+  })()
+}
+TG_CFG.ready = !!(TG_CFG.enabled && TG_CFG.token)
+function tgAllowed(chatId) {
+  if (!TG_CFG.allowedChatIds.length) return false      // пустой whitelist = никому (защита)
+  return TG_CFG.allowedChatIds.indexOf(Number(chatId)) >= 0
+}
+
+// ---- Анти-афк (свой модуль: в mineflayer 4.25.0 встроенного нет) ----
+const ANTI_AFK = {
+  enabled: cfgGet(CFG, 'antiAfk.enabled', true) !== false,
+  everyMs: Math.max(10000, Number(cfgGet(CFG, 'antiAfk.everyMs', 45000)) || 45000),
+  jitterMs: Math.max(0, Number(cfgGet(CFG, 'antiAfk.jitterMs', 15000)) || 0)
+}
+
+// ---- Анархии: диапазоны (премиальные НЕ входят), парсер ТОЛЬКО /anN ----
+const ANARCHY = {
+  ranges: (() => {
+    const v = cfgGet(CFG, 'anarchy.ranges', null)
+    const def = [[102, 112], [202, 234], [302, 323], [502, 514], [902, 904]]
+    if (!Array.isArray(v) || !v.length) return def
+    const out = []
+    for (const r of v) {
+      if (Array.isArray(r) && r.length === 2 && Number.isFinite(Number(r[0])) && Number.isFinite(Number(r[1]))) {
+        const a = Math.min(Number(r[0]), Number(r[1])), b = Math.max(Number(r[0]), Number(r[1]))
+        out.push([a, b])
+      }
+    }
+    return out.length ? out : def
+  })(),
+  allowAny: cfgGet(CFG, 'anarchy.allowAny', false) === true
+}
+// номер анархии валиден, если попадает в диапазоны (или allowAny)
+function anarchyOk(n) {
+  n = Number(n)
+  if (!Number.isFinite(n) || n <= 0) return false
+  if (ANARCHY.allowAny) return true
+  for (const r of ANARCHY.ranges) if (n >= r[0] && n <= r[1]) return true
+  return false
+}
+// принимаем ТОЛЬКО команду вида /anN («304» без /an — это текст для релея, не смена)
+function parseAnarchyCmd(text) {
+  const m = String(text || '').trim().match(/^\/an(\d{1,5})$/i)
+  if (!m) return null
+  const n = Number(m[1])
+  return anarchyOk(n) ? n : null
+}
+function anarchyListText() {
+  return ANARCHY.ranges.map(r => r[0] + '-' + r[1]).join('; ')
+}
+
+// ---- headless-пул: анархия для CLI-забега (null = остаться в HUB) ----
+const ALGO = {
+  anarchy: (() => {
+    const v = cfgGet(CFG, 'algo.anarchy', null)
+    if (v === null || v === undefined || v === '') return null
+    const n = Number(v)
+    if (!anarchyOk(n)) return null
+    return n
+  })()
+}
+
+// ---- база аккаунтов ----
+const ACCOUNTS_DB_PATH = process.env.ACCOUNTS_DB ? path.resolve(process.env.ACCOUNTS_DB) : path.join(LEARN_DIR, 'accounts_db.json')
+
+// ---- роли туннелей и ёмкость слотов ----
+// role: 'algo' (общий пул/алгоритмы, по умолчанию) | 'personal' (только личные ручные заходы)
+function tunnelRole(src) { return String((src && src.role) || 'algo').toLowerCase() === 'personal' ? 'personal' : 'algo' }
+function personalTunnels() { return TUNNELS.filter(t => t.role === 'personal') }
+function algoTunnels() { return TUNNELS.filter(t => t.role !== 'personal') }
+// очередь слотов: algo (приоритет 0) проходит раньше personal (приоритет 1)
+const SLOT_PRIORITY = { algo: 0, personal: 1 }
+function acquireSlot(T, kind, holder) {
+  kind = SLOT_PRIORITY[kind] !== undefined ? kind : 'algo'
+  if (!T) return Promise.resolve(true)                    // direct-режим: слотов нет
+  return new Promise(resolve => {
+    const max = SOLVER.maxAccountsPerTunnel
+    if (T.slots.active.length < max) { T.slots.active.push(kind); resolve(true); return }
+    const w = { kind, resolve, at: Date.now(), holder: holder || null }
+    if (holder) holder.slotWaiter = w
+    T.slots.waiters.push(w)
+    T.slots.waiters.sort((a, b) => (SLOT_PRIORITY[a.kind] - SLOT_PRIORITY[b.kind]) || (a.at - b.at))
+  })
+}
+function releaseSlot(T, kind, holder) {
+  if (!T) return
+  const i = T.slots.active.lastIndexOf(kind)
+  if (i >= 0) T.slots.active.splice(i, 1)
+  if (holder) holder.slotWaiter = null
+  const w = T.slots.waiters.shift()                        // уже отсортированы по приоритету
+  if (w) { T.slots.active.push(w.kind); if (w.holder) w.holder.slotWaiter = null; try { w.resolve(true) } catch (e) {} }
+}
+function slotsUsed(T) { return T ? T.slots.active.length : 0 }
+
 // ========================= YOLO API (распознавание капчи FunTime) =========================
 // v3.14.0: основной распознаватель — ХОСТ-МОДЕЛЬ ROBOFLOW (см. блок ROBOFLOW ниже).
 // Здесь остались запасные локальные серверы на случай, если облако недоступно.
@@ -2880,7 +3014,7 @@ function connectAndSolve(tag, opt) {
 
       bot = mineflayer.createBot({
         username: nick, host: MC.host, port: MC.port, version: MC.version,
-        socket: conn.socket, hideErrors: true, auth: 'offline', keepAlive: true, checkTimeoutInterval: 60
+        socket: conn.socket, hideErrors: true, auth: 'offline', keepAlive: true, checkTimeoutInterval: 60000   // v5-фикс: опция В МС (было 60 → обрыв через 60мс)
       })
 
       // ---------- map_data ----------
@@ -3059,7 +3193,8 @@ function connectAndSolve(tag, opt) {
         if (finished) return          // живая фаза: только сканим сущности, готовность не проверяем
         const rd = readiness()
         if (rd.ready) {
-          const settleMs = FAST_MODE ? FAST.settleMs : SETTLE_MS
+          // v5: при ПОЛНЫХ данных всех плиток добор не нужен — 150мс вместо 800мс
+          const settleMs = FAST_MODE ? FAST.settleMs : (rd.allComplete ? Math.min(150, SETTLE_MS) : SETTLE_MS)
           if (!readySince) { readySince = Date.now(); ev('данные готовы (' + rd.why + '): ' + rd.have + '/' + rd.total + ' — добираю ' + settleMs + 'мс') }
           if (!settleT) settleT = setTimeout(() => goLive('captured ' + rd.have + '/' + rd.total + ' ' + rd.why), settleMs)
         } else {
@@ -3122,16 +3257,17 @@ async function waitVerdict(live, opt) {
   return { kind: SOLVER.unknownIsSuccess ? 'success' : 'timeout', ms: Date.now() - t0, unknown: true }
 }
 
-// ========================= АВТОРИЗАЦИЯ: /reg или /l =========================
-// kind: 'ok' | 'exists' | 'fail' | 'kick' | 'timeout'
+// ========================= АВТОРИЗАЦИЯ: /reg или /l (v5: loginFirst для базы) =========================
+// kind: 'ok' | 'exists' | 'notreg' | 'fail' | 'kick' | 'timeout'
 async function waitAuthResult(live, mark, ms) {
   const t0 = Date.now()
   while (Date.now() - t0 < (ms || SOLVER.regVerifyMs)) {
     if (live.isDead()) return { kind: 'kick', reason: live.deadReason() }
     for (const ln of live.chatsFrom(mark)) {
-      const wO = matchAny(ln, SOLVER.regOkWords);     if (wO) return { kind: 'ok', line: ln, word: wO }
-      const wE = matchAny(ln, SOLVER.regExistsWords); if (wE) return { kind: 'exists', line: ln, word: wE }
-      const wF = matchAny(ln, SOLVER.regFailWords);   if (wF) return { kind: 'fail', line: ln, word: wF }
+      const wO = matchAny(ln, SOLVER.regOkWords);      if (wO) return { kind: 'ok', line: ln, word: wO }
+      const wN = matchAny(ln, SOLVER.regNotRegWords);  if (wN) return { kind: 'notreg', line: ln, word: wN }
+      const wE = matchAny(ln, SOLVER.regExistsWords);  if (wE) return { kind: 'exists', line: ln, word: wE }
+      const wF = matchAny(ln, SOLVER.regFailWords);    if (wF) return { kind: 'fail', line: ln, word: wF }
     }
     await sleep(250)
   }
@@ -3139,11 +3275,27 @@ async function waitAuthResult(live, mark, ms) {
   return { kind: 'timeout' }
 }
 
-async function authPhase(live, w, label) {
+// opt.loginFirst — аккаунт ИЗ БАЗЫ (status='registered'): сначала /l, при «не зарегистрированы»
+// или провале — /reg. Новый аккаунт: /reg → (exists) /l.
+async function authPhase(live, w, label, opt) {
+  opt = opt || {}
   if (!ACCOUNTS.regTemplate && !ACCOUNTS.loginTemplate) return { ok: true, via: 'skip' }
   await sleep(SOLVER.regDelayMs)
   if (live.isDead()) return { ok: false, stage: 'reg', kind: 'kick', reason: live.deadReason() }
   const pass = w.pass
+
+  // ---- режим базы: /l первым ----
+  if (opt.loginFirst && ACCOUNTS.loginTemplate) {
+    let markL = live.chatsLen()
+    live.chat(buildAuthCommand(ACCOUNTS.loginTemplate, pass))
+    step(label + ': 🔑 /l отправлен (аккаунт из базы, ник «' + w.nick + '»)')
+    const resL = await waitAuthResult(live, markL, SOLVER.regVerifyMs)
+    if (resL.kind === 'ok') { step(label + ': ✅ вход подтверждён: ' + String(resL.line || '').slice(0, 90)); return { ok: true, via: 'login', line: resL.line } }
+    if (resL.kind === 'kick') return { ok: false, stage: 'login', kind: 'kick', reason: resL.reason }
+    if (resL.kind === 'notreg') step(label + ': сервер: «не зарегистрированы» — ухожу на /reg')
+    else step(label + ': ⚠️ /l не принят (' + resL.kind + (resL.line ? ': ' + String(resL.line).slice(0, 70) : '') + ') — пробую /reg')
+  }
+
   let mark = live.chatsLen()
   const regCmd = buildAuthCommand(ACCOUNTS.regTemplate, pass)
   if (regCmd) {
@@ -3153,7 +3305,7 @@ async function authPhase(live, w, label) {
     if (res.kind === 'ok') { step(label + ': ✅ регистрация подтверждена: ' + String(res.line || '').slice(0, 90)); return { ok: true, via: 'reg', line: res.line } }
     if (res.kind === 'exists') {
       step(label + ': аккаунт уже существует — пробую /l («' + String(res.line || '').slice(0, 70) + '»)')
-    } else if (res.kind === 'fail') {
+    } else if (res.kind === 'fail' || res.kind === 'notreg') {
       // сервер не принял пароль/команду — один повтор со свежим паролем, затем /l
       step(label + ': ⚠️ /reg не принят: ' + String(res.line || '').slice(0, 90))
       w.pass = randomPass()
@@ -3166,7 +3318,7 @@ async function authPhase(live, w, label) {
       return { ok: false, stage: 'reg', kind: res.kind, line: res.line }
     }
   }
-  // /l — аккаунт уже был зарегистрирован (обычно не пригождается: ники случайные)
+  // /l — аккаунт уже был зарегистрирован
   const logCmd = buildAuthCommand(ACCOUNTS.loginTemplate, pass)
   if (!logCmd) return { ok: false, stage: 'login', kind: 'no-template' }
   mark = live.chatsLen()
@@ -3177,29 +3329,24 @@ async function authPhase(live, w, label) {
   return { ok: false, stage: 'login', kind: res2.kind, line: res2.line }
 }
 
-// ========================= ОДИН ЗАХОД: капча → ответ → регистрация =========================
-async function solveJoin(w, r) {
-  const tag = 'b' + w.id + 'r' + r
-  const label = 'БОТ-' + w.id + ' заход ' + r
-  step('--- ' + label + ' (ник ' + w.nick + ', туннель «' + (w.T ? w.T.name : 'direct') + '», IP ' + ((w.T && w.T.ip) || '?') + ') ---')
-  const tJoin = Date.now()
-  const conn = await connectAndSolve(tag, { T: w.T, nick: w.nick })
-  if (!conn.ok) {
-    step(label + ': ❌ подключение/сбор не удались: ' + conn.note)
-    return { ok: false, stage: 'connect', note: conn.note }
-  }
-  const live = conn.live
-  w.live = live
-  step(label + ': 🖼 картинка собрана за ' + ((Date.now() - tJoin) / 1000).toFixed(1) + 'с — решаю')
-
+// ========================= РЕШЕНИЕ КАПЧИ НА ЖИВОМ СОЕДИНЕНИИ (общее для CLI и TG-сессий) =========================
+// Вынесено из solveJoin v4: цикл попыток (solver.triesPerJoin) — снимок стены → распознавание
+// → ответ в чат → вердикт → авторизация. ctx: {label, dirTag, roundNo, acc, loginFirst, isStopped}
+async function solveCaptchaOnLive(live, ctx) {
+  ctx = ctx || {}
+  const label = ctx.label || 'сессия'
+  const dirTag = ctx.dirTag || 'sess'
+  const acc = ctx.acc || { nick: '?', pass: '' }
+  const roundNo = Number(ctx.roundNo) || 1
   const attempts = []
   let lastRec = null, lastAns = null, lastVerdict = null
   for (let t = 1; t <= SOLVER.triesPerJoin; t++) {
+    if (ctx.isStopped && ctx.isStopped()) { lastVerdict = { kind: 'stopped' }; break }
     if (live.isDead()) { lastVerdict = { kind: 'kick', reason: live.deadReason() }; break }
     const snap = live.snap()
-    const dir = path.join(REC_ROOT, 'bot' + w.id + '_round' + String(r).padStart(2, '0') + '_a' + t + '_' + STAMP)
+    const dir = path.join(REC_ROOT, dirTag + '_a' + t + '_' + STAMP)
     let rec = null
-    try { rec = saveRound(dir, snap, label + ' п' + t, w.roundNoBase + r) } catch (e) { step(label + ': saveRound err: ' + e.message) }
+    try { rec = saveRound(dir, snap, label + ' п' + t, roundNo) } catch (e) { step(label + ': saveRound err: ' + e.message) }
     if (!rec) { attempts.push({ t, fail: 'wall-not-assembled' }); break }
     lastRec = rec
 
@@ -3214,7 +3361,7 @@ async function solveJoin(w, r) {
     }
     lastAns = ans
     rec.yolo = ans
-    try { rfSaveAnswer({ yolo: ans, dir: rec.dir }, w.roundNoBase + r) } catch (e) {}
+    try { rfSaveAnswer({ yolo: ans, dir: rec.dir }, roundNo) } catch (e) {}
     step(label + ': 🔢 «' + ans.digits + '» (' + (ans.host || '?') + ', ' + ans.ms + 'мс' + (ans.exact === false ? ', ⚠️ не ровно ' + DIGITS_EXPECTED + ' цифр' : '') + ')')
 
     // ---- отправка ответа В ЧАТ СЕРВЕРА ----
@@ -3233,7 +3380,7 @@ async function solveJoin(w, r) {
 
     if (verdict.kind === 'success' || verdict.kind === 'auth') {
       step(label + ': ✅ КАПЧА ПРОЙДЕНА («' + ans.digits + '», реакция: ' + verdict.kind + (verdict.line ? ' — ' + String(verdict.line).slice(0, 80) : '') + ')')
-      const auth = await authPhase(live, w, label)
+      const auth = await authPhase(live, acc, label, { loginFirst: !!ctx.loginFirst })
       writeResult(dir, { label, attempt: t, rec, ans, verdict, auth, ts: new Date().toISOString() })
       return { ok: true, stage: 'solved', rec, ans, verdict, auth, live, attempts, dir }
     }
@@ -3255,9 +3402,6 @@ async function solveJoin(w, r) {
   }
 
   const why = lastVerdict ? (lastVerdict.kind + (lastVerdict.reason ? ': ' + String(lastVerdict.reason).slice(0, 80) : '')) : 'wall/recognition fail'
-  step(label + ': ❌ заход не удался (' + why + ')')
-  try { live.end('captcha failed') } catch (e) {}
-  w.live = null
   return { ok: false, stage: 'captcha', note: why, kick: lastVerdict && lastVerdict.kind === 'kick', kickReason: (lastVerdict && lastVerdict.reason) || '', rec: lastRec, ans: lastAns, attempts }
 }
 
@@ -3275,23 +3419,7 @@ function writeResult(dir, obj) {
   } catch (e) { dbg('writeResult err: ' + e.message) }
 }
 
-// ========================= УДЕРЖАНИЕ В ИГРЕ (stayOnline) =========================
-// После успеха бот остаётся на сервере: держим соединение, пока не кикнут,
-// не истечёт holdMinutes или процесс не завершат (SIGINT/SIGTERM).
-function holdOnline(w, label) {
-  return new Promise(resolve => {
-    const live = w.live
-    if (!live || live.isDead()) { resolve('dead'); return }
-    const t0 = Date.now()
-    const limitMs = SOLVER.holdMinutes > 0 ? SOLVER.holdMinutes * 60000 : 0
-    step(label + ': 🟢 остаюсь в игре (ник «' + w.nick + '», пароль в config-логе не печатается)' + (limitMs ? ' на ' + SOLVER.holdMinutes + ' мин' : ' — до остановки процесса'))
-    const timer = setInterval(() => {
-      if (live.isDead()) { clearInterval(timer); step(label + ': соединение закрыто сервером (' + live.deadReason() + ')'); resolve('dead'); return }
-      if (limitMs && Date.now() - t0 >= limitMs) { clearInterval(timer); step(label + ': holdMinutes истёк — выхожу'); try { live.end('hold done') } catch (e) {}; resolve('timeout'); return }
-      if (SHUTDOWN) { clearInterval(timer); resolve('shutdown') }
-    }, 1000)
-  })
-}
+// (v5) holdOnline удалён: удержание в игре живёт в движке сессий (hub/anarchy + анти-афк).
 let SHUTDOWN = false
 function makeSyntheticCaptcha(cols, rows, seed) {
   let s = seed || 12345
@@ -3404,9 +3532,827 @@ function makeWallSnapshot(img, W, H, opts) {
     : { x: plane + viewSide * 5, y: OY, z: OX + 2, yaw: viewSide < 0 ? -Math.PI / 2 : Math.PI / 2, pitch: 0 })
   return { maps, frames, chats: ['[chat] BotFilter >> Введите номер с картинки в чат'], events: ['selftest'], view, metaDump: [] }
 }
+// ========================= TELEGRAM: ТРАНСПОРТ (порт из v3.14.0, battle-tested) =========================
+// Чистый https/socks без npm-пакетов: прямой доступ, telegram.apiProxy (SOCKS5h),
+// туннель MC-прокси; 429 retry_after; запоминание рабочего транспорта.
+function tgLogFile() { return path.join(REC_ROOT || __dirname, 'telegram.log') }
+function tgLog(msg) {
+  const line = logStamp() + ' [TG] ' + msg
+  try { fs.mkdirSync(REC_ROOT || __dirname, { recursive: true }); fs.appendFileSync(tgLogFile(), line + '\n') } catch (e) {}
+  step('[TG] ' + msg)
+}
+
+let tgTransport = null
+function tgTransports() {
+  let isHttp = false
+  try { isHttp = new URL(TG_CFG.apiUrl).protocol === 'http:' } catch (e) {}
+  if (isHttp) return ['direct']        // локальный/тестовый endpoint — прокси не нужен
+
+  const direct = 'direct'
+  const s = parseSocksUrl(TG_CFG.socksUrl)
+  const tgProxy = s ? { name: 'tg-proxy(' + s.host + ':' + s.port + ')', socks: s } : null
+  const mc = (TG_CFG.useMcProxy && PROXY.host)
+    ? { name: 'mc-proxy(' + PROXY.host + ')', socks: { type: 5, host: PROXY.host, port: PROXY.port, username: PROXY.username, password: PROXY.password } }
+    : null
+  // специальный прокси первым (если задан): прямой доступ к Telegram обычно заблокирован
+  const list = []
+  if (tgProxy && TG_CFG.preferSocks) list.push(tgProxy)
+  list.push(direct)
+  if (tgProxy && !TG_CFG.preferSocks) list.push(tgProxy)
+  if (mc) list.push(mc)
+  return list
+}
+
+// вызов метода Telegram Bot API: сначала рабочий транспорт, потом остальные
+async function tgApi(method, params, file, timeoutMs, onlyTransport) {
+  if (!TG_CFG.token) return { ok: false, description: 'нет telegram.token' }
+  let u
+  try { u = new URL(TG_CFG.apiUrl + '/bot' + TG_CFG.token + '/' + method) } catch (e) { return { ok: false, description: 'плохой telegram.apiUrl' } }
+  const order = []
+  if (onlyTransport) order.push(onlyTransport)
+  else {
+    if (tgTransport) order.push(tgTransport)
+    for (const t of tgTransports()) if (order.indexOf(t) < 0) order.push(t)
+  }
+
+  const errs = []
+  let lastErr = 'нет транспорта'
+  for (const tr of order) {
+    for (let retry = 0; retry < 2; retry++) {
+      let body = null, headers = {}
+      if (file) { const mp = multipart(params || {}, file); body = mp.body; headers['Content-Type'] = mp.contentType }
+      else { body = JSON.stringify(params || {}); headers['Content-Type'] = 'application/json' }
+      const socks = (tr === 'direct') ? null : tr.socks
+      const tName = (tr === 'direct') ? 'direct' : tr.name
+      const secure = u.protocol !== 'http:'
+      const r = await httpsRequest({ host: u.hostname, port: Number(u.port || (secure ? 443 : 80)), path: u.pathname + u.search, method: 'POST', headers, body, timeoutMs: timeoutMs || TG_CFG.timeoutMs, socks, secure })
+      if (!r.ok) {
+        lastErr = tName + ': ' + r.error
+        if (errs.indexOf(lastErr) < 0) errs.push(lastErr)
+        if (/модуль socks не установлен/.test(r.error)) tgLog('⚠️ нужен пакет socks: npm i socks (без него прокси-транспорты не работают)')
+        else tgLog('API ' + method + ' через ' + tName + ' не прошёл: ' + r.error)
+        break
+      }
+      let json = null
+      try { json = JSON.parse(r.body.toString('utf8')) } catch (e) {}
+      if (r.status === 429) {
+        const ra = json && json.parameters && json.parameters.retry_after ? Number(json.parameters.retry_after) : 3
+        tgLog('429 too many requests, жду ' + ra + 'с')
+        await sleep(Math.min(30, ra) * 1000)
+        continue
+      }
+      if (json && json.ok) {
+        if (tgTransport !== tr) { tgTransport = tr; tgLog('транспорт: ' + tName) }
+        return json
+      }
+      const d = (json && json.description) || ('HTTP ' + r.status + ' ' + r.body.toString('utf8').slice(0, 200))
+      return { ok: false, error_code: r.status, description: tName + ': ' + d }
+    }
+  }
+  return { ok: false, description: errs.length ? errs.join(' | ') : lastErr }
+}
+
+// ---- обёртки UI-слоя ----
+async function tgSend(chatId, text, kb) {
+  const p = { chat_id: chatId, text: String(text), disable_web_page_preview: true }
+  if (kb) p.reply_markup = JSON.stringify(kb)
+  const r = await tgApi('sendMessage', p)
+  if (!r.ok) tgLog('sendMessage ошибка: ' + (r.description || r.error_code))
+  return r
+}
+async function tgEdit(chatId, messageId, text, kb) {
+  const p = { chat_id: chatId, message_id: messageId, text: String(text), disable_web_page_preview: true }
+  if (kb) p.reply_markup = JSON.stringify(kb)
+  const r = await tgApi('editMessageText', p)
+  // «message is not modified» — не ошибка: текст и так актуален
+  if (!r.ok && /not modified/i.test(String(r.description || ''))) return { ok: true, unchanged: true }
+  if (!r.ok && /message can't be edited|message to edit not found/i.test(String(r.description || ''))) return { ok: false, gone: true, description: r.description }
+  if (!r.ok) tgLog('editMessageText ошибка: ' + (r.description || r.error_code))
+  return r
+}
+async function tgDelete(chatId, messageId) {
+  const r = await tgApi('deleteMessage', { chat_id: chatId, message_id: messageId })
+  if (!r.ok && !/can't be deleted|message to delete not found/i.test(String(r.description || ''))) tgLog('deleteMessage ошибка: ' + (r.description || r.error_code))
+  return r
+}
+async function tgAnswerCb(callbackQueryId, text) {
+  const p = { callback_query_id: callbackQueryId }
+  if (text) p.text = String(text).slice(0, 190)
+  return await tgApi('answerCallbackQuery', p)
+}
+async function tgGetUpdates(offset, timeoutSec) {
+  return await tgApi('getUpdates', {
+    offset: Number(offset) || 0,
+    timeout: Math.max(0, Number(timeoutSec) || 0),
+    allowed_updates: ['message', 'callback_query']
+  }, null, ((Number(timeoutSec) || 0) + 20) * 1000)
+}
+
+// ---- диагностика связи: node main.js --tg-test ----
+async function runTgTest() {
+  console.log('=== ПРОВЕРКА TELEGRAM (v5) ===')
+  if (!TG_CFG.token) { console.log('❌ нет telegram.token в конфиге'); return false }
+  const list = tgTransports()
+  let working = null
+  for (const tr of list) {
+    const name = (tr === 'direct') ? 'direct' : tr.name
+    process.stdout.write('  транспорт ' + name + ': getMe … ')
+    const r = await tgApi('getMe', null, null, 15000, tr)
+    if (r.ok && r.result) { console.log('✅ бот @' + r.result.username + ' (id ' + r.result.id + ')'); working = { name, bot: r.result }; break }
+    console.log('❌ ' + String(r.description || r.error_code || '').slice(0, 140))
+  }
+  if (!working) { console.log('❌ ни один транспорт не работает'); return false }
+  const chat = TG_CFG.allowedChatIds[0]
+  if (chat) {
+    const r = await tgApi('sendMessage', { chat_id: chat, text: '✅ Связь есть. Транспорт: ' + working.name + '\nБот @' + working.bot.username + ' готов (v5.0.0, Telegram-пульт).' })
+    console.log(r.ok ? '  ✅ тестовое сообщение отправлено в chat_id ' + chat : '  ⚠️ сообщение не отправлено: ' + String(r.description || '').slice(0, 140))
+  } else {
+    console.log('  ⚠️ telegram.allowedChatIds пуст — тестовое сообщение не отправлялось')
+  }
+  return true
+}
+
+// ========================= БАЗА АККАУНТОВ (learn/accounts_db.json) =========================
+// Созданный аккаунт сохраняется: ник, пароль, туннель, IP регистрации, владелец.
+// Когда нужны аккаунты — сначала берутся ИЗ БАЗЫ (заход через /l; если IP туннеля совпадает
+// с IP регистрации, сервер может вообще не показать капчу), и только потом создаются новые.
+// owner: 'algo' (общий пул) | 'tg:<chatId>' (личный, алгоритмам НЕ выдаётся).
+let DB_PATH = ACCOUNTS_DB_PATH
+const DB = { version: 1, savedAt: null, accounts: [] }
+
+function dbSetPath(p) { DB_PATH = p }   // только для selftest
+function dbLoad(force) {
+  if (!force && DB.accounts.length) return DB
+  try {
+    const raw = fs.readFileSync(DB_PATH, 'utf8')
+    const j = JSON.parse(raw)
+    DB.accounts = Array.isArray(j.accounts) ? j.accounts : []
+    DB.version = Number(j.version) || 1
+    DB.savedAt = j.savedAt || null
+  } catch (e) {
+    if (e && e.code !== 'ENOENT') step('[db] не удалось прочитать ' + DB_PATH + ': ' + e.message + ' — начинаю с пустой базы')
+    DB.accounts = []
+  }
+  return DB
+}
+function dbSave() {
+  try {
+    DB.savedAt = new Date().toISOString()
+    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
+    const tmp = DB_PATH + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify({ version: DB.version, savedAt: DB.savedAt, accounts: DB.accounts }, null, 1) + '\n')
+    fs.renameSync(tmp, DB_PATH)      // атомарная запись: читатели не видят половинный файл
+    return true
+  } catch (e) { step('[db] запись ошибки: ' + e.message); return false }
+}
+function dbNewRecord(owner, T, opts) {
+  opts = opts || {}
+  return {
+    nick: opts.nick || randomNick(),
+    pass: opts.pass || randomPass(),
+    tunnel: (T && T.name) || opts.tunnel || '',
+    ip: (T && T.ip) || opts.ip || '',
+    owner: String(owner || 'algo'),
+    status: 'new',
+    createdAt: new Date().toISOString(),
+    lastUsed: new Date().toISOString(),
+    regConfirmed: false,
+    anarchy: null,
+    note: opts.note || '',
+    busy: true
+  }
+}
+// создать аккаунт (owner: 'algo' | 'tg:<chatId>')
+function dbCreate(owner, T, opts) {
+  dbLoad()
+  const acc = dbNewRecord(owner, T, opts)
+  DB.accounts.push(acc)
+  dbSave()
+  return acc
+}
+// личный аккаунт пользователя ТГ: ПОСТОЯННЫЙ (создаётся один раз, сам не меняется)
+function dbPersonal(tgId, T) {
+  dbLoad()
+  const owner = 'tg:' + tgId
+  let acc = null
+  for (const a of DB.accounts) if (a.owner === owner && a.status !== 'retired') acc = a   // берём последний живой
+  if (acc) {
+    if (T && acc.tunnel !== T.name) { acc.tunnel = T.name; acc.ip = (T && T.ip) || acc.ip; dbSave() }
+    return acc
+  }
+  return dbCreate(owner, T)
+}
+// «смена ника»: старый аккаунт остаётся в базе (retired), создаётся новый случайный
+function dbPersonalRotate(tgId, T) {
+  dbLoad()
+  const owner = 'tg:' + tgId
+  for (const a of DB.accounts) if (a.owner === owner && a.status !== 'retired') { a.status = 'retired'; a.busy = false; a.note = (a.note ? a.note + '; ' : '') + 'retired ' + new Date().toISOString() }
+  return dbCreate(owner, T)
+}
+// свободный аккаунт АЛГОРИТМАМ: приоритет — тот же IP → тот же туннель → любой свободный.
+// личные (owner tg:*) и занятые (busy) НЕ выдаются. Возвращает null, если в базе пусто.
+function dbTakeFreeAlgo(T) {
+  dbLoad()
+  const cands = DB.accounts.filter(a => a.owner === 'algo' && !a.busy && a.status === 'registered')
+  if (!cands.length) return null
+  const ip = (T && T.ip) || ''
+  const tn = (T && T.name) || ''
+  const pick = cands.find(a => ip && a.ip === ip) || cands.find(a => tn && a.tunnel === tn) || cands[0]
+  pick.busy = true
+  pick.lastUsed = new Date().toISOString()
+  dbSave()
+  return pick
+}
+function dbMarkBusy(acc, b) { if (!acc) return; acc.busy = !!b; acc.lastUsed = new Date().toISOString(); dbSave() }
+function dbMarkRegistered(acc) {
+  if (!acc) return
+  acc.status = 'registered'; acc.regConfirmed = true; acc.lastUsed = new Date().toISOString()
+  dbSave()
+}
+function dbSetAnarchy(acc, n) { if (!acc) return; acc.anarchy = (n === null || n === undefined) ? null : Number(n); dbSave() }
+function dbSummary() {
+  dbLoad()
+  const s = { total: DB.accounts.length, registered: 0, personal: 0, algo: 0, busy: 0, retired: 0 }
+  for (const a of DB.accounts) {
+    if (a.status === 'registered') s.registered++
+    if (a.status === 'retired') s.retired++
+    if (String(a.owner || '').indexOf('tg:') === 0) s.personal++; else s.algo++
+    if (a.busy) s.busy++
+  }
+  return s
+}
+
+// ========================= СЕССИИ v5 (единый движок для TG-пульта и CLI) =========================
+// Состояния: queued → joining → captcha → hub → anarchy(N) → stopped/dead/error.
+// sentLog — «то, что написал аккаунт» (пароль маскируется, чистится при смене анархии).
+// Анти-афк — свой (в mineflayer 4.25.0 встроенного нет): swingArm + микро-look каждые ~45с±15с.
+// Ротация IP — только «особые случаи»: бан-кик, серия провалов капчи, серия сетевых фейлов.
+const SESSIONS = []
+let SESS_SEQ = 0
+let GLOBAL_FATAL = ''            // фатальная ошибка окружения (нет mineflayer/proxy.host) — гасит CLI-пул
+// хуки только для selftest-моков (в бою всегда null)
+const SESS_HOOKS = { connect: null, solve: null }
+
+function sessionLabel(S) {
+  return S.kind === 'personal' ? ('ЛИЧНЫЙ-' + S.tgChatId) : ('БОТ-' + S.id)
+}
+function sessionTag(S, r) { return 's' + S.id + 'r' + r }
+
+function makeSession(opt) {
+  opt = opt || {}
+  const S = {
+    id: ++SESS_SEQ,
+    kind: opt.kind === 'personal' ? 'personal' : 'algo',   // 'algo' покрывает и CLI-пул
+    tgChatId: opt.tgChatId || null,
+    acc: opt.acc || null,
+    T: opt.T || null,
+    state: 'queued',
+    anarchy: null,
+    sentLog: [],
+    live: null,
+    stop: false,
+    error: '',
+    lastError: '',
+    rotations: 0, failStreak: 0, netFails: 0,
+    roundNo: 0, roundNoBase: Number(opt.roundNoBase) || 0,
+    presetAnarchy: (opt.presetAnarchy === undefined || opt.presetAnarchy === null) ? null : Number(opt.presetAnarchy),
+    startedAt: 0, finishedAt: 0,
+    slotHeld: false, slotWaiter: null,
+    afkTimer: null,
+    solved: false, solvedRound: 0, ans: null, auth: null,
+    ui: null,                    // {chatId, messageId} — статус-блок в TG (ставит UI-слой)
+    onChanged: [],
+    notify() { for (const f of S.onChanged.slice()) { try { f(S) } catch (e) {} } },
+    setState(st) { if (S.state !== st) { S.state = st; step(sessionLabel(S) + ': состояние → ' + st.toUpperCase()); } S.notify(); S.settleCheck() },
+    logSent(text) {
+      S.sentLog.push(maskSecret(text, S.acc))
+      if (S.sentLog.length > 50) S.sentLog.shift()
+      S.notify()
+    },
+    // «номер статуса» для TG-блока: 1 — заход на сервер, 2 — HUB, 3 — анархия N
+    statusNo() {
+      if (S.state === 'anarchy') return 3
+      if (S.state === 'hub') return 2
+      return 1
+    }
+  }
+  // обещание «сессия дошла до HUB/анархии или завершилась» — для сводки CLI-пула
+  S.settledPromise = new Promise(res => { S._settle = res })
+  S._settledDone = false
+  S.settleCheck = function () {
+    if (S._settledDone) return
+    if (['hub', 'anarchy', 'stopped', 'dead', 'error'].indexOf(S.state) >= 0) { S._settledDone = true; try { S._settle(S) } catch (e) {} }
+  }
+  return S
+}
+
+// пароль аккаунта никогда не печатается
+function maskSecret(text, acc) {
+  let s = String(text === undefined || text === null ? '' : text)
+  if (acc && acc.pass && s.indexOf(acc.pass) >= 0) s = s.split(acc.pass).join('••••••')
+  return s
+}
+
+// ---- анти-афк ----
+function antiAfkInterval() {
+  const j = ANTI_AFK.jitterMs > 0 ? Math.floor((Math.random() * 2 - 1) * ANTI_AFK.jitterMs) : 0
+  return Math.max(5000, ANTI_AFK.everyMs + j)
+}
+function startAntiAfk(S) {
+  if (!ANTI_AFK.enabled) return
+  stopAntiAfk(S)
+  const tick = () => {
+    S.afkTimer = setTimeout(() => {
+      try {
+        const live = S.live
+        if (live && !live.isDead() && live.bot) {
+          const bot = live.bot
+          try { if (bot.swingArm) bot.swingArm('right') } catch (e) {}
+          try {
+            if (bot.entity && bot.look) {
+              const yaw = (Number(bot.entity.yaw) || 0) + (Math.random() - 0.5) * 0.2
+              const pitch = Math.max(-1.4, Math.min(1.4, (Number(bot.entity.pitch) || 0) + (Math.random() - 0.5) * 0.1))
+              bot.look(yaw, pitch, true)
+            }
+          } catch (e) {}
+          dbg(sessionLabel(S) + ': анти-афк (swingArm + микро-look)')
+        }
+      } catch (e) {}
+      if (!S.stop && ['hub', 'anarchy'].indexOf(S.state) >= 0) tick()
+    }, antiAfkInterval())
+  }
+  tick()
+}
+function stopAntiAfk(S) { if (S.afkTimer) { try { clearTimeout(S.afkTimer) } catch (e) {} S.afkTimer = null } }
+
+// ---- смена анархии: /anN в игру, очистка «написанного» ----
+async function setAnarchy(S, n, opt) {
+  opt = opt || {}
+  n = Number(n)
+  if (!anarchyOk(n)) return { ok: false, error: 'анархия ' + n + ' вне диапазонов (' + anarchyListText() + ')' + (ANARCHY.allowAny ? '' : '; anarchy.allowAny=false') }
+  if (!S.live || S.live.isDead()) return { ok: false, error: 'нет живого соединения с сервером' }
+  const prev = S.anarchy
+  if (prev !== null) S.sentLog = []       // при СМЕНЕ анархии список «написанного» очищается
+  S.live.chat('/an' + n)                 // обёртка chat → sentLog добавит «/anN» первой строкой нового списка
+  // идемпотентная запись: в сессии chat() обёрнут (пишет сам), вне сессии (тесты) — пишем здесь
+  if (S.sentLog[S.sentLog.length - 1] !== '/an' + n) S.logSent('/an' + n)
+  S.anarchy = n
+  dbSetAnarchy(S.acc, n)
+  S.setState('anarchy')
+  step(sessionLabel(S) + ': 🌀 анархия /an' + n + (prev !== null ? ' (смена с ' + prev + ')' : '') + ' — релей чата включён')
+  return { ok: true, prev }
+}
+
+// «особые случаи» для смены IP (как в v4: бан-кик, серии провалов)
+function sessionNeedsRotation(S, res) {
+  if (!S.T) return false
+  if (res && res.kick && matchAny(res.kickReason, SOLVER.banWords)) return true
+  if (S.failStreak >= SOLVER.rotateOnFailStreak) return true
+  if (S.netFails >= SOLVER.rotateOnNetFails) return true
+  return false
+}
+
+async function runSession(S) {
+  S.startedAt = Date.now()
+  const label = sessionLabel(S)
+  try {
+    S.setState('queued')
+    const got = await acquireSlot(S.T, S.kind, S)
+    if (!got || S.stop) { if (!S.stop) S.error = 'слот отменён'; S.setState(S.stop ? 'stopped' : 'error'); return S }
+    S.slotHeld = true
+
+    let solved = false
+    const maxAttempts = Math.max(1, SOLVER.roundsPerBot)
+    for (let r = 1; r <= maxAttempts && !S.stop && !solved; r++) {
+      if (r > 1) await sleep(PAUSE_BETWEEN_MS + Math.floor(Math.random() * 600))
+      S.roundNo = r
+      S.setState('joining')
+      step('--- ' + label + ' заход ' + r + ' (ник ' + S.acc.nick + ', туннель «' + (S.T ? S.T.name : 'direct') + '», IP ' + ((S.T && S.T.ip) || '?') + ') ---')
+      const tJoin = Date.now()
+      const tag = sessionTag(S, r)
+      let conn = null
+      try {
+        conn = SESS_HOOKS.connect ? await SESS_HOOKS.connect(tag, { T: S.T, nick: S.acc.nick })
+                                  : await connectAndSolve(tag, { T: S.T, nick: S.acc.nick })
+      } catch (e) { conn = { ok: false, note: 'exception: ' + e.message } }
+      if (S.stop) break
+      if (!conn || !conn.ok) {
+        const note = (conn && conn.note) || 'connect fail'
+        step(label + ' заход ' + r + ': ❌ подключение/сбор не удались: ' + note)
+        S.lastError = note
+        if (FATAL_RE.test(note)) {
+          S.error = note
+          GLOBAL_FATAL = note
+          S.setState('error')
+          return S
+        }
+        const netFail = NET_FAIL_RE.test(note)
+        if (netFail) { S.netFails++; if (S.T) S.T.failStreak = (S.T.failStreak || 0) + 1 } else { S.netFails = 0; S.failStreak++ }
+        const res = { stage: 'connect', note, kick: /kicked/.test(note), kickReason: note }
+        if (await specialRotation(S, res, label)) continue
+        if (S.rotations >= MAX_ROTATIONS_ON_FAIL) { S.error = 'лимит ротаций IP исчерпан (' + S.rotations + ')'; S.setState('error'); return S }
+        continue
+      }
+
+      // живое соединение: заворачиваем chat(), чтобы всё написанное аккаунтом попало в sentLog
+      S.live = conn.live
+      const rawChat = S.live.chat.bind(S.live)
+      S.live.chat = function (t) { S.logSent(t); return rawChat(t) }
+      step(label + ': 🖼 картинка собрана за ' + ((Date.now() - tJoin) / 1000).toFixed(1) + 'с — решаю')
+      S.setState('captcha')
+
+      let res = null
+      try {
+        res = SESS_HOOKS.solve ? await SESS_HOOKS.solve(S.live, { label, tag, roundNo: S.roundNoBase + r, acc: S.acc })
+                               : await solveCaptchaOnLive(S.live, {
+                                   label, dirTag: 'sess' + S.id + '_r' + r, roundNo: S.roundNoBase + r,
+                                   acc: S.acc, loginFirst: S.acc.status === 'registered',
+                                   isStopped: () => S.stop
+                                 })
+      } catch (e) { res = { ok: false, stage: 'exception', note: e.message } }
+      if (S.stop) break
+
+      if (res && res.ok) {
+        solved = true
+        S.solved = true; S.solvedRound = r; S.ans = res.ans || null; S.auth = res.auth || null
+        S.failStreak = 0; S.netFails = 0
+        dbMarkRegistered(S.acc)
+        step('=== ' + label + ' ✅ КАПЧА РЕШЕНА' + (S.auth && S.auth.ok ? ' + АВТОРИЗОВАН (' + S.auth.via + ')' : ' (авторизация не подтверждена)') +
+          ' | ник «' + S.acc.nick + '» | цифр «' + (res.ans ? res.ans.digits : '?') + '» | заходов: ' + r + '/' + maxAttempts + ' ===')
+        S.setState('hub')
+        continue
+      }
+
+      // ---- провал капчи ----
+      const note = (res && res.note) || 'captcha fail'
+      S.lastError = note
+      step(label + ' заход ' + r + ': ❌ ' + note)
+      S.netFails = 0; S.failStreak++
+      if (res && res.kick && matchAny(res.kickReason, SOLVER.banWords)) step(label + ': ⚠️ кик с признаком бана: ' + String(res.kickReason).slice(0, 100))
+      if (await specialRotation(S, res || {}, label)) continue
+      if (S.rotations >= MAX_ROTATIONS_ON_FAIL) { S.error = 'лимит ротаций IP исчерпан (' + S.rotations + ')'; break }
+    }
+
+    if (S.stop) { S.setState('stopped') }
+    else if (!solved) { S.error = S.lastError || 'капча не решена'; S.setState('error') }
+    else {
+      // ---- HUB / АНАРХИЯ: держим соединение до остановки или смерти ----
+      startAntiAfk(S)
+      if (S.presetAnarchy && anarchyOk(S.presetAnarchy)) {
+        await setAnarchy(S, S.presetAnarchy)
+      } else if (S.presetAnarchy) {
+        step(label + ': ⚠️ algo.anarchy=' + S.presetAnarchy + ' вне диапазонов — остаюсь в HUB')
+      }
+      while (!S.stop) {
+        if (S.live && S.live.isDead()) {
+          S.error = S.live.deadReason() || 'соединение закрыто'
+          step(label + ': соединение закрыто сервером (' + S.error + ')')
+          S.setState('dead')
+          break
+        }
+        await sleep(400)
+      }
+      stopAntiAfk(S)
+      if (S.stop && S.state !== 'dead') S.setState('stopped')
+    }
+  } catch (e) {
+    S.error = (e && e.message) || String(e)
+    step(label + ': исключение сессии: ' + S.error)
+    S.setState('error')
+  } finally {
+    stopAntiAfk(S)
+    try { if (S.live) S.live.end('session done') } catch (e) {}
+    S.live = null
+    if (S.slotHeld) { releaseSlot(S.T, S.kind, S); S.slotHeld = false }
+    try { dbMarkBusy(S.acc, false) } catch (e) {}
+    S.finishedAt = Date.now()
+    S.settleCheck()
+    S.notify()
+  }
+  return S
+}
+
+// ротация IP в «особых случаях»; true = ротация выполнена (можно повторять заход)
+async function specialRotation(S, res, label) {
+  if (!sessionNeedsRotation(S, res)) return false
+  if (!S.T) return false
+  if (S.rotations >= MAX_ROTATIONS_ON_FAIL) {
+    step(label + ': лимит ротаций IP исчерпан (' + S.rotations + ') — прекращаю заходы')
+    return false
+  }
+  S.rotations++
+  S.failStreak = 0; S.netFails = 0
+  if (S.T) S.T.failStreak = 0
+  step(label + ': 🔄 особый случай — меняю IP туннеля «' + S.T.name + '» (ротация ' + S.rotations + '/' + MAX_ROTATIONS_ON_FAIL + ')')
+  try { await rotateIp(S.T) } catch (e) { step(label + ': ротация IP ошибка: ' + e.message) }
+  await sleep(2500)
+  return true
+}
+
+function stopSession(S, reason) {
+  if (!S || S.stop) return
+  S.stop = true
+  if (reason) S.error = S.error || reason
+  // если ждём слот — вынуть из очереди немедленно
+  if (S.slotWaiter && S.T) {
+    const i = S.T.slots.waiters.indexOf(S.slotWaiter)
+    if (i >= 0) { S.T.slots.waiters.splice(i, 1); try { S.slotWaiter.resolve(false) } catch (e) {} }
+  }
+  try { if (S.live) S.live.end('stopped: ' + (reason || 'user')) } catch (e) {}
+  if (S.state === 'queued') S.setState('stopped')
+}
+function stopAllSessions(reason) { for (const S of SESSIONS.slice()) stopSession(S, reason) }
+function activeSessionOfChat(chatId) {
+  for (const S of SESSIONS) if (S.kind === 'personal' && String(S.tgChatId) === String(chatId) &&
+    ['stopped', 'dead', 'error'].indexOf(S.state) < 0) return S
+  return null
+}
+function sessionsSummary() {
+  const L = []
+  for (const S of SESSIONS) {
+    L.push('  ' + sessionLabel(S) + ' ник «' + (S.acc ? S.acc.nick : '?') + '» туннель «' + (S.T ? S.T.name : 'direct') + '»: ' +
+      S.state.toUpperCase() + (S.anarchy ? ' (' + S.anarchy + ')' : '') +
+      (S.solved ? ' ✅ капча решена (заход ' + S.solvedRound + ')' : '') +
+      (S.error ? ' | ' + String(S.error).slice(0, 80) : '') + ' | ротаций IP: ' + S.rotations)
+  }
+  return L
+}
+
+// ========================= TELEGRAM-ПУЛЬТ (v5: меню, личный заход, статус-блок, релей) =========================
+// Основный режим запуска. whitelist — telegram.allowedChatIds; чужие chat_id игнорируются.
+// Защита от «призрачных» апдейтов: offset flush при старте + date-фильтр (порт логики v3.11.1).
+const TG_UI = {
+  running: false,
+  startedAt: 0,          // unix-секунды старта (date-фильтр призраков)
+  offset: 0,
+  flushDone: false,      // offset-flush завершён (для тестов: инъекции только после него)
+  throttle: {},          // key chatId:messageId → {last, timer} (editMessageText ≤ 1 раз/1.2с)
+  byChat: {}             // chatId → {pendingAnarchy: bool}
+}
+
+function kbInline(rows) { return { inline_keyboard: rows } }
+function kbMenu() {
+  return kbInline([[
+    { text: '🧩 Алгоритмы', callback_data: 'menu:algo' },
+    { text: '👤 Личный заход', callback_data: 'menu:personal' }
+  ]])
+}
+function kbBack() { return kbInline([[{ text: '« Меню', callback_data: 'menu:back' }]]) }
+function kbPersonalPanel() {
+  return kbInline([
+    [{ text: '▶️ Запуск', callback_data: 'p:start' }, { text: '🔄 Смена ника', callback_data: 'p:rotate' }],
+    [{ text: '« Меню', callback_data: 'menu:back' }]
+  ])
+}
+function statusKb(S) {
+  const rows = [[
+    { text: '⏹ Выключить бота', callback_data: 's:stop' },
+    { text: '🔀 Смена анархии', callback_data: 's:anarchy' }
+  ]]
+  if (['stopped', 'dead', 'error'].indexOf(S.state) >= 0) rows.push([{ text: '▶️ Запустить заново', callback_data: 'p:start' }])
+  return kbInline(rows)
+}
+
+// текст статус-блока: статус 1/2/3 + «написано аккаунтом» между статусом и кнопками
+function statusBlockText(S) {
+  const L = []
+  L.push('👤 Личный заход — ' + (S.acc ? S.acc.nick : '?'))
+  const st = S.state
+  if (st === 'queued') L.push('Статус: 1️⃣ Заход на сервер… (жду слот туннеля ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel + ')')
+  else if (st === 'joining') L.push('Статус: 1️⃣ Заход на сервер…')
+  else if (st === 'captcha') L.push('Статус: 1️⃣ Заход на сервер… (решаю капчу)')
+  else if (st === 'hub') L.push('Статус: 2️⃣ HUB — выберите анархию')
+  else if (st === 'anarchy') L.push('Статус: 3️⃣ Анархия ' + S.anarchy)
+  else if (st === 'stopped') L.push('Статус: ⏹ Выключен')
+  else if (st === 'dead') L.push('Статус: 💀 Соединение закрыто' + (S.error ? ': ' + String(S.error).slice(0, 60) : ''))
+  else if (st === 'error') L.push('Статус: ❌ Ошибка: ' + String(S.error || S.lastError || '?').slice(0, 80))
+  else L.push('Статус: ' + st)
+  L.push('Туннель «' + (S.T ? S.T.name : 'direct') + '» · IP ' + ((S.T && S.T.ip) || '?') + ' · слоты ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel)
+  if (st === 'hub') {
+    L.push('────────────')
+    L.push('📜 Список анархий: ' + anarchyListText())
+    L.push('Отправьте команду /anN (например /an304). Премиальные в список не входят.')
+  }
+  L.push('────────────')
+  L.push('📝 Написано аккаунтом:')
+  if (S.sentLog.length) for (const s of S.sentLog.slice(-12)) L.push('> ' + s)
+  else L.push('> (пока пусто)')
+  return L.join('\n')
+}
+
+// editMessageText с троттлингом 1.2с на сообщение (Telegram лимитирует частые правки)
+function scheduleStatusEdit(S, force) {
+  const ui = S.ui
+  if (!ui || !ui.messageId) return
+  const key = String(ui.chatId) + ':' + ui.messageId
+  const rec = TG_UI.throttle[key] || (TG_UI.throttle[key] = { last: 0, timer: null })
+  const doEdit = () => {
+    rec.last = Date.now(); rec.timer = null
+    Promise.resolve(tgEdit(ui.chatId, ui.messageId, statusBlockText(S), statusKb(S))).catch(() => {})
+  }
+  if (force) { if (rec.timer) { clearTimeout(rec.timer); rec.timer = null }; doEdit(); return }
+  const wait = 1200 - (Date.now() - rec.last)
+  if (wait <= 0) { if (!rec.timer) doEdit() }
+  else if (!rec.timer) rec.timer = setTimeout(doEdit, wait)
+}
+
+const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.0.0\n\n🧩 Алгоритмы — готовые сценарии (в разработке)\n👤 Личный заход — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов'
+const ALGO_STUB_TEXT = '🧩 Алгоритмы — ЗАГЛУШКА (в разработке).\n\nКаркас готов: сессии, слоты туннелей (≤' + SOLVER.maxAccountsPerTunnel + '), приоритет алгоритмов выше личных, анархия-пресет (algo.anarchy).\nНаполнение сценариями (последовательности действий после анархии, настройка) — следующая итерация.'
+
+function personalPanelText(chatId) {
+  const T = personalTunnels()[0]
+  dbLoad()
+  const owner = 'tg:' + chatId
+  let acc = null
+  for (const a of DB.accounts) if (a.owner === owner && a.status !== 'retired') acc = a
+  const L = ['👤 Личный заход']
+  L.push(acc ? ('Ваш постоянный аккаунт: ' + acc.nick + ' (сам не меняется; статус: ' + acc.status + ')') : 'Личный аккаунт ещё не создан — будет создан при первом запуске.')
+  if (T) L.push('Туннель: «' + T.name + '» (role: personal)' + (T.ip ? ' · IP ' + T.ip : ''))
+  else L.push('⚠️ Личный туннель не задан — добавьте в config.json "tunnels": [ { …, "role": "personal" } ]')
+  L.push('«Смена ника» создаёт новый случайный аккаунт (старый остаётся в базе).')
+  return L.join('\n')
+}
+
+async function sendMenu(chatId) { return await tgSend(chatId, MENU_TEXT, kbMenu()) }
+
+async function startPersonal(chatId, messageId) {
+  const existing = activeSessionOfChat(chatId)
+  if (existing) {
+    if (existing.ui && existing.ui.messageId === messageId) { scheduleStatusEdit(existing, true); return }
+    await tgSend(chatId, '⚠️ Заход уже идёт (статус: ' + existing.state.toUpperCase() + (existing.anarchy ? ' ' + existing.anarchy : '') + '). Сначала «⏹ Выключить бота» или /stop.')
+    return
+  }
+  const T = personalTunnels()[0]
+  if (!T) {
+    tgLog('личный заход chat ' + chatId + ': личный туннель не задан')
+    await tgEdit(chatId, messageId, '⚠️ Личный туннель не задан.\n\nДобавьте в config.json второй прокси с ролью personal:\n"tunnels": [ { "name": "my", "host": "…", "port": …, "username": "…", "password": "…", "changeIpUrl": "…", "role": "personal" } ]\n\nЛичный заход использует ТОЛЬКО личный туннель (приоритет алгоритмов выше).', kbBack())
+    return
+  }
+  const acc = dbPersonal(chatId, T)
+  const S = makeSession({ kind: 'personal', tgChatId: chatId, acc, T })
+  SESSIONS.push(S)
+  S.ui = { chatId, messageId }
+  S.onChanged.push(() => scheduleStatusEdit(S))
+  await tgEdit(chatId, messageId, statusBlockText(S), statusKb(S))     // сообщение ЗАМЕНЯЕТСЯ статус-блоком
+  tgLog('личный заход запущен: chat ' + chatId + ', ник ' + acc.nick + ', туннель «' + T.name + '»')
+  runSession(S).catch(e => { S.error = (e && e.message) || String(e); S.setState('error') })
+}
+
+async function rotatePersonal(chatId, messageId) {
+  const existing = activeSessionOfChat(chatId)
+  if (existing) { await tgSend(chatId, '⚠️ Сначала остановите текущий заход («⏹ Выключить бота» или /stop), потом меняйте ник.'); return }
+  const T = personalTunnels()[0] || null
+  const acc = dbPersonalRotate(chatId, T)
+  tgLog('смена ника chat ' + chatId + ': новый аккаунт ' + acc.nick)
+  await tgEdit(chatId, messageId, personalPanelText(chatId) + '\n\n✅ Новый ник: ' + acc.nick, kbPersonalPanel())
+}
+
+async function onCallback(chatId, data, message) {
+  const mid = message && message.message_id
+  if (data === 'menu:back') { await tgEdit(chatId, mid, MENU_TEXT, kbMenu()); return }
+  if (data === 'menu:algo') { await tgEdit(chatId, mid, ALGO_STUB_TEXT, kbBack()); return }
+  if (data === 'menu:personal') { await tgEdit(chatId, mid, personalPanelText(chatId), kbPersonalPanel()); return }
+  if (data === 'p:start' || data === 'p:restart') { await startPersonal(chatId, mid); return }
+  if (data === 'p:rotate') { await rotatePersonal(chatId, mid); return }
+  if (data === 's:stop') {
+    const S = activeSessionOfChat(chatId)
+    if (!S) { await tgSend(chatId, 'Активная сессия не найдена.'); return }
+    stopSession(S, 'остановлено из Telegram')
+    tgLog('стоп сессии ' + sessionLabel(S) + ' из chat ' + chatId)
+    if (S.ui) scheduleStatusEdit(S, true)
+    return
+  }
+  if (data === 's:anarchy') {
+    const S = activeSessionOfChat(chatId)
+    if (!S || (S.state !== 'hub' && S.state !== 'anarchy')) { await tgSend(chatId, 'Смена анархии доступна только в активном заходе (HUB/анархия).'); return }
+    const st = TG_UI.byChat[chatId] || (TG_UI.byChat[chatId] = {})
+    st.pendingAnarchy = true
+    await tgSend(chatId, '🔀 Отправьте команду /anN (например /an304).\nСписок анархий: ' + anarchyListText() + '\n/cancel — отмена.')
+    return
+  }
+}
+
+async function onMessage(chatId, messageId, text) {
+  const t = String(text || '').trim()
+  const st = TG_UI.byChat[chatId] || (TG_UI.byChat[chatId] = {})
+  const S = activeSessionOfChat(chatId)
+
+  if (/^\/start(\b|$)/i.test(t)) { await sendMenu(chatId); return }
+  if (/^\/status(\b|$)/i.test(t)) {
+    if (!S) { await tgSend(chatId, 'Активных заходов нет. /start — меню.'); return }
+    await tgSend(chatId, statusBlockText(S), statusKb(S))
+    return
+  }
+  if (/^\/stop(\b|$)/i.test(t)) {
+    if (!S) { await tgSend(chatId, 'Активных заходов нет.'); return }
+    stopSession(S, 'остановлено из Telegram (/stop)')
+    tgLog('стоп сессии ' + sessionLabel(S) + ' (/stop, chat ' + chatId + ')')
+    return
+  }
+  if (/^\/cancel(\b|$)/i.test(t)) { st.pendingAnarchy = false; await tgSend(chatId, 'Отменено.'); return }
+  if (/^\/accounts(\b|$)/i.test(t)) {
+    const s = dbSummary()
+    await tgSend(chatId, '🗄 База аккаунтов (' + s.total + '): зарегистрировано ' + s.registered + ', личных ' + s.personal + ', алгоритмических ' + s.algo + ', занято ' + s.busy + ', в архиве ' + s.retired + '.\nФайл: learn/accounts_db.json')
+    return
+  }
+  if (/^\/help(\b|$)/i.test(t)) { await tgSend(chatId, 'Команды: /start меню · /status · /stop · /cancel · /accounts · /anN — смена анархии (в заходе) · любой текст в анархии — релей в игровой чат.'); return }
+
+  // /anN — смена анархии (только команда, «304» без /an — это релей)
+  const n = parseAnarchyCmd(t)
+  if (n !== null) {
+    st.pendingAnarchy = false
+    if (!S || (S.state !== 'hub' && S.state !== 'anarchy')) { await tgSend(chatId, 'Анархию можно выбрать только в активном заходе (статус HUB или анархия).'); return }
+    const r = await setAnarchy(S, n)
+    if (!r.ok) { await tgSend(chatId, '⚠️ ' + r.error); return }
+    await tgDelete(chatId, messageId)          // команду тоже удаляем — не засорять чат
+    if (S.ui) scheduleStatusEdit(S, true)
+    return
+  }
+
+  // релей: в анархии любой текст → в игровой чат, сообщение в ТГ удалить
+  if (S && S.state === 'anarchy' && S.live && !S.live.isDead()) {
+    if (!t) return
+    S.live.chat(t)                               // обёртка chat() сама добавит строку в sentLog
+    await tgDelete(chatId, messageId)
+    if (S.ui) scheduleStatusEdit(S)
+    return
+  }
+  if (S && S.state === 'hub') { await tgSend(chatId, 'Сначала выберите анархию: /anN (список: ' + anarchyListText() + ')'); return }
+  if (S) { await tgSend(chatId, 'Сессия в состоянии «' + S.state + '» — релей текста доступен только в анархии.'); return }
+  await tgSend(chatId, 'Нет активного захода. /start — меню.')
+}
+
+async function handleUpdate(u) {
+  const cq = u.callback_query
+  const msg = u.message
+  const chatId = cq ? (cq.message && cq.message.chat && cq.message.chat.id) : (msg && msg.chat && msg.chat.id)
+  if (chatId === undefined || chatId === null) return
+  // whitelist: чужие chat_id игнорируются
+  if (!tgAllowed(chatId)) { tgLog('запрет доступа: chat_id=' + chatId); return }
+  if (cq) {
+    try { await tgAnswerCb(cq.id) } catch (e) {}
+    await onCallback(chatId, String(cq.data || ''), cq.message || {})
+    return
+  }
+  const text = (msg.text === undefined || msg.text === null) ? '' : String(msg.text)
+  await onMessage(chatId, msg.message_id, text)
+}
+
+async function tgUiLoop() {
+  // защита от «призрачных» апдейтов: сбрасываем накопившуюся очередь (offset:-1)
+  TG_UI.flushDone = false
+  try {
+    const flush = await tgApi('getUpdates', { offset: -1, timeout: 0 })
+    if (flush && flush.ok && Array.isArray(flush.result) && flush.result.length) {
+      const last = flush.result[flush.result.length - 1]
+      TG_UI.offset = (last.update_id || 0) + 1
+      tgLog('offset flush: сброшено старых апдейтов ' + flush.result.length + ' (offset=' + TG_UI.offset + ')')
+    } else if (flush && flush.ok) {
+      TG_UI.offset = 0
+    }
+  } catch (e) { tgLog('offset flush ошибка: ' + e.message) }
+  TG_UI.flushDone = true
+
+  let errStreak = 0
+  while (TG_UI.running) {
+    let r = null
+    try { r = await tgGetUpdates(TG_UI.offset, TG_CFG.pollTimeoutSec) } catch (e) { r = { ok: false, description: e.message } }
+    if (!TG_UI.running) break
+    if (!r || !r.ok) {
+      errStreak++
+      tgLog('getUpdates ошибка: ' + ((r && (r.description || r.error_code)) || '?') + (errStreak > 3 ? ' (повтор через 10с)' : ' — повтор через 3с'))
+      await sleep(errStreak > 3 ? 10000 : 3000)
+      continue
+    }
+    errStreak = 0
+    const list = Array.isArray(r.result) ? r.result : []
+    for (const u of list) {
+      if (u && u.update_id) TG_UI.offset = u.update_id + 1     // offset сразу за апдейт (flush)
+      try {
+        // date-фильтр призраков: апдейты ДО старта пульта игнорируем (date=0 — мок/локальный, пропускаем)
+        const d = u && (u.message ? u.message.date : (u.callback_query && u.callback_query.message ? u.callback_query.message.date : 0))
+        if (d && TG_UI.startedAt && d < TG_UI.startedAt - 30) { dbg('[tg] призрачный апдейт ' + u.update_id + ' (date=' + d + ') — пропущен'); continue }
+        await handleUpdate(u)
+      } catch (e) { tgLog('handleUpdate ошибка: ' + e.message) }
+    }
+    if (!list.length && TG_CFG.pollTimeoutSec <= 0) await sleep(500)   // коротко-поллинговый режим (мок)
+  }
+  tgLog('пульт остановлен')
+}
+
+function tgUiStart() {
+  if (TG_UI.running) return
+  TG_UI.running = true
+  TG_UI.startedAt = Math.floor(Date.now() / 1000)
+  step('📱 TELEGRAM-ПУЛЬТ: запущен (бот ' + (TG_CFG.token ? TG_CFG.token.split(':')[0] : '?') + ', whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО — никто не подключится') + ')')
+  tgLog('пульт v5.0.0 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
+  tgUiLoop().catch(e => { tgLog('tgUiLoop fatal: ' + e.message); TG_UI.running = false })
+}
+function tgUiStop() { TG_UI.running = false }
+
 // ========================= SELFTEST (офлайн, без сервера и интернета) =========================
 async function selftest() {
-  console.log('=== SELFTEST v4.0.0: геометрия сборки + туннели + решатель ===')
+  console.log('=== SELFTEST v5.0.0: геометрия сборки + туннели + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
   // самопроверка НЕ выходит в интернет: хост-модель Roboflow на это время выключаем,
   // иначе yoloRecognize сходил бы в облако вместо локального мок-сервера (и потратил кредиты)
   const rfReadyWas = RF.ready
@@ -4036,131 +4982,481 @@ async function selftest() {
     if (!okQ) fails++
     console.log('  ' + (okQ ? '✅' : '❌') + ' параллельные вызовы выстраиваются в очередь (порядок a,b,c: ' + order.join(',') + ')')
   }
+  // ============ v5.0.0: АНАРХИИ (диапазоны + парсер ТОЛЬКО /anN) ============
+  console.log('--- v5.0.0: анархии (диапазоны, парсер /anN, список) ---')
+  {
+    const okRanges = anarchyOk(102) && anarchyOk(112) && !anarchyOk(113) && anarchyOk(202) && anarchyOk(304) &&
+      anarchyOk(514) && anarchyOk(902) && anarchyOk(904) && !anarchyOk(905) && !anarchyOk(999) && !anarchyOk(0) && !anarchyOk(-5)
+    if (!okRanges) fails++
+    console.log('  ' + (okRanges ? '✅' : '❌') + ' диапазоны: границы 102/112/202/304/514/902/904 — в списке; 113/905/999/0 — нет')
+
+    const okParse = parseAnarchyCmd('/an304') === 304 && parseAnarchyCmd(' /an305 ') === 305 &&
+      parseAnarchyCmd('/AN102') === 102 && parseAnarchyCmd('304') === null && parseAnarchyCmd('/an999') === null &&
+      parseAnarchyCmd('an304') === null && parseAnarchyCmd('/an') === null && parseAnarchyCmd('') === null
+    if (!okParse) fails++
+    console.log('  ' + (okParse ? '✅' : '❌') + ' парсер: «/an304»→304; «304» без /an НЕ принимается (это релей); /an999 вне диапазонов→null')
+
+    const list = anarchyListText()
+    const okList = list.indexOf('102-112') >= 0 && list.indexOf('902-904') >= 0 && list.split(';').length === ANARCHY.ranges.length
+    if (!okList) fails++
+    console.log('  ' + (okList ? '✅' : '❌') + ' список анархий: «' + list + '»')
+  }
+
+  // ============ v5.0.0: БАЗА АККАУНТОВ (9 кейсов, временный файл) ============
+  console.log('--- v5.0.0: база аккаунтов learn/accounts_db.json (9 кейсов) ---')
+  {
+    const dbDir = path.join(REC_ROOT || __dirname, 'selftest_db')
+    const tmpDb = path.join(dbDir, 'accounts_db.json')
+    const realPath = DB_PATH
+    try { fs.rmSync(dbDir, { recursive: true, force: true }) } catch (e) {}
+    dbSetPath(tmpDb)
+    DB.accounts = []
+
+    // 1. создание + атомарная запись на диск
+    const a1 = dbCreate('algo', { name: 'tx', ip: '1.1.1.1' })
+    const ok1 = !!a1 && /^Player\d+$/.test(a1.nick) && a1.pass.length >= 6 && a1.status === 'new' && a1.busy === true &&
+      a1.owner === 'algo' && a1.tunnel === 'tx' && a1.ip === '1.1.1.1' && fs.existsSync(tmpDb)
+    if (!ok1) fails++
+    console.log('  ' + (ok1 ? '✅' : '❌') + ' 1. dbCreate: ник/пароль/туннель/IP, статус new, busy, файл записан (tmp+rename)')
+
+    // 2. личный аккаунт ПОСТОЯНЕН: повторный dbPersonal возвращает ТОТ ЖЕ
+    const p1 = dbPersonal(777, { name: 'pers', ip: '2.2.2.2' })
+    const p2 = dbPersonal(777, { name: 'pers', ip: '2.2.2.2' })
+    const ok2 = p1 === p2 && p1.owner === 'tg:777'
+    if (!ok2) fails++
+    console.log('  ' + (ok2 ? '✅' : '❌') + ' 2. dbPersonal: один и тот же аккаунт (сам не меняется), owner=tg:777')
+
+    // 3. «смена ника»: старый остаётся в базе (retired), новый — другой ник
+    const p3 = dbPersonalRotate(777, { name: 'pers', ip: '2.2.2.2' })
+    const retired = DB.accounts.filter(a => a.owner === 'tg:777' && a.status === 'retired')
+    const ok3 = p3.nick !== p1.nick && retired.length === 1 && retired[0].busy === false &&
+      DB.accounts.filter(a => a.owner === 'tg:777' && a.status !== 'retired').length === 1
+    if (!ok3) fails++
+    console.log('  ' + (ok3 ? '✅' : '❌') + ' 3. dbPersonalRotate: старый → retired (остаётся в базе), новый случайный ник')
+
+    // 4. повторное использование: зарегистрированные algo-аккаунты выдаются из базы
+    const a2 = dbCreate('algo', { name: 'tx', ip: '1.1.1.2' })
+    dbMarkRegistered(a1); dbMarkRegistered(a2)
+    a1.busy = false; a2.busy = false
+    const take1 = dbTakeFreeAlgo({ name: 'other', ip: '9.9.9.9' })
+    const ok4 = !!take1 && take1.status === 'registered' && take1.busy === true
+    if (!ok4) fails++
+    console.log('  ' + (ok4 ? '✅' : '❌') + ' 4. dbTakeFreeAlgo: выдаёт зарегистрированный из базы и помечает busy')
+
+    // 5. приоритет «тот же IP»
+    take1.busy = false
+    const tIp = dbTakeFreeAlgo({ name: 'other', ip: '1.1.1.2' })
+    const ok5 = tIp === a2                                  // у a2 ip 1.1.1.2
+    if (!ok5) fails++
+    console.log('  ' + (ok5 ? '✅' : '❌') + ' 5. приоритет: совпал IP туннеля → выдан аккаунт с этим IP регистрации')
+
+    // 6. приоритет «тот же туннель»
+    tIp.busy = false
+    const a3 = dbCreate('algo', { name: 'tx', ip: '3.3.3.3' }); dbMarkRegistered(a3); a3.busy = false
+    const a4 = dbCreate('algo', { name: 'zz', ip: '4.4.4.4' }); dbMarkRegistered(a4); a4.busy = false
+    const tTun = dbTakeFreeAlgo({ name: 'zz', ip: '8.8.8.8' })
+    const ok6 = tTun === a4                                  // ip не совпал, туннель «zz» совпал
+    if (!ok6) fails++
+    console.log('  ' + (ok6 ? '✅' : '❌') + ' 6. приоритет: IP не совпал → выдан аккаунт того же туннеля')
+
+    // 7. занятые не выдаются; исчерпано → null
+    for (const a of DB.accounts) a.busy = true
+    const ok7 = dbTakeFreeAlgo({ name: 'tx', ip: '1.1.1.1' }) === null
+    if (!ok7) fails++
+    console.log('  ' + (ok7 ? '✅' : '❌') + ' 7. все заняты (busy) → dbTakeFreeAlgo вернул null')
+
+    // 8. личные (owner tg:*) алгоритмам НЕ выдаются
+    for (const a of DB.accounts) a.busy = false
+    const personalBefore = DB.accounts.filter(a => a.owner.indexOf('tg:') === 0).length
+    let leaked = false
+    for (let i = 0; i < DB.accounts.length + 2; i++) { const x = dbTakeFreeAlgo({ name: 'q', ip: 'q' }); if (x && x.owner.indexOf('tg:') === 0) leaked = true; if (x) x.busy = true; else break }
+    const ok8 = !leaked && personalBefore > 0
+    for (const a of DB.accounts) a.busy = false
+    if (!ok8) fails++
+    console.log('  ' + (ok8 ? '✅' : '❌') + ' 8. личные аккаунты (tg:*) алгоритмам не выдаются')
+
+    // 9. битый файл переносится gracefully + сводка
+    fs.writeFileSync(tmpDb, '{ oops not json')
+    DB.accounts = [{ owner: 'x' }]                            // грязное состояние в памяти
+    dbLoad(true)
+    const s = dbSummary()
+    const ok9 = DB.accounts.length === 0 && s.total === 0
+    if (!ok9) fails++
+    console.log('  ' + (ok9 ? '✅' : '❌') + ' 9. битый accounts_db.json → пустая база без падения; dbSummary считает')
+
+    // статус-блоки используют tmp-путь (dbSetAnarchy пишет туда же)
+    console.log('--- v5.0.0: статус-блок TG (6 кейсов) ---')
+    const fakeT = { name: 'personal-test', ip: '5.6.7.8', role: 'personal', slots: { active: ['personal'], waiters: [] } }
+    const S = makeSession({ kind: 'personal', tgChatId: 1, acc: { nick: 'Player777', pass: 'SECRET123', status: 'new', owner: 'tg:1', anarchy: null }, T: fakeT })
+    S.setState('joining')
+    const t1 = statusBlockText(S)
+    const c1 = t1.indexOf('1️⃣') >= 0 && t1.indexOf('Заход на сервер') >= 0 && t1.indexOf('Player777') >= 0
+    S.setState('captcha')
+    const c1b = statusBlockText(S).indexOf('решаю капчу') >= 0
+    S.setState('hub')
+    const t2 = statusBlockText(S)
+    const c2 = t2.indexOf('2️⃣') >= 0 && t2.indexOf('выберите анархию') >= 0 && t2.indexOf('102-112') >= 0 && t2.indexOf('902-904') >= 0
+    S.logSent('48152')
+    S.logSent('/reg SECRET123')
+    const t3pre = statusBlockText(S)
+    const c4 = t3pre.indexOf('••••••') >= 0 && t3pre.indexOf('SECRET123') < 0 && t3pre.indexOf('> 48152') >= 0
+    const fakeLive = { chat(x) { fakeLive.sent.push(String(x)); return true }, sent: [], isDead: () => false, deadReason: () => '', end() {} }
+    S.live = fakeLive
+    await setAnarchy(S, 304)
+    const t3 = statusBlockText(S)
+    const c3 = t3.indexOf('3️⃣') >= 0 && t3.indexOf('Анархия 304') >= 0
+    S.logSent('привет всем')
+    await setAnarchy(S, 310)                                  // СМЕНА анархии → список очищен
+    const t4 = statusBlockText(S)
+    const c5 = S.sentLog.length === 1 && S.sentLog[0] === '/an310' && t4.indexOf('привет всем') < 0 && t4.indexOf('> /an310') >= 0
+    const c6 = t4.indexOf('слоты 1/' + SOLVER.maxAccountsPerTunnel) >= 0 && t4.indexOf('Туннель «personal-test»') >= 0 && t4.indexOf('IP 5.6.7.8') >= 0
+    const okSt = c1 && c1b && c2 && c3 && c4 && c5 && c6
+    if (!okSt) fails++
+    console.log('  ' + (okSt ? '✅' : '❌') + ' статус 1️⃣/2️⃣/3️⃣ + список анархий в HUB + пароль •••••• + очистка при смене + «Туннель/IP/слоты»' +
+      (okSt ? '' : ' [c1=' + c1 + ' c1b=' + c1b + ' c2=' + c2 + ' c3=' + c3 + ' c4=' + c4 + ' c5=' + c5 + ' c6=' + c6 + ']'))
+    S.live = null
+
+    console.log('--- v5.0.0: слоты туннелей (ёмкость ≤' + SOLVER.maxAccountsPerTunnel + ', приоритет algo > personal) ---')
+    {
+      const TS = makeTunnel({ name: 'slot-test', host: '127.0.0.1', port: 1 }, 0)
+      const got = []
+      for (let i = 0; i < SOLVER.maxAccountsPerTunnel; i++) got.push(await acquireSlot(TS, 'algo'))
+      const okCap = got.every(Boolean) && TS.slots.active.length === SOLVER.maxAccountsPerTunnel
+      // занято: personal встал в очередь ПЕРВЫМ, algo вторым — освободившийся слот достанется algo
+      let persDone = false, algoDone = false
+      const pP = acquireSlot(TS, 'personal').then(r => { persDone = r; return r })
+      await sleep(10)
+      const aP = acquireSlot(TS, 'algo').then(r => { algoDone = r; return r })
+      await sleep(10)
+      releaseSlot(TS, 'algo')
+      await sleep(10)
+      const okPrio1 = algoDone === true && persDone === false && TS.slots.waiters.length === 1 && TS.slots.waiters[0].kind === 'personal'
+      releaseSlot(TS, 'algo')
+      await Promise.all([pP, aP])
+      const okPrio2 = persDone === true && TS.slots.active.length === SOLVER.maxAccountsPerTunnel
+      // отмена ожидания слота (стоп сессии в очереди)
+      let cancelled = null
+      const cP = acquireSlot(TS, 'personal', { slotWaiter: null }).then(r => { cancelled = r; return r })
+      await sleep(10)
+      const holder = TS.slots.waiters[TS.slots.waiters.length - 1]
+      if (holder) { const i = TS.slots.waiters.indexOf(holder); TS.slots.waiters.splice(i, 1); holder.resolve(false) }
+      await cP
+      const okCancel = cancelled === false
+      const okSlots = okCap && okPrio1 && okPrio2 && okCancel
+      if (!okSlots) fails++
+      console.log('  ' + (okSlots ? '✅' : '❌') + ' ёмкость ' + SOLVER.maxAccountsPerTunnel + ' + очередь: algo раньше personal + отмена ожидания' +
+        (okSlots ? '' : ' [cap=' + okCap + ' prio1=' + okPrio1 + ' prio2=' + okPrio2 + ' cancel=' + okCancel + ']'))
+    }
+
+    // восстановить реальный путь базы
+    dbSetPath(realPath)
+    DB.accounts = []
+    dbLoad(true)
+    try { fs.rmSync(dbDir, { recursive: true, force: true }) } catch (e) {}
+  }
+
+  // ============ v5.0.0: TELEGRAM-ПУЛЬТ на мок-Bot-API (10 кейсов, офлайн) ============
+  console.log('--- v5.0.0: Telegram-пульт на мок-Bot-API (10 кейсов) ---')
+  {
+    const dbDir2 = path.join(REC_ROOT || __dirname, 'selftest_tg_db')
+    const tmpDb2 = path.join(dbDir2, 'accounts_db.json')
+    const realPath2 = DB_PATH
+    const tgLogPath = path.join(REC_ROOT || __dirname, 'telegram.log')
+    try { fs.rmSync(dbDir2, { recursive: true, force: true }) } catch (e) {}
+    try { fs.rmSync(tgLogPath, { force: true }) } catch (e) {}
+    dbSetPath(tmpDb2)
+    DB.accounts = []
+
+    // ---- мок Telegram Bot API на локальном http-сервере ----
+    const sent = [], edits = [], deletes = [], cbAnswers = []
+    let pending = [], nextMid = 100, uid = 90000
+    const srv = http.createServer((rq, rs) => {
+      const b = []
+      rq.on('data', c => b.push(c))
+      rq.on('end', () => {
+        const buf = Buffer.concat(b)
+        const m = rq.url.split('/').pop()
+        const j = o => { rs.writeHead(200, { 'Content-Type': 'application/json' }); rs.end(JSON.stringify(o)) }
+        let p = {}; try { p = JSON.parse(buf.toString('utf8')) } catch (e) {}
+        if (m === 'getMe') return j({ ok: true, result: { id: 1, username: 'selftest_v5_bot' } })
+        if (m === 'sendMessage') { const mid = ++nextMid; sent.push({ params: p, mid }); return j({ ok: true, result: { message_id: mid } }) }
+        if (m === 'editMessageText') { edits.push({ params: p, mid: p.message_id }); return j({ ok: true, result: { message_id: p.message_id } }) }
+        if (m === 'deleteMessage') { deletes.push({ params: p }); return j({ ok: true, result: true }) }
+        if (m === 'answerCallbackQuery') { cbAnswers.push({ params: p }); return j({ ok: true, result: true }) }
+        if (m === 'getUpdates') {
+          if (p.offset === -1) { const out = pending.slice(); pending = []; return j({ ok: true, result: out }) }   // offset flush
+          if (typeof p.offset === 'number' && p.offset > 0) pending = pending.filter(u => u.update_id >= p.offset)
+          const out = pending.splice(0, pending.length)
+          if (out.length) return j({ ok: true, result: out })
+          setTimeout(() => j({ ok: true, result: [] }), 40)
+          return
+        }
+        j({ ok: true, result: {} })
+      })
+    })
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    const port = srv.address().port
+
+    // ---- переключаем окружение на мок ----
+    const savedTG = { apiUrl: TG_CFG.apiUrl, token: TG_CFG.token, allowed: TG_CFG.allowedChatIds.slice(), poll: TG_CFG.pollTimeoutSec }
+    TG_CFG.apiUrl = 'http://127.0.0.1:' + port
+    TG_CFG.token = 'SELFTEST'
+    TG_CFG.allowedChatIds = [1]
+    TG_CFG.pollTimeoutSec = 0
+    tgTransport = null
+    const persT = makeTunnel({ name: 'personal-test', host: '127.0.0.1', port: 9, role: 'personal' }, 900)
+    persT.ip = '5.6.7.8'
+
+    function makeFakeLive() {
+      const L = {
+        sent: [],
+        bot: { swingArm() {}, look() {}, entity: { yaw: 0, pitch: 0 } },
+        snap: () => ({ maps: new Map(), frames: [], chats: [], events: [], metaDump: [] }),
+        chatsLen: () => L.chats.length,
+        chatsFrom: mm => L.chats.slice(Number(mm) || 0),
+        chats: [],
+        chat(t) { L.sent.push(String(t)); return true },
+        isDead: () => false,
+        deadReason: () => '',
+        lastChange: () => Date.now(),
+        readiness: () => ({ ready: true }),
+        waitDead: async () => false,
+        waitFreshWall: async () => false,
+        end() {}
+      }
+      return L
+    }
+    let lastLive = null
+    const savedHooks = { c: SESS_HOOKS.connect, s: SESS_HOOKS.solve }
+    SESS_HOOKS.connect = async () => { lastLive = makeFakeLive(); return { ok: true, live: lastLive } }
+    SESS_HOOKS.solve = async live => { live.chat('48152'); return { ok: true, ans: { digits: '48152', host: 'mock', ms: 1 }, auth: { ok: true, via: 'reg' }, attempts: [] } }
+
+    const inject = u => { u.update_id = ++uid; pending.push(u) }
+    const injMsg = (chatId, mid, text, date) => inject({ message: { message_id: mid, chat: { id: chatId }, text, date: date || 0 } })
+    const injCb = (chatId, mid, data) => inject({ callback_query: { id: 'cb' + mid + data, message: { message_id: mid, chat: { id: chatId } }, data } })
+    async function waitFor(cond, ms) {
+      const t0 = Date.now()
+      while (Date.now() - t0 < (ms || 4000)) { let v = false; try { v = cond() } catch (e) {}; if (v) return true; await sleep(40) }
+      return false
+    }
+
+    TG_UI.running = true
+    TG_UI.startedAt = Math.floor(Date.now() / 1000)
+    TG_UI.offset = 0
+    const loopP = tgUiLoop()
+    // ВАЖНО: инъекции только ПОСЛЕ offset-flush (иначе первый апдейт съест флаш)
+    await waitFor(() => TG_UI.flushDone === true, 3000)
+
+    const results = []
+    const caseOk = (name, ok, extra) => { if (!ok) fails++; results.push('  ' + (ok ? '✅' : '❌') + ' ' + name + (extra ? ' — ' + extra : '')) }
+    const editWith = frag => edits.some(e => String((e.params && e.params.text) || '').indexOf(frag) >= 0)
+
+    // 1+2: /start → приветствие и меню с 2 кнопками
+    injMsg(1, 11, '/start')
+    const okMenu = await waitFor(() => sent.length >= 1)
+    const menuRec = sent[0] || {}
+    const menuText = String((menuRec.params && menuRec.params.text) || '')
+    let kb = null; try { kb = JSON.parse((menuRec.params && menuRec.params.reply_markup) || 'null') } catch (e) {}
+    caseOk('1. приветствие: /start → «пульт управления v5.0.0» в chat 1', okMenu && menuText.indexOf('пульт управления v5.0.0') >= 0 && menuRec.params && menuRec.params.chat_id === 1)
+    const okBtns = !!kb && Array.isArray(kb.inline_keyboard) && kb.inline_keyboard[0].length === 2 &&
+      kb.inline_keyboard[0][0].callback_data === 'menu:algo' && kb.inline_keyboard[0][1].callback_data === 'menu:personal' &&
+      kb.inline_keyboard[0][0].text.indexOf('Алгоритмы') >= 0 && kb.inline_keyboard[0][1].text.indexOf('Личный заход') >= 0
+    caseOk('2. меню: 2 кнопки «🧩 Алгоритмы» + «👤 Личный заход»', okBtns)
+
+    // 3: панель «Личный заход» (Запуск / Смена ника)
+    const menuMid = menuRec.mid
+    injCb(1, menuMid, 'menu:personal')
+    const okPanel = await waitFor(() => edits.some(e => e.mid === menuMid && String(e.params.text).indexOf('Личный заход') >= 0 &&
+      String(e.params.reply_markup || '').indexOf('p:start') >= 0 && String(e.params.reply_markup || '').indexOf('p:rotate') >= 0))
+    caseOk('3. панель личного захода: аккаунт + «▶️ Запуск»/«🔄 Смена ника»', okPanel)
+
+    // 4: личного туннеля нет → предупреждение (запуск не стартует)
+    const sessBefore = SESSIONS.length
+    injCb(1, menuMid, 'p:start')
+    const okWarn = await waitFor(() => editWith('Личный туннель не задан'))
+    caseOk('4. без туннеля role=personal: «⚠️ Личный туннель не задан», сессия не создана', okWarn && SESSIONS.length === sessBefore)
+
+    // 5: добавляем личный туннель → Запуск → статус-блок 1️⃣ → 2️⃣ HUB + список анархий
+    TUNNELS.push(persT)
+    injCb(1, menuMid, 'p:start')
+    const okSess = await waitFor(() => SESSIONS.some(x => x.kind === 'personal' && String(x.tgChatId) === '1'))
+    const S = SESSIONS.find(x => x.kind === 'personal' && String(x.tgChatId) === '1') || null
+    const okBlock1 = await waitFor(() => editWith('👤 Личный заход —') && editWith('слоты'))
+    const okHub = !!S && await waitFor(() => S.state === 'hub', 6000)
+    const okBlock2 = await waitFor(() => edits.some(e => String(e.params.text).indexOf('2️⃣') >= 0 &&
+      String(e.params.text).indexOf('Список анархий: 102-112') >= 0 && String(e.params.text).indexOf('> 48152') >= 0))
+    caseOk('5. «Запуск» → статус-блок: 1️⃣ заход → 2️⃣ HUB + список анархий + «написано аккаунтом»', okSess && okBlock1 && okHub && okBlock2, 'состояние: ' + (S ? S.state : 'нет сессии'))
+
+    if (S) {
+      // 6: /an305 → в игру + ТГ-сообщение удалено; /an310 → смена + очистка sentLog
+      injMsg(1, 22, '/an305')
+      const okAn = await waitFor(() => S.state === 'anarchy' && S.anarchy === 305 &&
+        deletes.some(d => d.params.message_id === 22 && d.params.chat_id === 1) &&
+        lastLive && lastLive.sent.indexOf('/an305') >= 0)
+      injMsg(1, 23, '/an310')
+      const okSwitch = await waitFor(() => S.anarchy === 310 && S.sentLog.length === 1 && S.sentLog[0] === '/an310')
+      caseOk('6. /an305 → команда в игру, ТГ-сообщение удалено; /an310 → смена анархии, «написанное» очищено', okAn && okSwitch)
+
+      // 7: релей — текст из ТГ → игровой чат + deleteMessage + sentLog
+      injMsg(1, 24, 'привет всем')
+      const okRelay = await waitFor(() => lastLive && lastLive.sent.indexOf('привет всем') >= 0 &&
+        deletes.some(d => d.params.message_id === 24) && S.sentLog.indexOf('привет всем') >= 0)
+      caseOk('7. релей в анархии: текст → в игровой чат, ТГ-сообщение удалено, строка в sentLog', okRelay)
+
+      // 8: «305» без /an — релей, НЕ смена анархии
+      injMsg(1, 25, '305')
+      const ok305 = await waitFor(() => lastLive && lastLive.sent.indexOf('305') >= 0)
+      caseOk('8. «305» без /an — это релей (анархия осталась ' + S.anarchy + ')', ok305 && S.anarchy === 310)
+
+      // 9: чужой chat_id игнорируется + «призрачный» апдейт (date до старта) отброшен
+      // (сравниваем НЕ глобальные счётчики — троттлинг статус-блока может дать легальный edit в этом окне)
+      const sentBefore = sent.length
+      injMsg(999, 26, '/start')
+      injMsg(1, 27, '/accounts', TG_UI.startedAt - 300)
+      await sleep(1500)
+      let logHasBan = false
+      try { logHasBan = fs.readFileSync(tgLogPath, 'utf8').indexOf('запрет доступа') >= 0 } catch (e) {}
+      const newSent = sent.slice(sentBefore)
+      const okIgnore = !newSent.some(s => s.params.chat_id === 999) &&
+        !newSent.some(s => String(s.params.text || '').indexOf('База аккаунтов') >= 0) &&
+        !edits.some(e => e.params.chat_id === 999) && logHasBan
+      caseOk('9. чужой chat_id игнорируется («запрет доступа» в records/telegram.log), призрачный апдейт отброшен', okIgnore)
+
+      // 10: «⏹ Выключить бота» → сессия stopped + финальный статус-блок
+      injCb(1, menuMid, 's:stop')
+      const okStop = await waitFor(() => S.state === 'stopped', 5000)
+      const okFinal = await waitFor(() => editWith('⏹ Выключен'))
+      caseOk('10. «⏹ Выключить бота» → сессия остановлена (stopped), финальный блок', okStop && okFinal)
+    } else {
+      for (let k = 6; k <= 10; k++) caseOk(k + '. (пропущено — нет сессии)', false)
+    }
+
+    for (const r of results) console.log(r)
+
+    // ---- уборка: гасим цикл, мок, хуки, туннель, конфиг, базу ----
+    TG_UI.running = false
+    try { await Promise.race([loopP, sleep(1500)]) } catch (e) {}
+    try { srv.close() } catch (e) {}
+    SESS_HOOKS.connect = savedHooks.c; SESS_HOOKS.solve = savedHooks.s
+    const iT = TUNNELS.indexOf(persT); if (iT >= 0) TUNNELS.splice(iT, 1)
+    TG_CFG.apiUrl = savedTG.apiUrl; TG_CFG.token = savedTG.token
+    TG_CFG.allowedChatIds = savedTG.allowed; TG_CFG.pollTimeoutSec = savedTG.poll
+    tgTransport = null
+    for (const k of Object.keys(TG_UI.throttle)) { const rec = TG_UI.throttle[k]; if (rec && rec.timer) { try { clearTimeout(rec.timer) } catch (e) {} } delete TG_UI.throttle[k] }
+    TG_UI.byChat = {}
+    if (S) { const iS = SESSIONS.indexOf(S); if (iS >= 0) SESSIONS.splice(iS, 1) }
+    dbSetPath(realPath2)
+    DB.accounts = []
+    dbLoad(true)
+    if (!CLI.debug) {
+      try { fs.rmSync(dbDir2, { recursive: true, force: true }) } catch (e) {}
+      try { fs.rmSync(tgLogPath, { force: true }) } catch (e) {}
+    }
+  }
+
   RF.ready = rfReadyWas
   RF.disabledReason = rfDisabledWas
   if (!CLI.debug) {
-    for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest_yolo', 'selftest']) {
+    for (const d of ['selftest_e2e', 'selftest_e2e_light', 'selftest_learn', 'selftest_yolo', 'selftest', 'selftest_db', 'selftest_tg_db']) {
       try { fs.rmSync(path.join(REC_ROOT || __dirname, d), { recursive: true, force: true }) } catch (e) {}
     }
   } else console.log('  (--debug: артефакты самопроверки оставлены в ' + path.join(REC_ROOT || __dirname, 'selftest_e2e') + ')')
   console.log(fails ? '=== SELFTEST: ' + fails + ' ПРОВАЛОВ ===' : '=== SELFTEST: ВСЁ ОК ===')
   return fails === 0
 }
-// ========================= ПУЛ БОТОВ (мультибот, распределение по туннелям) =========================
-// Расчёт на N ботов (accounts.count / --bots), хотя обычно запускают одного.
-// Туннели назначаются round-robin: бот i → tunnels[i % tunnels.length].
-function buildWorkers() {
+// ========================= КЛИЕНТСКИЙ ПУЛ v5 (headless, --bots/--rounds) =========================
+// Тот же движок сессий, что и у TG-пульта: аккаунты БЕРУТСЯ ИЗ БАЗЫ (зарегистрированные,
+// приоритет: тот же IP → тот же туннель → любой свободный), иначе создаются новые.
+// Анархия headless-забега: algo.anarchy (null = остаться в HUB).
+function buildCliSessions() {
   const n = Math.max(1, ACCOUNTS.count)
-  const ws = []
+  const pool = algoTunnels().length ? algoTunnels() : TUNNELS
+  const out = []
   for (let i = 0; i < n; i++) {
-    const T = TUNNELS.length ? TUNNELS[i % TUNNELS.length] : null
-    ws.push({
-      id: i + 1,
-      nick: randomNick(),
-      pass: randomPass(),
-      T,
-      live: null,
-      roundNoBase: i * 100,          // нумерация файлов раундов не пересекается между ботами
-      success: false, authOk: false,
-      failStreak: 0, netFails: 0, rotations: 0,
-      results: [],
-      online: false
-    })
+    const T = pool.length ? pool[i % pool.length] : null
+    let acc = T ? dbTakeFreeAlgo(T) : null
+    if (!acc) acc = dbCreate('algo', T)
+    out.push(makeSession({
+      kind: 'algo', acc, T,
+      presetAnarchy: ALGO.anarchy,
+      roundNoBase: i * 100               // нумерация файлов раундов не пересекается между ботами
+    }))
   }
-  return ws
+  return out
 }
 
-// «особые случаи» для смены IP туннеля: бан-кик, серия провалов капчи, серия сетевых фейлов
-function tunnelNeedsRotation(w, res) {
-  if (!w.T) return false
-  if (res && res.kick && matchAny(res.kickReason, SOLVER.banWords)) return true
-  if (w.failStreak >= SOLVER.rotateOnFailStreak) return true
-  if (w.netFails >= SOLVER.rotateOnNetFails) return true
-  return false
-}
-
-async function runWorker(w, state) {
-  const label = 'БОТ-' + w.id
-  for (let r = 1; r <= SOLVER.roundsPerBot && !state.aborted; r++) {
-    if (r > 1) await sleep(PAUSE_BETWEEN_MS + Math.floor(Math.random() * 600))
-    let res = null
-    try { res = await solveJoin(w, r) } catch (e) { res = { ok: false, stage: 'exception', note: e.message }; step(label + ': исключение захода: ' + e.message) }
-    w.results.push({ r, ok: !!res.ok, stage: res.stage, note: res.note || '', digits: res.ans ? res.ans.digits : '', auth: res.auth ? (res.auth.ok ? res.auth.via : 'fail:' + (res.auth.kind || res.auth.stage)) : '' })
-
-    if (res.ok) {
-      w.success = true
-      w.authOk = !!(res.auth && res.auth.ok)
-      w.failStreak = 0; w.netFails = 0
-      state.solved++
-      step('=== ' + label + ' ✅ КАПЧА РЕШЕНА' + (w.authOk ? ' + АВТОРИЗОВАН' : ' (авторизация не подтверждена: ' + ((res.auth && (res.auth.kind || res.auth.stage)) || '?') + ')') +
-        ' | ник «' + w.nick + '» | цифр «' + (res.ans ? res.ans.digits : '?') + '» | заходов: ' + r + '/' + SOLVER.roundsPerBot + ' ===')
-      if (SOLVER.stayOnline) {
-        w.online = true
-        state.online++
-        await holdOnline(w, label)
-        w.online = false
-        state.online--
-      } else {
-        try { if (res.live) res.live.end('done') } catch (e) {}
-        w.live = null
-      }
-      return
-    }
-
-    // ---- провал: считаем серии, при «особых случаях» меняем IP туннеля ----
-    const netFail = res.stage === 'connect' && NET_FAIL_RE.test(res.note || '')
-    const fatal = FATAL_RE.test(res.note || '')
-    if (fatal) {
-      state.aborted = true
-      step('❌ ФАТАЛЬНО (' + res.note + ') — остановка всех ботов. ' + (mineflayer ? '' : 'Установите зависимости: npm install mineflayer socks'))
-      return
-    }
-    if (netFail) { w.netFails++; if (w.T) w.T.failStreak = (w.T.failStreak || 0) + 1 } else { w.netFails = 0; w.failStreak++ }
-    if (res.kick && matchAny(res.kickReason, SOLVER.banWords)) step(label + ': ⚠️ кик с признаком бана: ' + String(res.kickReason).slice(0, 100))
-
-    if (tunnelNeedsRotation(w, res)) {
-      if (w.rotations >= MAX_ROTATIONS_ON_FAIL) {
-        step(label + ': лимит ротаций IP исчерпан (' + w.rotations + ') — прекращаю заходы этого бота')
-        return
-      }
-      w.rotations++
-      w.failStreak = 0; w.netFails = 0
-      if (w.T) w.T.failStreak = 0
-      step(label + ': 🔄 особый случай — меняю IP туннеля «' + w.T.name + '» (ротация ' + w.rotations + '/' + MAX_ROTATIONS_ON_FAIL + ')')
-      try { await rotateIp(w.T) } catch (e) { step(label + ': ротация IP ошибка: ' + e.message) }
-      await sleep(2500)
-    } else if (res.stage === 'connect' && w.T && w.T.state === 'dead') {
-      // туннель мёртв (никто не слушает порт) — дальше долбиться бессмысленно
-      if (++state.tunnelDeadHits >= 4 && TUNNELS.length === 1) {
-        state.aborted = true
-        step('❌ ТУННЕЛЬ МЁРТВ: соединение не устанавливается 4 раза подряд. Запустите node main.js --proxy-check')
-        return
-      }
-    }
+async function runCliPool(sessions) {
+  const t0 = Date.now()
+  step('ПУЛ v5: ' + sessions.length + ' сессия(й) × до ' + SOLVER.roundsPerBot + ' заходов | туннелей: ' + (TUNNELS.length || 0) +
+    ' (algo: ' + algoTunnels().length + ', personal: ' + personalTunnels().length + ') | слоты ≤' + SOLVER.maxAccountsPerTunnel +
+    ' | старт вразнобой через ' + ACCOUNTS.staggerMs + 'мс | после успеха: HUB' + (ALGO.anarchy ? ' → /an' + ALGO.anarchy : ' (анархия не задана)'))
+  for (const S of sessions) {
+    SESSIONS.push(S)
+    step(sessionLabel(S) + ': ник «' + S.acc.nick + '» (' + (S.acc.status === 'registered' ? 'из базы, /l' : 'новый, /reg') + '), туннель «' + (S.T ? S.T.name : 'direct') + '»')
   }
-  step('=== ' + label + ': лимит заходов (' + SOLVER.roundsPerBot + ') исчерпан, капча не решена ===')
-}
-
-async function runWorkers(workers) {
-  const state = { aborted: false, solved: 0, online: 0, t0: Date.now(), tunnelDeadHits: 0 }
-  step('ПУЛ: ' + workers.length + ' бот(ов) × до ' + SOLVER.roundsPerBot + ' заходов | туннелей: ' + (TUNNELS.length || 0) +
-    ' | старт вразнобой через ' + ACCOUNTS.staggerMs + 'мс | после успеха: ' + (SOLVER.stayOnline ? (SOLVER.holdMinutes ? 'держать ' + SOLVER.holdMinutes + ' мин' : 'оставаться в игре') : 'выход'))
-  for (const w of workers) {
-    step('БОТ-' + w.id + ': ник «' + w.nick + '», пароль сгенерирован (' + w.pass.length + ' симв.), туннель «' + (w.T ? w.T.name : 'direct') + '»')
-  }
-  const tasks = workers.map((w, i) => (async () => {
+  const tasks = sessions.map((S, i) => (async () => {
     if (i > 0 && ACCOUNTS.staggerMs > 0) await sleep(i * ACCOUNTS.staggerMs + Math.floor(Math.random() * 400))
-    await runWorker(w, state)
+    if (S.stop) return
+    await runSession(S)
   })())
-  await Promise.all(tasks)
-  return state
+  // ждём, пока каждая сессия дойдёт до HUB/анархии или завершится (в HUB она остаётся жить)
+  await Promise.all(sessions.map(S => S.settledPromise))
+  return { t0, tasks }
 }
 
-// ========================= MAIN =========================
+function printSummary(sessions, t0) {
+  const solved = sessions.filter(S => S.solved).length
+  const online = sessions.filter(S => ['hub', 'anarchy'].indexOf(S.state) >= 0).length
+  const L = ['=== СВОДКА v5.0.0 ===']
+  L.push('сессий: ' + sessions.length + ' | решено капч: ' + solved + '/' + sessions.length + ' | в игре: ' + online + ' | время: ' + Math.round((Date.now() - t0) / 1000) + 'с')
+  for (const l of sessionsSummary()) L.push(l)
+  L.push('')
+  L.push('Картинки и результаты: ' + CAP_ROOT + ' и records/sess*_a*/result.json')
+  step('готово.')
+  flushReport(L.join('\n'))
+  try {
+    fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
+      stamp: STAMP, version: '5.0.0', sessions: sessions.length, solved, online,
+      seconds: Math.round((Date.now() - t0) / 1000),
+      results: sessions.map(S => ({
+        id: S.id, kind: S.kind, nick: S.acc ? S.acc.nick : '', tunnel: S.T ? S.T.name : 'direct',
+        state: S.state, anarchy: S.anarchy, solved: S.solved, solvedRound: S.solvedRound,
+        digits: S.ans ? S.ans.digits : '', auth: S.auth ? (S.auth.ok ? S.auth.via : 'fail:' + (S.auth.kind || S.auth.stage)) : '',
+        rotations: S.rotations, error: S.error || ''
+      }))
+    }, null, 2))
+  } catch (e) { console.error('summary.json err:', e.message) }
+  console.log('\n' + L.join('\n'))
+  return { solved, online }
+}
+
+// ========================= MAIN (v5: по умолчанию — Telegram-пульт) =========================
+function printConfigSummary() {
+  step('config: ' + (CFG_PATH || 'НЕТ') + ' parse=' + CFG_STRATEGY)
+  step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version)
+  if (TUNNELS.length) {
+    for (const T of TUNNELS) step('🔌 туннель «' + T.name + '» (role: ' + T.role + '): ' + T.cfg.host + ':' + T.cfg.port + (T.cfg.username ? ' (логин ' + T.cfg.username + ')' : '') + ' | смена IP: ' + describeChangeIpUrl(T.cfg.changeIpUrl))
+    if (!personalTunnels().length) step('⚠️ нет туннеля с role=personal — «Личный заход» в Telegram не запустится (добавьте в "tunnels")')
+  } else {
+    step('⚠️ туннели/прокси НЕ заданы' + (CAP.allowDirect ? ' — заход НАПРЯМУЮ (proxy.allowDirect=true), FunTime может быстро забанить ваш IP' : ' — заходы невозможны (нет proxy.host; для прямого захода включите "proxy": { "allowDirect": true })'))
+  }
+  step('☁️ ROBOFLOW: ' + (RF.ready
+    ? 'ВКЛ → https://' + RF.host + '/' + RF.model + ' (поле "' + RF.field + '", порог ' + RF.askConf + '%, overlap ' +
+      Math.round(RF.overlap * 100) + '%, таймаут ' + RF.timeoutMs + 'мс, ключ ' + rfMaskKey(RF.apiKey) + ', темп ' + RF.paceMs + 'мс)'
+    : (RF.enabled ? 'ВКЛ, но нет roboflow.apiKey — облако не используется' : 'ВЫКЛ (roboflow.enabled=false)')))
+  step('🌐 YOLO API (запасной): ' + (YOLO.enabled ? 'ВКЛ → ' + YOLO.urls.join(' → ') : 'ВЫКЛ (yolo.enabled=false)'))
+  if (!RF.ready && !YOLO.enabled) step('⚠️ распознавание ВЫКЛЮЧЕНО полностью: текст с картинки брать неоткуда — заходы бессмысленны')
+  step('АККАУНТЫ: префикс ника «' + ACCOUNTS.nickPrefix + '», пароль ' + ACCOUNTS.passwordLength + ' симв. (случайный), reg=«' + ACCOUNTS.regTemplate + '» login=«' + ACCOUNTS.loginTemplate + '» | база: ' + ACCOUNTS_DB_PATH)
+  step('РЕШАТЕЛЬ: до ' + SOLVER.triesPerJoin + ' попыток на заход, verifyMs=' + SOLVER.verifyMs + ', слоты ≤' + SOLVER.maxAccountsPerTunnel + ' аккаунтов на туннель, rotateOnStart=' + SOLVER.rotateOnStart)
+  step('АНАРХИИ: ' + anarchyListText() + (ANARCHY.allowAny ? ' (allowAny)' : '') + ' | АНТИ-АФК: ' + (ANTI_AFK.enabled ? 'каждые ' + Math.round(ANTI_AFK.everyMs / 1000) + 'с ±' + Math.round(ANTI_AFK.jitterMs / 1000) + 'с' : 'ВЫКЛ'))
+  step('📱 TELEGRAM: ' + (TG_CFG.ready ? 'ВКЛ — пульт управления (whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО') + ')' : (TG_CFG.enabled ? 'ВКЛ, но нет telegram.token — пульт не запустится' : 'ВЫКЛ (telegram.enabled=false)')))
+}
+
 async function main() {
-  step('=== СТАРТ v4.0.0 (авторешатель капчи FunTime) ===')
+  step('=== СТАРТ v5.0.0 (авторешатель капчи FunTime + Telegram-пульт) ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
+  if (CLI.tgTest) { const okTg = await runTgTest(); setTimeout(() => process.exit(okTg ? 0 : 1), 300); return }
   if (CLI.rfTest) { const okRf = await runRfTest(CLI.rfTestFile); setTimeout(() => process.exit(okRf ? 0 : 1), 300); return }
   if (CLI.yoloTest) {
     const f = CLI.yoloTest
@@ -4175,87 +5471,69 @@ async function main() {
     return
   }
   if (CLI.proxyCheck) {
-    step('config: ' + (CFG_PATH || 'НЕТ') + ' parse=' + CFG_STRATEGY)
+    printConfigSummary()
     const ok = await runProxyCheck()
     setTimeout(() => process.exit(ok ? 0 : 1), 300)
     return
   }
 
   if (!CFG_PATH) { step('НЕ НАЙДЕН config.json'); process.exit(1) }
-  step('config: ' + CFG_PATH + ' parse=' + CFG_STRATEGY)
-  step('MC: ' + MC.host + ':' + MC.port + ' v' + MC.version)
-  if (TUNNELS.length) {
-    for (const T of TUNNELS) step('🔌 туннель «' + T.name + '»: ' + T.cfg.host + ':' + T.cfg.port + (T.cfg.username ? ' (логин ' + T.cfg.username + ')' : '') + ' | смена IP: ' + describeChangeIpUrl(T.cfg.changeIpUrl))
-  } else {
-    step('⚠️ туннели/прокси НЕ заданы' + (CAP.allowDirect ? ' — заход НАПРЯМУЮ (proxy.allowDirect=true), FunTime может быстро забанить ваш IP' : ' — заходы невозможны (нет proxy.host; для прямого захода включите "proxy": { "allowDirect": true })'))
-  }
-  step('☁️ ROBOFLOW: ' + (RF.ready
-    ? 'ВКЛ → https://' + RF.host + '/' + RF.model + ' (поле "' + RF.field + '", порог ' + RF.askConf + '%, overlap ' +
-      Math.round(RF.overlap * 100) + '%, таймаут ' + RF.timeoutMs + 'мс, ключ ' + rfMaskKey(RF.apiKey) + ', темп ' + RF.paceMs + 'мс)'
-    : (RF.enabled ? 'ВКЛ, но нет roboflow.apiKey — облако не используется' : 'ВЫКЛ (roboflow.enabled=false)')))
-  step('🌐 YOLO API (запасной): ' + (YOLO.enabled ? 'ВКЛ → ' + YOLO.urls.join(' → ') : 'ВЫКЛ (yolo.enabled=false)'))
-  if (!RF.ready && !YOLO.enabled) step('⚠️ распознавание ВЫКЛЮЧЕНО полностью: текст с картинки брать неоткуда — заходы бессмысленны')
-  step('АККАУНТЫ: ' + ACCOUNTS.count + ' бот(ов), префикс ника «' + ACCOUNTS.nickPrefix + '», пароль ' + ACCOUNTS.passwordLength + ' симв. (случайный), reg=«' + ACCOUNTS.regTemplate + '» login=«' + ACCOUNTS.loginTemplate + '»')
-  step('РЕШАТЕЛЬ: до ' + SOLVER.triesPerJoin + ' попыток на заход, verifyMs=' + SOLVER.verifyMs + ', stayOnline=' + SOLVER.stayOnline)
-  if (!mineflayer) { step('❌ mineflayer не установлен — выполните: npm install mineflayer socks'); process.exit(1) }
+  printConfigSummary()
 
-  // первичная ротация IP: заходим со свежего адреса (лимит 30с на туннель сериализуется сам)
+  const headless = CLI.bots > 0 || CLI.rounds > 0
+  if (!mineflayer) {
+    step('❌ mineflayer не установлен — выполните: npm install mineflayer socks')
+    process.exit(1)
+  }
+  if (!headless && !TG_CFG.ready) {
+    step('❌ telegram.token не задан (telegram.enabled=' + TG_CFG.enabled + ') — основной режим v5 это Telegram-пульт.')
+    step('   Варианты: заполнить "telegram" в config.json, или запустить headless-пул: node main.js --bots 1')
+    process.exit(1)
+  }
+
+  // ---- IP при старте: по умолчанию ДЕРЖИТСЯ (узнаётся currentIp и фиксируется) ----
+  // ротация — только solver.rotateOnStart=true / --rotate / «особые случаи» в сессиях
   for (const T of TUNNELS) {
-    try { T.ip = await rotateIp(T) } catch (e) { step('ротация IP «' + T.name + '»: ' + e.message) }
-    step('туннель «' + T.name + '»: IP ' + (T.ip || '?'))
+    if (SOLVER.rotateOnStart) {
+      try { T.ip = await rotateIp(T) } catch (e) { step('ротация IP «' + T.name + '»: ' + e.message) }
+    } else {
+      try { T.ip = await currentIp({ T, quiet: true }) } catch (e) {}
+      if (T.ip) step('туннель «' + T.name + '»: IP ' + T.ip + ' (держится; ротация только особые случаи' + (CLI.rotate ? '' : '; --rotate = сменить при старте') + ')')
+      else step('туннель «' + T.name + '»: IP не определён' + (T.state === 'dead' ? ' (прокси не отвечает — node main.js --proxy-check)' : ''))
+    }
   }
 
-  // graceful shutdown: Ctrl+C / сигнал — корректно кладём ботов и пишем отчёт
-  const workers = buildWorkers()
-  GLOBAL_WORKERS = workers
+  // ---- graceful shutdown: Ctrl+C / сигнал — корректно гасим ВСЕ сессии ----
   const onSignal = sig => {
     if (SHUTDOWN) { process.exit(0); return }
     SHUTDOWN = true
-    step('получен ' + sig + ' — завершаю ботов…')
-    try {
-      for (const w of (GLOBAL_WORKERS || [])) { if (w.live) { try { w.live.end(sig) } catch (e) {} } }
-    } catch (e) {}
+    tgUiStop()
+    step('получен ' + sig + ' — завершаю сессии…')
+    try { stopAllSessions(sig) } catch (e) {}
     setTimeout(() => { flushReport('SHUTDOWN ' + sig); process.exit(0) }, 1200)
   }
   process.on('SIGINT', () => onSignal('SIGINT'))
   process.on('SIGTERM', () => onSignal('SIGTERM'))
 
-  const state = await runWorkers(workers)
-  printSummary(workers, state)
-}
-let GLOBAL_WORKERS = []
+  // ---- режим 1 (по умолчанию): TELEGRAM-ПУЛЬТ ----
+  if (!headless) {
+    dbLoad(true)
+    const s = dbSummary()
+    step('🗄 база аккаунтов: ' + s.total + ' (зарегистрировано ' + s.registered + ', личных ' + s.personal + ', algo ' + s.algo + ')')
+    tgUiStart()
+    step('🟢 процесс живёт, пока работает пульт. Остановка: Ctrl+C')
+    return
+  }
 
-function printSummary(workers, state) {
-  const L = ['=== СВОДКА v4.0.0 ===']
-  L.push('ботов: ' + workers.length + ' | решено капч: ' + state.solved + '/' + workers.length + ' | время: ' + Math.round((Date.now() - state.t0) / 1000) + 'с')
-  for (const w of workers) {
-    L.push('  БОТ-' + w.id + ' ник «' + w.nick + '» туннель «' + (w.T ? w.T.name : 'direct') + '»: ' +
-      (w.success ? ('✅ РЕШЕНА' + (w.authOk ? ' + АВТОРИЗОВАН' : ' (без подтверждения авторизации)') + (w.online || SOLVER.stayOnline ? ' — в игре' : '')) : '❌ не решена') +
-      ' | заходов: ' + w.results.length + ' | ротаций IP: ' + w.rotations)
-    for (const r of w.results) L.push('    #' + r.r + ': ' + (r.ok ? 'успех' : r.stage + ' ' + r.note) + (r.digits ? ' «' + r.digits + '»' : '') + (r.auth ? ' auth=' + r.auth : ''))
-  }
-  L.push('')
-  L.push('Картинки и результаты: ' + CAP_ROOT + ' и records/bot*_round*/result.json')
-  step('готово.')
-  flushReport(L.join('\n'))
-  try {
-    fs.writeFileSync(path.join(REC_ROOT, 'summary.json'), JSON.stringify({
-      stamp: STAMP, version: '4.0.0', bots: workers.length, solved: state.solved,
-      seconds: Math.round((Date.now() - state.t0) / 1000),
-      results: workers.map(w => ({
-        id: w.id, nick: w.nick, tunnel: w.T ? w.T.name : 'direct', success: w.success, authOk: w.authOk,
-        rotations: w.rotations, rounds: w.results
-      }))
-    }, null, 2))
-  } catch (e) { console.error('summary.json err:', e.message) }
-  console.log('\n' + L.join('\n'))
-  // если кто-то остался в игре — процесс не завершаем (боты держат соединение)
-  const anyOnline = workers.some(w => w.online)
-  if (anyOnline || (SOLVER.stayOnline && state.solved > 0)) {
-    step('🟢 процесс остаётся живым: боты в игре. Остановка: Ctrl+C')
-  } else {
-    setTimeout(() => process.exit(state.solved > 0 ? 0 : 1), 1500)
-  }
+  // ---- режим 2: headless-пул (--bots/--rounds) ----
+  dbLoad(true)
+  const sessions = buildCliSessions()
+  const t0 = Date.now()
+  await runCliPool(sessions)
+  const sum = printSummary(sessions, t0)
+  if (GLOBAL_FATAL) { step('❌ ФАТАЛЬНО: ' + GLOBAL_FATAL + (mineflayer ? '' : ' — установите зависимости: npm install mineflayer socks')); setTimeout(() => process.exit(1), 800); return }
+  if (sum.online > 0) step('🟢 процесс остаётся живым: ' + sum.online + ' сессия(й) в игре (HUB/анархия). Остановка: Ctrl+C')
+  else setTimeout(() => process.exit(sum.solved > 0 ? 0 : 1), 1500)
 }
 
 if (require.main === module) {
@@ -4266,7 +5544,7 @@ if (require.main === module) {
   })
 }
 module.exports = {
-  VERSION: '4.0.0',
+  VERSION: '5.0.0',
   // палитра/PNG/геометрия (используют tools/*)
   PALETTE, SHADE_MULT, BASE_COLORS, LUM, palDist, rotQ, encodePng, colorPng, bwPng,
   clusterValues, detectWalls, wallMinFrames, buildGrid, viewpointHAsc, orientationCandidates, rotationCandidates,
@@ -4283,13 +5561,28 @@ module.exports = {
   recognizePng, DIGITS_EXPECTED,
   // транспорт
   httpsRequest, parseSocksUrl, socksTlsConnect, openSocksTunnel,
-  // туннели/прокси
-  TUNNELS, makeTunnel, tunnelsFromConfig, proxyHostCandidates, socks5Open, httpConnect, httpThrough, proxyTunnel,
+  // туннели/прокси/слоты
+  TUNNELS, makeTunnel, tunnelsFromConfig, tunnelRole, personalTunnels, algoTunnels,
+  SLOT_PRIORITY, acquireSlot, releaseSlot, slotsUsed,
+  proxyHostCandidates, socks5Open, httpConnect, httpThrough, proxyTunnel,
   proxyConnect, proxyAlive, currentIp, socksHint, parseChangeIpResponse, ensureJsonParam,
   describeChangeIpUrl, runProxyCheck, checkOneTunnel, mcStatusPing, PROXY, rotateIp, isIpV4, altHostOf,
-  // решатель/аккаунты
+  // решатель/аккаунты/авторизация
   SOLVER, ACCOUNTS, buildAuthCommand, matchAny, randomNick, randomPass,
-  connectAndSolve, waitVerdict, waitAuthResult, authPhase, solveJoin, holdOnline,
-  buildWorkers, runWorker, runWorkers, printSummary, writeResult,
+  connectAndSolve, waitVerdict, waitAuthResult, authPhase, solveCaptchaOnLive, writeResult,
+  // Telegram-пульт (транспорт + UI)
+  TG_CFG, tgAllowed, tgApi, tgSend, tgEdit, tgDelete, tgAnswerCb, tgGetUpdates, tgLog, tgTransports, runTgTest,
+  TG_UI, tgUiStart, tgUiStop, tgUiLoop, handleUpdate, onMessage, onCallback, startPersonal, rotatePersonal, sendMenu,
+  statusBlockText, statusKb, scheduleStatusEdit, kbInline, kbMenu, kbBack, kbPersonalPanel,
+  MENU_TEXT, ALGO_STUB_TEXT, personalPanelText,
+  // база аккаунтов
+  DB, DB_PATH, dbSetPath, dbLoad, dbSave, dbCreate, dbPersonal, dbPersonalRotate, dbTakeFreeAlgo,
+  dbMarkBusy, dbMarkRegistered, dbSetAnarchy, dbSummary, ACCOUNTS_DB_PATH,
+  // сессии/анархии/анти-афк
+  SESSIONS, SESS_SEQ, SESS_HOOKS, GLOBAL_FATAL, makeSession, runSession, stopSession, stopAllSessions,
+  activeSessionOfChat, sessionLabel, sessionTag, sessionsSummary, setAnarchy, maskSecret, specialRotation,
+  ANARCHY, anarchyOk, parseAnarchyCmd, anarchyListText, ALGO,
+  ANTI_AFK, startAntiAfk, stopAntiAfk, antiAfkInterval,
+  buildCliSessions, runCliPool, printSummary, printConfigSummary,
   step, dbg, sleep, flushReport
 }
