@@ -1,6 +1,17 @@
-// VERSION: 5.1.0
+// VERSION: 5.1.1
 // main.js — АВТОРЕШАТЕЛЬ капчи FunTime + TELEGRAM-ПУЛЬТ управления
 //           заход → капча → /reg → HUB → /anN-анархия → релей чата из Telegram.
+//
+// ============ ЧТО ИЗМЕНЕНО В v5.1.1 ============
+// ФИКС «💀 Соединение закрыто: error: Parse error for play.toClient: Read error for
+//   undefined»: (1) ошибки РАЗБОРА пакетов в живой фазе больше НЕ убивают сессию —
+//   minecraft-protocol при них переподключает стрим и продолжает (пакет потерян, соединение
+//   живо); смерть по-прежнему определяется по 'end'/'kicked'. Такие ошибки = сервер/BotFilter
+//   шлёт пакеты, неизвестные протоколу configured-версии; (2) АВТООПРЕДЕЛЕНИЕ ВЕРСИИ при
+//   старте: status-пинг через туннель (minecraft.autoVersion, по умолчанию вкл) — грязное
+//   имя («BotFilter 1.8.x-26.x») распознаётся по номеру протокола (767=1.21.1 и т.д.),
+//   при расхождении minecraft.version переключается на серверную; (3) статус-блок TG:
+//   полный текст ошибки (100 симв.) + счётчик «⚠️ Ошибок разбора пакетов: N» пока сессия жива.
 //
 // ============ ЧТО ИЗМЕНЕНО В v5.1.0 (над v5.0.0) ============
 // ЭКРАННЫЕ КНОПКИ: «🧩 Алгоритмы» и «👤 Личный заход» — reply-клавиатура Telegram,
@@ -1801,7 +1812,7 @@ async function checkOneTunnel(T) {
 }
 
 async function runProxyCheck() {
-  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v5.1.0) ===')
+  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v5.1.1) ===')
   step('модуль socks: ' + (SocksClient ? 'установлен' : 'НЕТ (используется встроенный SOCKS5-клиент)'))
   if (!TUNNELS.length) {
     step('❌ в config.json нет ни секции "tunnels", ни proxy.host — заход возможен только напрямую')
@@ -1849,6 +1860,27 @@ async function mcStatusPing(sock, timeoutMs) {
     try { sock.write(Buffer.concat([pkt(hsBody), pkt(Buffer.from([0x00]))])) } catch (e) { fin({ ok: false, err: 'write: ' + e.message }) }
   })
 }
+// ========================= ВЕРСИЯ СЕРВЕРА: АВТООПРЕДЕЛЕНИЕ (v5.1.1) =========================
+// status-пинг через туннель: BotFilter отвечает даже без логина. Имя версии бывает «грязным»
+// («BotFilter 1.8.x-26.x») — тогда версию даём по номеру протокола.
+const PROTOCOL_VERSIONS = {
+  754: '1.16.5', 755: '1.17', 756: '1.17.1', 757: '1.18.1', 758: '1.18.2',
+  759: '1.19', 760: '1.19.2', 761: '1.19.3', 762: '1.19.4', 763: '1.20.1',
+  764: '1.20.2', 765: '1.20.4', 766: '1.20.6', 767: '1.21.1', 768: '1.21.3',
+  769: '1.21.4', 770: '1.21.5', 771: '1.21.6', 772: '1.21.7'
+}
+function protocolToVersion(p) { return PROTOCOL_VERSIONS[Number(p)] || null }
+function cleanVersionName(name) {
+  const m = String(name || '').trim().match(/^v?(\d+\.\d+(?:\.\d+)?)$/i)
+  return m ? m[1] : null
+}
+async function detectMcVersion(T, timeoutMs) {
+  try {
+    const sock = await proxyConnect(MC.host, MC.port, 15000, T)
+    return await mcStatusPing(sock, timeoutMs || 8000)    // mcStatusPing сам закрывает сокет
+  } catch (e) { return { ok: false, err: String((e && e.message) || e) } }
+}
+
 // ========================= ПАЛИТРА КАРТЫ MINECRAFT =========================
 const BASE_COLORS = [[0,0,0],[127,178,56],[247,233,163],[199,199,199],[255,0,0],[160,160,255],[167,167,167],[0,124,0],[255,255,255],[164,168,184],[151,109,77],[112,112,112],[64,128,255],[104,83,50],[255,252,245],[216,127,51],[178,76,216],[102,153,216],[229,229,51],[127,204,25],[242,127,165],[76,76,76],[153,153,153],[76,127,153],[127,63,178],[51,76,178],[102,76,51],[102,127,51],[153,51,51],[25,25,25],[250,238,77],[92,219,213],[74,128,255],[0,217,58],[135,107,58],[112,2,2],[143,119,100],[161,83,37],[149,88,108],[114,119,139],[186,133,35],[103,117,52],[160,77,78],[57,42,35],[135,106,97],[86,91,91],[118,70,86],[74,59,91],[77,51,35],[76,83,42],[143,61,46],[37,22,16],[189,48,49],[148,63,97],[126,32,44],[22,119,121],[58,142,140],[74,117,116],[23,121,121],[90,90,90],[224,169,112],[127,106,82],[221,169,46],[156,104,66]]
 // !!! ПРАВИЛЬНЫЙ ПОРЯДОК ОТТЕНКОВ (minecraft.wiki → Map item format):
@@ -2943,6 +2975,11 @@ function saveRound(outDir, snap, label, roundNo, opts) {
     layout: asm.layout, dir: outDir, capFile, originalFile: 'ORIGINAL_CAPTCHA.png'
   }
 }
+// классификатор ошибок разбора протокола (текст зависит от версии minecraft-protocol/protodef)
+function isProtocolParseError(msg) {
+  return /Parse error for|Deserialization error for|Serialization error for|Read error for undefined/i.test(String(msg || ''))
+}
+
 // ========================= ЗАХОД: подключение и ЖИВОЕ соединение =========================
 // В отличие от v3.x (снял картинку → отключился), здесь после сборки капчи соединение
 // ОСТАЁТСЯ ЖИВЫМ: через handle.chat() бот отправляет ответ, слушает реакцию сервера
@@ -2954,7 +2991,8 @@ function connectAndSolve(tag, opt) {
     const col = {
       maps: new Map(), mapFilled: new Map(), mapUpdatedAt: new Map(),
       frames: [], framesById: new Map(), chats: [], events: [], prompts: 0,
-      dead: false, reason: '', metaDump: [], firstFrameAt: 0, lastMapAt: 0, lastChangeAt: 0
+      dead: false, reason: '', metaDump: [], firstFrameAt: 0, lastMapAt: 0, lastChangeAt: 0,
+      parseErrs: 0     // v5.1.1: ошибки разбора пакетов (несмертельны; признак «чужой» версии)
     }
     const ev = s => { col.events.push(new Date().toISOString().slice(11, 23) + ' ' + s); step('[' + tag + '] ' + s) }
 
@@ -3036,6 +3074,7 @@ function connectAndSolve(tag, opt) {
         },
         isDead: () => !!col.dead,
         deadReason: () => col.reason || '',
+        parseErrs: () => col.parseErrs || 0,   // v5.1.1: диагностика версии протокола
         lastChange: () => col.lastChangeAt,
         readiness: () => { try { return readiness() } catch (e) { return { ready: false, why: e.message } } },
         // ждать закрытия соединения (кик/таймаут сервера): true = соединение умерло
@@ -3261,9 +3300,27 @@ function connectAndSolve(tag, opt) {
         }
       })
       bot.on('error', e => {
-        if (finished) { if (!col.dead) { col.dead = true; col.reason = 'error: ' + e.message } return }
+        const msg = String((e && e.message) || e)
+        if (finished) {
+          // v5.1.1: ЖИВАЯ ФАЗА — ошибка сама по себе НЕ убивает сессию. minecraft-protocol
+          // при ошибке разбора переподключает стрим и продолжает (пакет потерян, соединение
+          // живо); реальную смерть ловят обработчики 'end'/'kicked'. Раньше здесь ставился
+          // col.dead=true → «Parse error for play.toClient: Read error for undefined»
+          // (сервер/BotFilter прислал пакет, неизвестный протоколу версии) ронял рабочий заход.
+          if (col.events.length < 3000) col.events.push(new Date().toISOString().slice(11, 23) + ' error(live): ' + msg.slice(0, 200))
+          if (isProtocolParseError(msg)) {
+            col.parseErrs++
+            if (col.parseErrs === 1 || col.parseErrs % 25 === 0) {
+              ev('⚠️ ошибка разбора пакета #' + col.parseErrs + ' (НЕ фатально, соединение живо): ' + msg.slice(0, 170))
+              if (col.parseErrs === 1) ev('   ↳ сервер прислал пакет, неизвестный протоколу ' + MC.version + ' — часто это кастомные пакеты BotFilter/бэкенда; если ошибки сыплются постоянно и что-то не работает: node main.js --proxy-check (версия сервера) и minecraft.version в конфиге')
+            }
+          } else {
+            ev('error(live, не фатально): ' + msg.slice(0, 170))
+          }
+          return
+        }
         col.dead = true
-        if (!col.reason) col.reason = 'error: ' + e.message
+        if (!col.reason) col.reason = 'error: ' + msg
         ev(col.reason)
         const rd = readiness()
         if (rd.have < CAP.minTiles) finishFail(col.reason)
@@ -4224,11 +4281,15 @@ function statusBlockText(S) {
   else if (st === 'hub') L.push('Статус: 2️⃣ HUB — выберите анархию')
   else if (st === 'anarchy') L.push('Статус: 3️⃣ Анархия ' + S.anarchy)
   else if (st === 'stopped') L.push('Статус: ⏹ Выключен')
-  else if (st === 'dead') L.push('Статус: 💀 Соединение закрыто' + (S.error ? ': ' + String(S.error).slice(0, 60) : ''))
+  else if (st === 'dead') L.push('Статус: 💀 Соединение закрыто' + (S.error ? ': ' + String(S.error).slice(0, 100) : ''))
   else if (st === 'error') L.push('Статус: ❌ Ошибка: ' + String(S.error || S.lastError || '?').slice(0, 80))
   else L.push('Статус: ' + st)
   const up = sessUptime(S)
   L.push('Туннель «' + (S.T ? S.T.name : 'direct') + '» · IP ' + ((S.T && S.T.ip) || '?') + ' · слоты ' + slotsUsed(S.T) + '/' + SOLVER.maxAccountsPerTunnel + (up ? ' · ⏱ ' + up : ''))
+  try {
+    const pe = (S.live && S.live.parseErrs) ? S.live.parseErrs() : 0
+    if (pe > 0) L.push('⚠️ Ошибок разбора пакетов: ' + pe + ' — соединение ЖИВО (сервер шлёт пакеты не нашей версии; если что-то не работает: node main.js --proxy-check и minecraft.version)')
+  } catch (e) {}
   L.push('────────────')
   if (st === 'hub') {
     L.push('📜 Список анархий: ' + anarchyListText())
@@ -4264,7 +4325,7 @@ function scheduleStatusEdit(S, force) {
   else if (!rec.timer) rec.timer = setTimeout(doEdit, wait)
 }
 
-const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.1.0\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
+const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.1.1\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
 const ALGO_STUB_TEXT = '🧩 Алгоритмы — ЗАГЛУШКА (в разработке).\n\nКаркас уже готов и работает: сессии, слоты физических каналов (≤' + SOLVER.maxAccountsPerTunnel + ' аккаунтов), приоритет алгоритмов выше личных, база аккаунтов, пресет анархии (algo.anarchy), headless-пул (--bots).\n\nВ следующей итерации здесь появится: выбор/настройка сценария (последовательность действий после анархии) и кнопка запуска.'
 
 function personalPanelText(chatId) {
@@ -4392,7 +4453,7 @@ async function onMessage(chatId, messageId, text) {
     return
   }
   if (/^\/help(\b|$)/i.test(t)) {
-    await tgSend(chatId, '🎮 Пульт v5.1.0\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
+    await tgSend(chatId, '🎮 Пульт v5.1.1\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
     return
   }
 
@@ -4488,14 +4549,14 @@ function tgUiStart() {
   TG_UI.startedAt = Math.floor(Date.now() / 1000)
   step('📱 TELEGRAM-ПУЛЬТ: запущен (бот id ' + (TG_CFG.token ? TG_CFG.token.split(':')[0] : '?') + ', whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО — никто не подключится') + ')')
   step('   кнопки «' + BTN_ALGO + '» и «' + BTN_PERSONAL + '» — на экране телефона (reply-клавиатура); отправьте /start в чат бота, если их не видно')
-  tgLog('пульт v5.1.0 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
+  tgLog('пульт v5.1.1 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
   tgUiLoop().catch(e => { tgLog('tgUiLoop fatal: ' + e.message); TG_UI.running = false })
 }
 function tgUiStop() { TG_UI.running = false }
 
 // ========================= SELFTEST (офлайн, без сервера и интернета) =========================
 async function selftest() {
-  console.log('=== SELFTEST v5.1.0: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
+  console.log('=== SELFTEST v5.1.1: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
   // самопроверка НЕ выходит в интернет: хост-модель Roboflow на это время выключаем,
   // иначе yoloRecognize сходил бы в облако вместо локального мок-сервера (и потратил кредиты)
   const rfReadyWas = RF.ready
@@ -5180,6 +5241,27 @@ async function selftest() {
     console.log('  ' + (okSingle ? '✅' : '❌') + ' личный туннель только один: 2-й personal → algo (с заметкой); разные прокси = разные физканалы')
   }
 
+  // ============ v5.1.1: версия сервера + классификация ошибок разбора пакетов ============
+  console.log('--- v5.1.1: автоверсия (cleanVersionName/protocolToVersion) + isProtocolParseError ---')
+  {
+    const okV = cleanVersionName('1.21.1') === '1.21.1' && cleanVersionName('v1.20.4') === '1.20.4' &&
+      cleanVersionName('1.16.5') === '1.16.5' && cleanVersionName('BotFilter 1.8.x-26.x') === null &&
+      cleanVersionName('1.8-1.21') === null && cleanVersionName('') === null && cleanVersionName(null) === null
+    if (!okV) fails++
+    console.log('  ' + (okV ? '✅' : '❌') + ' cleanVersionName: «1.21.1»/«v1.20.4» → версия; «BotFilter 1.8.x-26.x»/диапазон/мусор → null')
+    const okP = protocolToVersion(767) === '1.21.1' && protocolToVersion(754) === '1.16.5' && protocolToVersion('767') === '1.21.1' &&
+      protocolToVersion(769) === '1.21.4' && protocolToVersion(999999) === null && protocolToVersion(0) === null
+    if (!okP) fails++
+    console.log('  ' + (okP ? '✅' : '❌') + ' protocolToVersion: 767→1.21.1, 754→1.16.5, 769→1.21.4, неизвестный→null')
+    const okE = isProtocolParseError('Parse error for play.toClient: Read error for undefined') === true &&
+      isProtocolParseError('Deserialization error for play.toClient.field : boom') === true &&
+      isProtocolParseError('Read error for undefined : x') === true &&
+      isProtocolParseError('client timed out after 60000 milliseconds') === false &&
+      isProtocolParseError('ECONNRESET') === false && isProtocolParseError('') === false
+    if (!okE) fails++
+    console.log('  ' + (okE ? '✅' : '❌') + ' isProtocolParseError: Parse/Deserialization/«Read error for undefined» → true; таймаут/ECONNRESET → false')
+  }
+
   // ============ v5.0.0: БАЗА АККАУНТОВ (9 кейсов, временный файл) ============
   console.log('--- v5.0.0: база аккаунтов learn/accounts_db.json (9 кейсов) ---')
   {
@@ -5440,8 +5522,8 @@ async function selftest() {
     let kb = null; try { kb = JSON.parse((menuRec.params && menuRec.params.reply_markup) || 'null') } catch (e) {}
     const okKb = !!kb && Array.isArray(kb.keyboard) && kb.resize_keyboard === true &&
       kb.keyboard[0].length === 2 && kb.keyboard[0][0].text === BTN_ALGO && kb.keyboard[0][1].text === BTN_PERSONAL
-    caseOk('1. /start → приветствие v5.1.0 + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
-      okMenu && menuText.indexOf('пульт управления v5.1.0') >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
+    caseOk('1. /start → приветствие v5.1.1 + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
+      okMenu && menuText.indexOf('пульт управления v5.1.1') >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
 
     // 2: нажатие экранной кнопки «🧩 Алгоритмы» (приходит текстом) → заглушка
     injMsg(1, 12, BTN_ALGO)
@@ -5602,7 +5684,7 @@ async function runCliPool(sessions) {
 function printSummary(sessions, t0) {
   const solved = sessions.filter(S => S.solved).length
   const online = sessions.filter(S => ['hub', 'anarchy'].indexOf(S.state) >= 0).length
-  const L = ['=== СВОДКА v5.1.0 ===']
+  const L = ['=== СВОДКА v5.1.1 ===']
   L.push('сессий: ' + sessions.length + ' | решено капч: ' + solved + '/' + sessions.length + ' | в игре: ' + online + ' | время: ' + Math.round((Date.now() - t0) / 1000) + 'с')
   for (const l of sessionsSummary()) L.push(l)
   L.push('')
@@ -5653,7 +5735,7 @@ function printConfigSummary() {
 }
 
 async function main() {
-  step('=== СТАРТ v5.1.0 (авторешатель капчи FunTime + Telegram-пульт) ===')
+  step('=== СТАРТ v5.1.1 (авторешатель капчи FunTime + Telegram-пульт) ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const okTg = await runTgTest(); setTimeout(() => process.exit(okTg ? 0 : 1), 300); return }
@@ -5705,6 +5787,31 @@ async function main() {
     }
   }
 
+  // ---- версия сервера: status-пинг приоритетнее конфига (бэкенд за BotFilter мог обновиться;
+  //      «Parse error for play.toClient: Read error for undefined» — типичный симптом чужой версии) ----
+  if (cfgGet(CFG, 'minecraft.autoVersion', true) !== false && (TUNNELS.length || CAP.allowDirect)) {
+    const T0 = distinctPhysical(TUNNELS)[0] || null
+    step('🔎 проверяю версию сервера status-пингом' + (T0 ? ' через туннель «' + T0.name + '»' : ' напрямую') + '… (minecraft.autoVersion; выкл: "autoVersion": false)')
+    const st = await detectMcVersion(T0)
+    if (st && st.ok && st.json && st.json.version) {
+      const vname = st.json.version.name
+      const vproto = st.json.version.protocol
+      const clean = cleanVersionName(vname) || protocolToVersion(vproto)
+      const pl = st.json.players ? (', игроков ' + st.json.players.online + '/' + st.json.players.max) : ''
+      step('🔎 сервер ответил за ' + st.ms + 'мс: «' + vname + '», protocol ' + vproto + (clean ? ' (= ' + clean + ')' : ' (версию по номеру не знаю)') + pl)
+      if (clean && clean !== MC.version) {
+        step('⚠️ в конфиге minecraft.version=' + MC.version + ' — ПЕРЕКЛЮЧАЮСЬ на версию сервера ' + clean + ': иначе будут «Parse error for play.toClient» и обрывы')
+        MC.version = clean
+      } else if (clean) {
+        step('   версия совпадает с конфигом (' + MC.version + ') — ок')
+      } else {
+        step('   имя версии нестандартное, а protocol ' + vproto + ' мне не известен — остаюсь на minecraft.version=' + MC.version)
+      }
+    } else {
+      step('🔎 пинг не прошёл (' + ((st && st.err) || 'нет ответа') + ') — остаюсь на minecraft.version=' + MC.version)
+    }
+  }
+
   // ---- graceful shutdown: Ctrl+C / сигнал — корректно гасим ВСЕ сессии ----
   const onSignal = sig => {
     if (SHUTDOWN) { process.exit(0); return }
@@ -5746,7 +5853,7 @@ if (require.main === module) {
   })
 }
 module.exports = {
-  VERSION: '5.1.0',
+  VERSION: '5.1.1',
   // палитра/PNG/геометрия (используют tools/*)
   PALETTE, SHADE_MULT, BASE_COLORS, LUM, palDist, rotQ, encodePng, colorPng, bwPng,
   clusterValues, detectWalls, wallMinFrames, buildGrid, viewpointHAsc, orientationCandidates, rotationCandidates,
