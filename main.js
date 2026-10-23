@@ -1,4 +1,4 @@
-// VERSION: 5.2.0
+// VERSION: 5.3.0-r2
 // main.js — АВТОРЕШАТЕЛЬ капчи FunTime + TELEGRAM-ПУЛЬТ управления
 //           заход → капча → /reg → HUB → /anN-анархия → релей чата из Telegram.
 //
@@ -84,6 +84,17 @@ const dns = require('dns')
 // mineflayer/socks нужны только для живого забега. Для --selftest — не нужны.
 let mineflayer = null
 try { mineflayer = require('mineflayer') } catch (e) { /* опционально */ }
+// (#7) терпимый prismarine-nbt.simplify: битые записи codec 26.x роняли UNCAUGHT и
+// убивали процесс. Оригинал сохраняем — он нужен фильтру registry_data для ЧЕСТНОЙ
+// проверки записей (фильтр должен ЛОВИТЬ исключение на битой записи).
+let nbtSimplifyOrig = null
+try {
+  const nbtLib = require('prismarine-nbt')
+  if (nbtLib && typeof nbtLib.simplify === 'function') {
+    nbtSimplifyOrig = nbtLib.simplify
+    nbtLib.simplify = function (v) { try { return nbtSimplifyOrig(v) } catch (e) { return {} } }
+  }
+} catch (e) { /* prismarine-nbt недоступен — не критично */ }
 let SocksClient = null
 try { SocksClient = require('socks').SocksClient } catch (e) { /* опционально */ }
 
@@ -124,7 +135,7 @@ const SETTLE_MS = 800           // добор данных после «гото
 const STABLE_MS = 1500            // поток map_data должен затихнуть на это время
 const CAPTCHA_TIMEOUT_MS = 75000  // жёсткий лимит на подключение+сбор картинки
 const CONNECT_TIMEOUT_MS = 35000
-const LOGIN_TIMEOUT_MS = 30000
+const LOGIN_TIMEOUT_MS = 60000   // (v10e) 30с→60с: прайм-тайм BotFilter/прокси тормозят (run10: 3× login timeout)
 const MAX_ROTATIONS_ON_FAIL = 6   // сколько раз подряд крутить IP одному боту без успеха
 const MIN_TILES_DEFAULT = 6       // минимум плиток, чтобы считать стену собранной
 const MIN_TILES_FRACTION = 0.6    // или 60% от размера сетки
@@ -419,7 +430,7 @@ const SOLVER = {
   successWords: wordsCfg('successWords', ['успешно', 'прошли капчу', 'прошел капчу', 'прошёл капчу', 'добро пожаловать', 'верификац', 'подтвержд', 'captcha solved', 'captcha accepted']),
   failWords: wordsCfg('failWords', ['неверно', 'не верно', 'неправиль', 'не совпад', 'ошибк', 'попробуй', 'попробуйте', 'wrong', 'incorrect', 'неудач']),
   authWords: wordsCfg('authWords', ['зарегистр', 'авториз', '/reg', '/l ', '/login', '/register', 'войдите', 'вход на сервер']),
-  regOkWords: wordsCfg('regOkWords', ['успешно зарегистрир', 'регистрация заверш', 'регистрация успеш', 'успешно заверш', 'вы зарегистрир', 'авторизован', 'успешный вход', 'вы вошли', 'successfully registered', 'successfully authenticated', 'успешно авториз']),
+  regOkWords: wordsCfg('regOkWords', ['успешно зарегистрир', 'регистрация заверш', 'регистрация успеш', 'успешно заверш', 'вы зарегистрир', 'авторизован', 'успешный вход', 'вы вошли', 'successfully registered', 'successfully authenticated', 'успешно авториз', 'успешная регистрация']),   // (#2) «[✾] Успешная регистрация!» funtime
   regExistsWords: wordsCfg('regExistsWords', ['уже зарегистрирован', 'уже зарег', 'вы уже', 'already registered', 'is already', 'авторизуйтесь', 'введите /l', 'используйте /l', '/l <пароль>']),
   regFailWords: wordsCfg('regFailWords', ['неверный пароль', 'ошибка регистрации', 'неверно', 'не правильный', 'коротк', 'слишком', 'не удалось', 'invalid', 'error', 'incorrect']),
   // слова в причине кика, при которых IP туннеля надо срочно менять
@@ -1256,7 +1267,9 @@ function proxyHostCandidates(T, host) {
 // на запасном хосте. T=null → прямой net.connect (если разрешено proxy.allowDirect).
 async function proxyTunnel(destHost, destPort, opt) {
   opt = opt || {}
-  const T = opt.T || TUNNELS[0] || null
+  // (сессия 10, шаг 25) opt.direct=true → ПРИНУДИТЕЛЬНО прямой net.connect (T=null
+  // больше не фолбэчит на TUNNELS[0]) — второй «туннель» = прямой выход песочницы
+  const T = opt.direct === true ? null : (opt.T || TUNNELS[0] || null)
   const timeoutMs = opt.timeoutMs || 15000
   if (!T || !T.cfg.host) {
     if (CAP.allowDirect) return await new Promise((resolve, reject) => {
@@ -1296,10 +1309,10 @@ function rememberProxyErr(T, host, e) {
 }
 
 // живой сокет до цели через туннель: пробуем запомненный хост, затем из конфига, затем запасные
-async function proxyConnect(destHost, destPort, timeoutMs, T) {
-  T = T || TUNNELS[0] || null
+async function proxyConnect(destHost, destPort, timeoutMs, T, direct) {
+  T = direct === true ? null : (T || TUNNELS[0] || null)
   if (!T || !T.cfg.host) {
-    if (CAP.allowDirect) return await proxyTunnel(destHost, destPort, { T: null, timeoutMs: timeoutMs || 15000 })
+    if (CAP.allowDirect) return await proxyTunnel(destHost, destPort, { T: null, direct: true, timeoutMs: timeoutMs || 15000 })
     throw new Error('нет proxy.host в конфиге')
   }
   const hosts = proxyHostCandidates(T)
@@ -1879,6 +1892,88 @@ async function mcStatusPing(sock, timeoutMs) {
     try { sock.write(Buffer.concat([pkt(hsBody), pkt(Buffer.from([0x00]))])) } catch (e) { fin({ ok: false, err: 'write: ' + e.message }) }
   })
 }
+// ========================= NBT-ЧАТ ДЕКОДЕР (фикс #8, сессия 7/9) =========================
+// prismarine-chat на 26.x-чате бросал «unknown chat format code: 4»; старый декодер
+// СТРИПАЛ \uXXXX-эски — кириллица терялась. nbtText разворачивает их в символы и
+// рекурсивно собирает текст из NBT/JSON-чата (text/extra/translate/with).
+function unfoldUEscapes (s) {
+  return String(s).replace(/\\u([0-9a-fA-F]{4})/g, (m, h) => {
+    try { return String.fromCharCode(parseInt(h, 16)) } catch (e) { return m }
+  })
+}
+function nbtText (v, depth) {
+  depth = depth || 0
+  if (v === null || v === undefined) return ''
+  if (depth > 64) return ''   // (run19-фикс) градиентный чат 26.x вложен на 20-40 уровней (посимвольная раскраска) — 12 обрезало текст
+  const t = typeof v
+  if (t === 'string') return unfoldUEscapes(v)
+  if (t === 'number' || t === 'boolean') return String(v)
+  if (t === 'bigint') return v.toString()
+  if (Array.isArray(v)) return v.map(x => nbtText(x, depth + 1)).join('')
+  if (t === 'object') {
+    // NBT-обёртка {type:'string'|'compound'|..., value:...} (не упрощённый NBT)
+    if (v.type !== undefined && v.value !== undefined && v.text === undefined) return nbtText(v.value, depth + 1)
+    let out = ''
+    if (v.text !== undefined) out += nbtText(v.text, depth + 1)
+    if (v.translate !== undefined) {
+      let tr = unfoldUEscapes(String(v.translate))
+      if (v.with !== undefined) {
+        // with — массив ИЛИ NBT-обёртка {type:'list', value:[...]}
+        const wl = Array.isArray(v.with) ? v.with : ((v.with && v.with.value) || [])
+        const parts = (Array.isArray(wl) ? wl : []).map(x => nbtText(x, depth + 1))
+        let i = 0
+        tr = tr.replace(/%(\d+)?\$?s/g, (m2, n2) => {
+          const idx = n2 ? Number(n2) - 1 : i++
+          return parts[idx] !== undefined ? parts[idx] : ''
+        })
+      }
+      if (!out) out += tr
+    }
+    if (v.extra !== undefined) out += nbtText(v.extra, depth + 1)   // массив ИЛИ NBT-обёртка списка
+    return out
+  }
+  return ''
+}
+function nbtChatText (pk) {
+  if (pk === null || pk === undefined) return ''
+  if (typeof pk === 'string') {
+    const s = pk.trim()
+    if (s.startsWith('{') || s.startsWith('[')) { try { return nbtText(JSON.parse(s)) } catch (e) { return unfoldUEscapes(pk) } }
+    return unfoldUEscapes(pk)
+  }
+  if (typeof pk === 'object') {
+    if (pk.content !== undefined) return nbtText(pk.content)
+    if (pk.message !== undefined) return nbtText(pk.message)
+    if (pk.text !== undefined || pk.extra !== undefined || pk.translate !== undefined) return nbtText(pk)
+    if (pk.value !== undefined) return nbtText(pk.value)
+  }
+  return nbtText(pk)
+}
+
+// (фикс #9) сравнение версий: «1.21.11» новее «1.21.1»; «26.2» новее «1.21.11»
+function versionNewer (a, b) {
+  const pa = String(a).split('.').map(x => parseInt(x, 10) || 0)
+  const pb = String(b).split('.').map(x => parseInt(x, 10) || 0)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0
+    if (x !== y) return x > y
+  }
+  return false
+}
+
+// (сессия 10) есть ли configuration_acknowledged в toServer-таблице protocol.json.
+// minecraft-data 3.117 НЕ содержит его НИ В ОДНОЙ версии — запись mcp такого пакета
+// даёт МУСОРНЫЙ КАДР «01 00» (id 0x00 = settings, пустое тело) → серверный
+// DecoderException → новый YBotFilter 1400edf держит соединение в config вечно.
+function configAckValidFor (version) {
+  try {
+    const proto = require('minecraft-data')(version).protocol
+    const ts = proto && proto.configuration && proto.configuration.toServer
+    if (!ts) return true   // не удалось проверить — не мешаем
+    return JSON.stringify((ts.types && ts.types.packet) || '').indexOf('configuration_acknowledged') >= 0
+  } catch (e) { return true }
+}
+
 // ========================= ВЕРСИЯ СЕРВЕРА: АВТООПРЕДЕЛЕНИЕ (v5.1.1) =========================
 // status-пинг через туннель: BotFilter отвечает даже без логина. Имя версии бывает «грязным»
 // («BotFilter 1.8.x-26.x») — тогда версию даём по номеру протокола.
@@ -1886,7 +1981,8 @@ const PROTOCOL_VERSIONS = {
   754: '1.16.5', 755: '1.17', 756: '1.17.1', 757: '1.18.1', 758: '1.18.2',
   759: '1.19', 760: '1.19.2', 761: '1.19.3', 762: '1.19.4', 763: '1.20.1',
   764: '1.20.2', 765: '1.20.4', 766: '1.20.6', 767: '1.21.1', 768: '1.21.3',
-  769: '1.21.4', 770: '1.21.5', 771: '1.21.6', 772: '1.21.7'
+  769: '1.21.4', 770: '1.21.5', 771: '1.21.6', 772: '1.21.7',
+  773: '1.21.10', 774: '1.21.11'   // (#9) 26.x-нумерация: 774 = 1.21.11 (рабочая версия funtime)
 }
 function protocolToVersion(p) { return PROTOCOL_VERSIONS[Number(p)] || null }
 function cleanVersionName(name) {
@@ -2996,7 +3092,8 @@ function saveRound(outDir, snap, label, roundNo, opts) {
 }
 // классификатор ошибок разбора протокола (текст зависит от версии minecraft-protocol/protodef)
 function isProtocolParseError(msg) {
-  return /Parse error for|Deserialization error for|Serialization error for|Read error for undefined/i.test(String(msg || ''))
+  // (шаг 5) «Attempted to read beyond the bounds» — тоже НЕ фатальна (битый codec 26.x)
+  return /Parse error for|Deserialization error for|Serialization error for|Read error for undefined|read beyond the bounds/i.test(String(msg || ''))
 }
 
 // ========================= ЗАХОД: подключение и ЖИВОЕ соединение =========================
@@ -3006,7 +3103,7 @@ function isProtocolParseError(msg) {
 function connectAndSolve(tag, opt) {
   opt = opt || {}
   return new Promise(resolve => {
-    const T = opt.T || TUNNELS[0] || null
+    const T = opt.direct === true ? null : (opt.T || TUNNELS[0] || null)   // (шаг 25) opt.direct — прямой заход
     const col = {
       maps: new Map(), mapFilled: new Map(), mapUpdatedAt: new Map(),
       frames: [], framesById: new Map(), chats: [], events: [], prompts: 0,
@@ -3090,11 +3187,43 @@ function connectAndSolve(tag, opt) {
         chatsLen: () => col.chats.length,
         chatsFrom: m => col.chats.slice(Number(m) || 0),
         chat(text) {
-          try { bot.chat(String(text)); ev('💬 chat → «' + String(text).slice(0, 40) + '»'); return true }
-          catch (e) { ev('chat err: ' + e.message); return false }
+          // (v10b) ГЕЙТ по state: play-пакеты (chat) в config-фазе = серверный
+          // DecoderException-кик (урок run2). Ставим в очередь — флаш при переходе в play.
+          try {
+            const st = (bot && bot._client) ? bot._client.state : 'play'
+            if (st !== 'play') {
+              col.chatQueue.push(String(text))
+              ev('💬 chat в очередь (state=' + st + '): «' + String(text).slice(0, 40) + '»')
+              return true
+            }
+            bot.chat(String(text)); ev('💬 chat → «' + String(text).slice(0, 40) + '»'); return true
+          } catch (e) { ev('chat err: ' + e.message); return false }
         },
         isDead: () => !!col.dead,
         deadReason: () => col.reason || '',
+        // (сессия 9) счётчики/телеметрия для tools/live_*
+        chunks: () => col.chunkSet.size,
+        logins: () => col.logins,
+        cfgPkts: () => ({
+          start: col.cfg.startIn, finIn: col.cfg.finishIn, finOut: col.cfg.finishOut,
+          ack: col.cfg.ackOut, set: col.cfg.settingsOut, kpIn: col.cfg.knownIn, kpOut: col.cfg.knownOut,
+          cocIn: col.cfg.cocIn, cocOut: col.cfg.cocOut, arp: col.cfg.arpIn, rpr: col.cfg.rprOut,
+          pkt: col.cfg.pktIn, wd: col.cfg.watchdog, ladder: col.cfg.ladderStep, ackSwallow: col.cfg.ackSwallowed,
+          state: (bot && bot._client) ? bot._client.state : '?',
+          stallS: (col.cfg.lastStartAt && bot && bot._client && bot._client.state === 'configuration') ? Math.round((Date.now() - col.cfg.lastStartAt) / 1000) : 0
+        }),
+        transferReq: () => ({ transfer: col.cfg.transferSeen, cookie: col.cfg.cookieSeen }),
+        // (фикс #1) ждать ВТОРОЙ join game (передача на бэкенд): true = relogin случился
+        async waitRelogin(ms, base) {
+          const b = (base === undefined || base === null) ? col.logins : base
+          const t0 = Date.now()
+          while (Date.now() - t0 < (ms || 20000)) {
+            if (col.dead) return false
+            if (col.logins > b) return true
+            await sleep(150)
+          }
+          return col.logins > b
+        },
         parseErrs: () => col.parseErrs || 0,   // v5.1.1: диагностика версии протокола
         lastChange: () => col.lastChangeAt,
         readiness: () => { try { return readiness() } catch (e) { return { ready: false, why: e.message } } },
@@ -3143,7 +3272,7 @@ function connectAndSolve(tag, opt) {
       else finishFail('timeout(have=' + r.have + ')')
     }, CAP.timeoutMs)
 
-    proxyConnect(MC.host, MC.port, CONNECT_TIMEOUT_MS, T).then(sock => {
+    proxyConnect(MC.host, MC.port, CONNECT_TIMEOUT_MS, T, !!opt.direct).then(sock => {
       const conn = { socket: sock }
       ev('туннель ' + (T ? '«' + T.name + '» ' : '(direct) ') + 'ok -> ' + MC.host + ':' + MC.port +
         (T && T.okHost && T.okHost !== T.cfg.host ? ' (через резерв ' + T.okHost + ')' : ''))
@@ -3165,8 +3294,432 @@ function connectAndSolve(tag, opt) {
         // где setProtocol только ПОДПИСЫВАЕТСЯ на 'connect' — синхронный emit теряется,
         // handshake не уходит (mcp 1.54: setSocket форвардит лишь будущий TCP-connect).
         connect: c => { c.setSocket(conn.socket); setImmediate(() => c.emit('connect')) },
-        hideErrors: true, auth: 'offline', keepAlive: true, checkTimeoutInterval: 60000   // v5-фикс: опция В МС (было 60 → обрыв через 60мс)
+        hideErrors: true, auth: 'offline', keepAlive: true, checkTimeoutInterval: 300000   // v5-фикс: опция В МС; (v10f) 60с→300с: keepAliveError не должен рвать «зависшую» config-фазу раньше снайпера/лестницы
       })
+
+      // ============================================================================
+      // v5.3.0-r2 (порт сессии 9 + форензика сессии 10) — машинерия config-фазы:
+      // #3/#3b/#3c/#3d-v2/#3e/#6/#7, v10b…v10h.
+      // КРИТИЧЕСКИЙ ФИКС СЕССИИ 10: mcp (play.js:53) при входе в config из play пишет
+      // 'configuration_acknowledged' — в таблицах protocol.json (minecraft-data 3.117)
+      // этого пакета НЕТ ни в одной версии → protodef молча сериализует его как кадр
+      // «01 00» = пакет id 0x00 (settings) С ПУСТЫМ ТЕЛОМ → на сервере DecoderException
+      // (обрезанный settings) → новый билд YBotFilter 1400edf (обновлён ночью 22.10)
+      // после такого кадра ДЕРЖИТ соединение в config вечно: keepalive шлёт, а
+      // finish_configuration — нет (корень зависаний runs 9-15). Лечение: write-обёртка
+      // ПРОГЛАТЫВАЕТ configuration_acknowledged (ванильный клиент 26.x его не шлёт —
+      // вход в config подтверждается самой отправкой settings).
+      // ============================================================================
+      const cli = bot._client
+      col.logins = 0
+      col.chatQueue = []
+      col.chunkSet = new Set()
+      col.emitErrs = 0
+      col.lastDimRaw = null
+      col.sniperHooked = false
+      col.cfg = {
+        startIn: 0, finishIn: 0, finishOut: 0, ackOut: 0, ackOutSinceStart: 0,
+        settingsOut: 0, settingsOutSinceStart: 0,
+        knownIn: 0, knownOut: 0, cocIn: 0, cocOut: 0, arpIn: 0, rprOut: 0, pktIn: 0,
+        lastStartAt: 0, lastFinishInAt: 0, lastFinishOutAt: 0, manualFinishAt: 0,
+        ladderStep: 0, ladderAt: 0, ladderPktBase: 0, ladderReact: {},
+        flashedAt: 0, ackHealAt: 0, dumpAt: 0, dumpAt2: 0, stallDump: [], stallHist: {}, offerLogged: 0,
+        sniperArmedAt: 0, sniperVerdictAt: 0, sniperBytes: 0, sniperHex: [],
+        forcePlayAt: 0, watchdog: 0, wdFired: false,
+        lastKnownOffer: null, transferSeen: null, cookieSeen: null, ackSwallowed: 0,
+        rprDone: new Set()
+      }
+      const CFG_PKT_SET = new Set(['keep_alive', 'ping', 'pong', 'start_configuration', 'finish_configuration',
+        'registry_data', 'select_known_packs', 'code_of_conduct', 'add_resource_pack', 'remove_resource_pack',
+        'custom_payload', 'disconnect', 'cookie_request', 'store_cookie', 'transfer', 'feature_flags', 'tags',
+        'server_links', 'custom_report_details', 'reset_chat', 'clear_dialog', 'show_dialog', 'bundle_delimiter'])
+      const SETTINGS_RU = { locale: 'ru_ru', viewDistance: 12, chatFlags: 0, chatColors: true, skinParts: 127, mainHand: 1, enableTextFiltering: false, enableServerListing: true }
+      const CFG_ACK_OK = configAckValidFor(MC.version)
+      if (!CFG_ACK_OK) ev('🧹 протокол ' + MC.version + ': configuration_acknowledged нет в CONFIG-таблице (в 26.x он в PLAY-таблице, id 0x0f) — записи В НЕ-PLAY состояниях будут проглочены; валидный ack при переходе play→config проходит (run16-фикс)')
+
+      function flushChatQueue () {
+        if (!col.chatQueue.length) return
+        const q = col.chatQueue.splice(0, col.chatQueue.length)
+        for (const t of q) {
+          try { bot.chat(t); ev('💬 chat (из очереди) → «' + String(t).slice(0, 40) + '»') } catch (e) { ev('flush chat err: ' + e.message) }
+        }
+      }
+
+      // (#3e) инструменталка state: в mcp state — getter/setter прототипа (переключение
+      // пересоздаёт сериализатор) — оборачиваем дескриптор, логируем переходы со стеком.
+      try {
+        const protoDesc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(cli), 'state')
+        if (protoDesc && protoDesc.get && protoDesc.set) {
+          Object.defineProperty(cli, 'state', {
+            configurable: true,
+            get () { return protoDesc.get.call(cli) },
+            set (v) {
+              const old = protoDesc.get.call(cli)
+              if (old !== v) {
+                let stack = ''
+                try { stack = String(new Error().stack || '').split('\n').slice(2, 5).map(s => s.trim()).join(' ← ') } catch (e2) {}
+                ev('🧭 state: ' + old + ' → ' + v + ' | ' + stack.slice(0, 220))
+              }
+              protoDesc.set.call(cli, v)
+              if (v === 'configuration' && !col.cfg.lastStartAt) col.cfg.lastStartAt = Date.now()   // первичный вход (из login) — целитель вооружён
+              if (v === 'play') { try { flushChatQueue() } catch (e2) {} }
+            }
+          })
+        }
+      } catch (e) { ev('state-инструменталка err: ' + e.message) }
+
+      function manualFinish (srcName) {
+        col.cfg.manualFinishAt = Date.now()
+        try { cli.write('finish_configuration', {}) } catch (e) { ev(srcName + ': finish write err: ' + e.message) }
+      }
+
+      // исходящие: телеметрия + ПРОГЛАТЫВАНИЕ configuration_acknowledged (сессия 10)
+      // + подавление дубля finish (v10g) + known_packs пустой→предложенные (#3)
+      try {
+        const origCliWrite = cli.write.bind(cli)
+        cli.write = function (name, params) {
+          try {
+            // (run16-фикс) configuration_acknowledged в 26.x — пакет PLAY-таблицы (id 0x0f):
+            // mcp пишет его В PLAY-состоянии до перехода в config — это ВАЛИДНЫЙ ack
+            // старта конфигурации (vanilla-поведение), НЕ глотать! Мусорный кадр 01 00
+            // получается только если писать его в configuration/login (там его в таблице нет).
+            if (name === 'configuration_acknowledged' && !CFG_ACK_OK && cli.state !== 'play') {
+              col.cfg.ackSwallowed++
+              if (col.cfg.ackSwallowed <= 3) ev('🧹 проглочен configuration_acknowledged #' + col.cfg.ackSwallowed + ' (запись в state=' + cli.state + ' — пакета нет в config-таблице ' + MC.version + ', был бы мусорный кадр 01 00)')
+              return true
+            }
+            if (name === 'finish_configuration') {
+              const now = Date.now()
+              const isManual = now - (col.cfg.manualFinishAt || 0) < 50
+              if (!isManual && col.cfg.lastFinishOutAt && now - col.cfg.lastFinishOutAt < 1500) {
+                ev('🚫 дубль finish_configuration от mcp-once подавлен (v10g)')
+                if (cli.state !== 'play') { try { cli.state = 'play' } catch (e2) {} }
+                return true
+              }
+            }
+            // (run18b) resource_pack_receive: mineflayer шлёт uuid ОБЪЕКТОМ (uuid-1345) —
+            // protodef сериализует его в НУЛЕВОЙ uuid БЕЗ ошибки → сервер не получает ответ
+            // на свой пак и держит config-фазу. Нормализуем строкой; дубли/нули глотаем.
+            if (name === 'resource_pack_receive' && params) {
+              const wasObj = params.uuid && typeof params.uuid === 'object' && !Buffer.isBuffer(params.uuid)
+              let uu = wasObj ? String(params.uuid.toString()) : params.uuid
+              const key = String(uu === undefined || uu === null ? '' : uu)
+              const zero = /^0+$/.test(key.replace(/-/g, ''))
+              if (zero || (wasObj && col.cfg.rprDone.has(key))) {
+                col.cfg.rprSwallowed = (col.cfg.rprSwallowed || 0) + 1
+                if (col.cfg.rprSwallowed <= 6) ev('🧹 resource_pack_receive подавлен (' + (zero ? 'НУЛЕВОЙ uuid — баг mineflayer' : 'дубль mineflayer — uuid уже отвечен нами') + ', ' + key.slice(0, 36) + ')')
+                return true
+              }
+              if (wasObj) params = Object.assign({}, params, { uuid: key })
+            }
+            if (name === 'select_known_packs' && cli.state === 'configuration') {
+              const packs = (params && params.packs) || []
+              if (!packs.length && col.cfg.lastKnownOffer && col.cfg.lastKnownOffer.length) {
+                params = { packs: col.cfg.lastKnownOffer }
+                ev('📦 known_packs: пустой ответ mcp → подтвердил предложенные сервером паки (' + col.cfg.lastKnownOffer.length + ') (#3)')
+              }
+            }
+            switch (name) {
+              case 'configuration_acknowledged': col.cfg.ackOut++; col.cfg.ackOutSinceStart++; break
+              case 'settings': col.cfg.settingsOut++; col.cfg.settingsOutSinceStart++; break
+              case 'select_known_packs': col.cfg.knownOut++; break
+              case 'accept_code_of_conduct': col.cfg.cocOut++; break
+              case 'finish_configuration': col.cfg.finishOut++; col.cfg.lastFinishOutAt = Date.now(); break
+              case 'resource_pack_receive': col.cfg.rprOut++; break
+            }
+          } catch (e) {}
+          return origCliWrite(name, params)
+        }
+      } catch (e) { ev('write-обёртка err: ' + e.message) }
+
+      // (#6) emit-обёртка: исключения обработчиков (prismarine-chat «unknown chat format
+      // code: 4» на 26.x-чате) больше не убивают процесс
+      try {
+        const origEmit = cli.emit.bind(cli)
+        cli.emit = function (name) {
+          try { return origEmit.apply(null, arguments) } catch (e) {
+            col.emitErrs++
+            const msg = String((e && e.message) || e)
+            if (col.emitErrs <= 3 || col.emitErrs % 50 === 0) ev('🛡 emit(' + name + ') подавлено исключение #' + col.emitErrs + ': ' + msg.slice(0, 140))
+            return false
+          }
+        }
+      } catch (e) {}
+
+      // телеметрия входящих + (#3d-v2) watchdog + transfer/cookie-детект + счётчик чанков
+      cli.prependListener('packet', (d, m) => {
+        try {
+          const n = (m && m.name) || ''
+          col.cfg.pktIn++
+          if (/transfer/i.test(n)) { col.cfg.transferSeen = { at: Date.now(), name: n }; ev('🚚 transfer-пакет: ' + n) }
+          if (/cookie/i.test(n)) { col.cfg.cookieSeen = { at: Date.now(), name: n }; ev('🍪 cookie-пакет: ' + n) }
+          if (n === 'map_chunk') { const x = d && d.x, z = d && d.z; if (x !== undefined && z !== undefined) col.chunkSet.add(x + ',' + z) }
+          if (cli.state === 'configuration') {
+            if (col.cfg.lastStartAt) {
+              if (col.cfg.stallDump.length < 25) col.cfg.stallDump.push(n)
+              col.cfg.stallHist[n] = (col.cfg.stallHist[n] || 0) + 1
+            }
+            if (n === 'login' || n === 'respawn') col.cfg.watchdog = 99
+            else if (!CFG_PKT_SET.has(n)) col.cfg.watchdog++
+            if (col.cfg.watchdog >= 6 && !col.cfg.wdFired) {
+              col.cfg.wdFired = true
+              ev('🐕 watchdog v2: ' + col.cfg.watchdog + ' не-config пакетов в config-фазе (последний: ' + n + ') → finish + форс play (#3d-v2)')
+              manualFinish('watchdog')
+              try { cli.state = 'play' } catch (e2) {}
+            }
+          } else col.cfg.watchdog = 0
+        } catch (e) {}
+      })
+
+      cli.prependListener('start_configuration', () => {
+        col.cfg.startIn++
+        col.cfg.lastStartAt = Date.now()
+        col.cfg.ackOutSinceStart = 0
+        col.cfg.settingsOutSinceStart = 0
+        col.cfg.ladderStep = 0; col.cfg.ladderAt = 0; col.cfg.ladderReact = {}
+        col.cfg.flashedAt = 0; col.cfg.ackHealAt = 0; col.cfg.dumpAt = 0; col.cfg.dumpAt2 = 0; col.cfg.stallDump = []; col.cfg.stallHist = {}
+        col.cfg.sniperArmedAt = 0; col.cfg.sniperVerdictAt = 0; col.cfg.sniperBytes = 0; col.cfg.sniperHex = []
+        col.cfg.forcePlayAt = 0; col.cfg.watchdog = 0; col.cfg.wdFired = false
+        ev('🔁 start_configuration #' + col.cfg.startIn + ' (state=' + cli.state + ') — флаги целителя сброшены')
+      })
+
+      // (#3c) персистентный отложенный ответ на finish_configuration сервера: once mcp
+      // мог быть израсходован в прошлой фазе (enterConfigState early-return не
+      // перевооружает) — отвечаем сами через 400мс и ставим play.
+      cli.prependListener('finish_configuration', () => {
+        col.cfg.finishIn++
+        col.cfg.lastFinishInAt = Date.now()
+        setTimeout(() => {
+          try {
+            if (cli.state !== 'configuration') return
+            if (col.cfg.lastFinishOutAt >= col.cfg.lastFinishInAt) return   // mcp уже ответил
+            ev('⚕️ целитель: finish_configuration от сервера, mcp промолчал → отвечаю + play (#3c)')
+            manualFinish('#3c')
+            if (cli.state === 'configuration') { try { cli.state = 'play' } catch (e2) {} }
+          } catch (e) {}
+        }, 400)
+      })
+
+      // (#3) select_known_packs: mcp отвечает только once — фолбэк через 700мс
+      cli.prependListener('select_known_packs', pkt => {
+        col.cfg.knownIn++
+        try { col.cfg.lastKnownOffer = (pkt && pkt.packs) || [] } catch (e) {}
+        if (col.cfg.offerLogged < 3) {
+          col.cfg.offerLogged++
+          try { ev('📦 known_packs OFFER #' + col.cfg.knownIn + ': ' + JSON.stringify((pkt && pkt.packs) || []).slice(0, 300)) } catch (e) {}
+        }
+        setTimeout(() => {
+          try {
+            if (cli.state !== 'configuration') return
+            if (col.cfg.knownOut >= col.cfg.knownIn) return
+            cli.write('select_known_packs', { packs: col.cfg.lastKnownOffer || [] })
+            ev('📦 known_packs: mcp промолчал (once израсходован) → фолбэк-ответ 700мс (' + ((col.cfg.lastKnownOffer || []).length) + ' паков) (#3)')
+          } catch (e) {}
+        }, 700)
+      })
+
+      // (#3b) code_of_conduct: страховочный accept (mcp once мог не сработать во 2-й фазе)
+      cli.prependListener('code_of_conduct', () => {
+        col.cfg.cocIn++
+        setTimeout(() => {
+          try {
+            if (cli.state !== 'configuration') return
+            if (col.cfg.cocOut >= col.cfg.cocIn) return
+            cli.write('accept_code_of_conduct', {})
+            ev('📜 code_of_conduct: страховочный accept (#3b)')
+          } catch (e) {}
+        }, 500)
+      })
+
+      // (run18b — КОРНЕВОЙ ФИКС фазы 4) add_resource_pack в ЛЮБОМ state: отвечаем
+      // ПЕРВЫМИ правильным uuid-СТРОКОЙ: ACCEPTED(3) → +400мс SUCCESS(0). Сервер держит
+      // config-фазу открытой, пока пак не отвечен; mineflayer отвечает нулевым uuid (баг
+      // сериализации uuid-1345 объекта) — его дубли подавляет write-обёртка.
+      cli.prependListener('add_resource_pack', pkt => {
+        col.cfg.arpIn++
+        try {
+          const uu = pkt && pkt.uuid
+          const key = String(uu)
+          ev('📦 add_resource_pack (state=' + cli.state + '): uuid=' + key.slice(0, 36) + ' url=' + String((pkt && pkt.url) || '').slice(0, 70) + (pkt && pkt.required ? ' REQUIRED' : '') + ' — отвечаю ACCEPTED→SUCCESS (run18b)')
+          if (!col.cfg.rprDone.has(key)) {
+            col.cfg.rprDone.add(key)
+            cli.write('resource_pack_receive', { uuid: uu, result: 3 })
+            setTimeout(() => {
+              try { if (!col.dead) { cli.write('resource_pack_receive', { uuid: uu, result: 0 }); ev('📦 resource_pack_receive → SUCCESS(0) uuid=' + key.slice(0, 13) + '…') } } catch (e) {}
+            }, 400)
+          }
+        } catch (e) { ev('add_resource_pack err: ' + e.message) }
+      })
+
+      // (#7) фильтр битых записей registry_data — ДО обработчика mineflayer
+      // (loadDimensionCodec): битые biome 26.x роняли nbt.simplify → UNCAUGHT
+      cli.prependListener('registry_data', pkt => {
+        try {
+          const codec = (pkt && pkt.codec) || pkt
+          if (!codec || !Array.isArray(codec.entries) || !nbtSimplifyOrig) return
+          const clean = []
+          let dropped = 0
+          for (const e of codec.entries) {
+            try { nbtSimplifyOrig(e && e.value); clean.push(e) } catch (err) { dropped++ }
+          }
+          if (dropped) {
+            codec.entries = clean
+            ev('🧹 registry_data(' + String(codec.id || '?') + '): отфильтровано ' + dropped + ' битых записей, осталось ' + clean.length + ' (#7)')
+          }
+        } catch (e) {}
+      })
+
+      // (#7/шаг 5) сырое значение dimension из login/respawn — для поиска «по индексу»
+      for (const nmD of ['login', 'respawn']) {
+        cli.prependListener(nmD, p => {
+          try {
+            const ws = p && p.worldState
+            col.lastDimRaw = (ws && ws.dimension !== undefined) ? ws.dimension : (p && p.dimension)
+          } catch (e) {}
+        })
+      }
+
+      // (шаг 5) умный fixWorldDims: dim не найден в codec (dim=3 у Minestom-передач) →
+      // mineflayer ставит minY=0/height=256 → чанки парсятся со смещением → нет коллизий
+      // → бот проваливается сквозь мир. Ищем измерение (по ключу / по индексу / по имени
+      // overworld / первое валидное в массиве); НЕ нашли → ванильные -64/384.
+      function fixWorldDims (why) {
+        try {
+          const g = bot.game
+          if (!g) return
+          const reg = bot.registry || {}
+          const dims = reg.dimensionsByName || {}
+          const byId = reg.dimensionsById || {}
+          const arr = reg.dimensionsArray || []
+          const ok = d => !!d && Number.isFinite(d.minY) && Number.isFinite(d.height) && d.height > 0
+          let d = null, src = ''
+          if (g.dimension && ok(dims[g.dimension])) { d = dims[g.dimension]; src = 'ключ «' + g.dimension + '»' }
+          if (!d && typeof col.lastDimRaw === 'number') {
+            if (ok(byId[col.lastDimRaw])) { d = byId[col.lastDimRaw]; src = 'индекс ' + col.lastDimRaw }
+            else if (ok(arr[col.lastDimRaw])) { d = arr[col.lastDimRaw]; src = 'array[' + col.lastDimRaw + ']' }
+          }
+          if (!d && ok(dims.overworld)) { d = dims.overworld; src = 'имя «overworld»' }
+          if (!d) { for (const x of arr) { if (ok(x)) { d = x; src = 'первое валидное «' + x.name + '»'; break } } }
+          const minY = d ? d.minY : -64
+          const height = d ? d.height : 384
+          if (g.minY !== minY || g.height !== height) {
+            ev('🌍 fixWorldDims(' + why + ') ' + (d ? 'измерение найдено: ' + src : 'ВАНИЛЬНЫЙ фолбэк -64/384 (измерение не найдено)') + ': minY ' + g.minY + '→' + minY + ', height ' + g.height + '→' + height)
+            g.minY = minY
+            g.height = height
+          }
+        } catch (e) { ev('fixWorldDims err: ' + e.message) }
+      }
+      bot.on('login', () => {
+        col.logins++
+        try { fixWorldDims('login#' + col.logins) } catch (e) {}
+        setTimeout(() => { try { flushChatQueue() } catch (e) {} }, 300)
+      })
+      cli.on('respawn', () => { setTimeout(() => { try { fixWorldDims('respawn') } catch (e) {} }, 0) })
+
+      // 📶 socket-снайпер (v10f): с 10с зависания считаем сырые байты сокета —
+      // вердикт: 0 = сервер молчит; >0 = байты идут (фрейминг цел, сервер держит в config)
+      function hookSniper () {
+        if (col.sniperHooked) return
+        try {
+          const sock = cli.socket
+          if (!sock || !sock.on) return
+          sock.on('data', buf => {
+            try {
+              if (!col.cfg.sniperArmedAt || col.cfg.sniperVerdictAt) return
+              col.cfg.sniperBytes += buf.length
+              if (col.cfg.sniperHex.length < 10) col.cfg.sniperHex.push(Buffer.from(buf.slice(0, 40)).toString('hex'))
+            } catch (e) {}
+          })
+          col.sniperHooked = true
+          ev('📶 снайпер взведён: считаю сырые байты сокета (v10f)')
+        } catch (e) {}
+      }
+
+      // ⚕️ ЦЕЛИТЕЛЬ config-фазы (тик 2с): (а) флаш бандла >6с, (б) settings-self-heal
+      // >8с (#3c), 📋 дамп пакетов >12с (#3e), 📶 снайпер 10с + вердикт 30с (v10f),
+      // 🪜 ЛЕСТНИЦА РУКОПОЖАТИЯ (v10h) 10/20/30/40/50с с детектором реакции сервера,
+      // 🔨 форс play 65с. Флаги сбрасываются на каждый start_configuration.
+      // (run18) ДВЕ лестницы: MIN (по умолчанию) — чистый зонд: ТОЛЬКО finish_configuration
+      // @20с (гипотеза run15 перепроверяется С ВАЛИДНЫМ ack; самопальные known_packs/settings
+      // в run17 провоцировали пересылку диффов и, вероятно, серверный обрыв на +50с).
+      // FULL (v10h) — включается MC_CFG_LADDER=full.
+      const LADDER_FULL = [
+        { at: 10000, name: 'known_packs(ПУСТОЙ)', run: () => cli.write('select_known_packs', { packs: [] }) },
+        { at: 20000, name: 'settings(повтор)', run: () => cli.write('settings', SETTINGS_RU) },
+        { at: 30000, name: 'accept_code_of_conduct', run: () => cli.write('accept_code_of_conduct', {}) },
+        { at: 40000, name: 'known_packs(core@' + MC.version + ')', run: () => cli.write('select_known_packs', { packs: [{ namespace: 'minecraft', id: 'core', version: String(MC.version) }] }) },
+        { at: 50000, name: 'finish_configuration', run: () => manualFinish('лестница-5') }
+      ]
+      const LADDER_MIN = [
+        { at: 20000, name: 'finish_configuration (чистый зонд run18 — без форса play)', run: () => manualFinish('лестница-min') }
+      ]
+      const LADDER = (process.env.MC_CFG_LADDER === 'full') ? LADDER_FULL : LADDER_MIN
+      ev('🪜 режим лестницы: ' + (process.env.MC_CFG_LADDER === 'full' ? 'FULL (v10h, 5 шагов)' : 'MIN (чистый зонд: finish@20с)') + ' (переключается MC_CFG_LADDER=full)')
+      const healerT = setInterval(() => {
+        try {
+          if (col.dead) return
+          if (cli.state !== 'configuration' || !col.cfg.lastStartAt) return
+          const since = Date.now() - col.cfg.lastStartAt
+          if (since > 6000 && !col.cfg.flashedAt) {
+            col.cfg.flashedAt = Date.now()
+            const b = cli._mcBundle || []
+            ev('🧺 зависание 6с+: _mcBundle=' + b.length + (b.length ? ' [' + b.slice(0, 8).map(p => p.metadata && p.metadata.name).join(', ') + ']' : ''))
+            if (b.length) {
+              let nf = 0
+              for (const p of b) {
+                try { cli.emit('packet', p.data, p.metadata, p.buffer, p.fullBuffer); cli.emit(p.metadata.name, p.data, p.metadata); nf++ } catch (e2) {}
+              }
+              try { cli._mcBundle = [] } catch (e2) {}
+              ev('🧺 ФЛАШ бандла: эмитировал ' + nf + ' пакетов вручную')
+            }
+          }
+          if (since > 8000 && !col.cfg.ackHealAt) {
+            col.cfg.ackHealAt = Date.now()
+            if (col.cfg.settingsOutSinceStart === 0) {
+              try {
+                // (run16-фикс) ack в config-состоянии НЕ пишем — там его нет в таблице
+                // (валидный ack уходит сам в PLAY-момент перехода)
+                cli.write('settings', SETTINGS_RU)
+                ev('⚕️ self-heal: config ' + Math.round(since / 1000) + 'с, settings не уходили с start_configuration → отправил settings(ru_ru) (#3c)')
+              } catch (e2) { ev('self-heal err: ' + e2.message) }
+            }
+          }
+          if (since > 10000 && !col.cfg.sniperArmedAt) {
+            col.cfg.sniperArmedAt = Date.now(); col.cfg.sniperBytes = 0; col.cfg.sniperHex = []
+            hookSniper()
+          }
+          if (col.cfg.sniperArmedAt && !col.cfg.sniperVerdictAt && Date.now() - col.cfg.sniperArmedAt >= 20000) {
+            col.cfg.sniperVerdictAt = Date.now()
+            ev('📶 вердикт снайпера: ' + col.cfg.sniperBytes + ' байт за 20с' + (col.cfg.sniperBytes === 0 ? ' — сервер ПОЛНОСТЬЮ молчит' : ' — байты идут (фрейминг цел; сервер держит нас в config)') + (col.cfg.sniperHex.length ? ' | кадры: ' + col.cfg.sniperHex.slice(0, 6).join(' ') : ''))
+          }
+          if (since > 12000 && !col.cfg.dumpAt) {
+            col.cfg.dumpAt = Date.now()
+            ev('📋 дамп зависания (' + Math.round(since / 1000) + 'с): входящие пакеты (первые 25): ' + (col.cfg.stallDump.join(', ') || 'ПУСТО') + ' | pktIn=' + col.cfg.pktIn)
+          }
+          if (since > 30000 && !col.cfg.dumpAt2) {
+            col.cfg.dumpAt2 = Date.now()
+            const hist = Object.entries(col.cfg.stallHist).sort((a, b) => b[1] - a[1]).slice(0, 18).map(([k, v]) => k + '=' + v).join(' ')
+            ev('📊 гистограмма зависания (' + Math.round(since / 1000) + 'с): ' + (hist || 'ПУСТО') + ' | pktIn=' + col.cfg.pktIn)
+          }
+          while (col.cfg.ladderStep < LADDER.length && since >= LADDER[col.cfg.ladderStep].at) {
+            const ls = LADDER[col.cfg.ladderStep]
+            col.cfg.ladderStep++
+            col.cfg.ladderPktBase = col.cfg.pktIn
+            col.cfg.ladderAt = Date.now()
+            try { ls.run(); ev('🪜 лестница шаг ' + col.cfg.ladderStep + '/' + LADDER.length + ' (' + Math.round(since / 1000) + 'с): ' + ls.name) } catch (e2) { ev('🪜 шаг «' + ls.name + '» err: ' + e2.message) }
+          }
+          if (col.cfg.ladderStep > 0 && col.cfg.ladderAt && !col.cfg.ladderReact[col.cfg.ladderStep] && col.cfg.pktIn > col.cfg.ladderPktBase) {
+            col.cfg.ladderReact[col.cfg.ladderStep] = true
+            ev('🪜 сервер ОТРЕАГИРОВАЛ на шаг ' + col.cfg.ladderStep + ' (' + LADDER[col.cfg.ladderStep - 1].name + '): +' + (col.cfg.pktIn - col.cfg.ladderPktBase) + ' пакетов')
+          }
+          if (since > 65000 && !col.cfg.forcePlayAt) {
+            col.cfg.forcePlayAt = Date.now()
+            ev('🔨 config висит 65с — ФОРС state=play (крайняя мера; config-keepalive перестанут парситься)')
+            try { cli.state = 'play' } catch (e2) {}
+          }
+        } catch (e) {}
+      }, 2000)
+      bot.on('end', () => { try { clearInterval(healerT) } catch (e) {} })
 
       // ---------- map_data ----------
       const onMap = pkt => {
@@ -3300,17 +3853,17 @@ function connectAndSolve(tag, opt) {
       }
       bot.on('message', m => { let t = ''; try { t = m.toString() } catch (e) {}; onText(t, 'chat') })
       try { bot.on('messagestr', s => onText(s, 'chatstr')) } catch (e) {}
-      for (const nm of ['set_title_text', 'set_title_subtitle', 'set_action_bar_text', 'system_chat', 'disguised_chat', 'set_title_title']) {
+      // (#6/#8) raw-слушатели ЧЕРЕЗ prependListener (до mineflayer — prismarine-chat
+      // на 26.x бросает «unknown chat format code: 4») + NBT-декодер nbtChatText:
+      // кириллица через \uXXXX-разворот. Строки player_chat/profileless_chat получают
+      // тег ТОЧНОГО имени пакета — харнесс ловит цель по /^\[(player_chat|profileless_chat)\]/.
+      for (const nm of ['player_chat', 'profileless_chat', 'system_chat', 'disguised_chat', 'set_title_text', 'set_title_subtitle', 'set_action_bar_text', 'set_title_title']) {
         try {
-          bot._client.on(nm, pk => {
+          bot._client.prependListener(nm, pk => {
             let t = ''
-            try {
-              if (typeof pk.text === 'string') t = pk.text
-              else if (pk.text && typeof pk.text === 'object') t = JSON.stringify(pk.text)
-              else if (pk.content) t = typeof pk.content === 'string' ? pk.content : JSON.stringify(pk.content)
-              t = t.replace(/\\u[0-9a-f]{4}/gi, '')
-            } catch (e) {}
-            onText(t, nm)
+            try { t = nbtChatText(pk) } catch (e) {}
+            if (!t) { try { t = typeof pk === 'string' ? pk : JSON.stringify(pk) } catch (e) { t = '' } }
+            if (t) onText(t, nm)
           })
         } catch (e) {}
       }
@@ -3319,7 +3872,11 @@ function connectAndSolve(tag, opt) {
       bot.on('spawn', () => { try { clearTimeout(spawnT) } catch (e) {}; col.spawnedAt = Date.now(); ev('spawn ok за ' + (Date.now() - tConn) + 'мс') })
       bot.on('kicked', r => {
         col.dead = true; col.reason = 'kicked'
-        const why = String((r && (r.reason || r.message)) || r || '').slice(0, 200)
+        // (шаг 25) NBT-кик декодируем nbtChatText (был «[object Object]» — причина терялась)
+        let why = ''
+        try { why = nbtChatText({ content: r }) || '' } catch (e) {}
+        if (!why) { try { why = String((r && (r.reason || r.message)) || (typeof r === 'string' ? r : JSON.stringify(r)) || '') } catch (e) { why = String(r) } }
+        why = String(why).replace(/\s+/g, ' ').slice(0, 2000)
         ev('kicked: ' + why)
         col.kickReason = why
         if (!finished) {
@@ -3480,9 +4037,20 @@ async function authPhase(live, w, label, opt) {
   // ---- режим базы: /l первым ----
   if (opt.loginFirst && ACCOUNTS.loginTemplate) {
     let markL = live.chatsLen()
+    const logins0F = live.logins ? live.logins() : 0
     live.chat(buildAuthCommand(ACCOUNTS.loginTemplate, pass))
     step(label + ': 🔑 /l отправлен (аккаунт из базы, ник «' + w.nick + '»)')
-    const resL = await waitAuthResult(live, markL, SOLVER.regVerifyMs)
+    let resL = await waitAuthResult(live, markL, SOLVER.regVerifyMs)
+    // (фикс #1) передача на бэкенд (join game #2) глотает команду — повторяем после relogin
+    if (resL.kind === 'timeout' && live.waitRelogin && !live.isDead()) {
+      const rl = (live.logins && live.logins() > logins0F) || await live.waitRelogin(6000, logins0F)
+      if (rl) {
+        step(label + ': 🔁 передача (join game #' + (live.logins ? live.logins() : '?') + ') — /l потерян, повторяю после relogin (фикс #1)')
+        markL = live.chatsLen()
+        live.chat(buildAuthCommand(ACCOUNTS.loginTemplate, pass))
+        resL = await waitAuthResult(live, markL, SOLVER.regVerifyMs)
+      }
+    }
     if (resL.kind === 'ok') { step(label + ': ✅ вход подтверждён: ' + String(resL.line || '').slice(0, 90)); return { ok: true, via: 'login', line: resL.line } }
     if (resL.kind === 'kick') return { ok: false, stage: 'login', kind: 'kick', reason: resL.reason }
     if (resL.kind === 'notreg') step(label + ': сервер: «не зарегистрированы» — ухожу на /reg')
@@ -3492,9 +4060,20 @@ async function authPhase(live, w, label, opt) {
   let mark = live.chatsLen()
   const regCmd = buildAuthCommand(ACCOUNTS.regTemplate, pass)
   if (regCmd) {
+    const logins0R = live.logins ? live.logins() : 0
     live.chat(regCmd)
     step(label + ': 🔑 /reg отправлен (ник «' + w.nick + '», пароль не печатаем)')
     let res = await waitAuthResult(live, mark, SOLVER.regVerifyMs)
+    // (фикс #1) /reg теряется при передаче на бэкенд (join game #2) — ждём relogin и повторяем
+    if (res.kind === 'timeout' && live.waitRelogin && !live.isDead()) {
+      const rl = (live.logins && live.logins() > logins0R) || await live.waitRelogin(6000, logins0R)
+      if (rl) {
+        step(label + ': 🔁 передача (join game #' + (live.logins ? live.logins() : '?') + ') — /reg потерян, повторяю после relogin (фикс #1)')
+        mark = live.chatsLen()
+        live.chat(regCmd)
+        res = await waitAuthResult(live, mark, SOLVER.regVerifyMs)
+      }
+    }
     if (res.kind === 'ok') { step(label + ': ✅ регистрация подтверждена: ' + String(res.line || '').slice(0, 90)); return { ok: true, via: 'reg', line: res.line } }
     if (res.kind === 'exists') {
       step(label + ': аккаунт уже существует — пробую /l («' + String(res.line || '').slice(0, 70) + '»)')
@@ -3515,9 +4094,20 @@ async function authPhase(live, w, label, opt) {
   const logCmd = buildAuthCommand(ACCOUNTS.loginTemplate, pass)
   if (!logCmd) return { ok: false, stage: 'login', kind: 'no-template' }
   mark = live.chatsLen()
+  const logins0L = live.logins ? live.logins() : 0
   live.chat(logCmd)
   step(label + ': 🔑 /l отправлен')
-  const res2 = await waitAuthResult(live, mark, SOLVER.regVerifyMs)
+  let res2 = await waitAuthResult(live, mark, SOLVER.regVerifyMs)
+  // (фикс #1) повтор /l после передачи
+  if (res2.kind === 'timeout' && live.waitRelogin && !live.isDead()) {
+    const rl = (live.logins && live.logins() > logins0L) || await live.waitRelogin(6000, logins0L)
+    if (rl) {
+      step(label + ': 🔁 передача (join game #' + (live.logins ? live.logins() : '?') + ') — /l потерян, повторяю после relogin (фикс #1)')
+      mark = live.chatsLen()
+      live.chat(logCmd)
+      res2 = await waitAuthResult(live, mark, SOLVER.regVerifyMs)
+    }
+  }
   if (res2.kind === 'ok') { step(label + ': ✅ вход подтверждён: ' + String(res2.line || '').slice(0, 90)); return { ok: true, via: 'login', line: res2.line } }
   return { ok: false, stage: 'login', kind: res2.kind, line: res2.line }
 }
@@ -3959,7 +4549,11 @@ function dbTakeFreeAlgo(T) {
 function dbMarkBusy(acc, b) { if (!acc) return; acc.busy = !!b; acc.lastUsed = new Date().toISOString(); dbSave() }
 function dbMarkRegistered(acc) {
   if (!acc) return
+  // (шаг 27) БЫЛ БАГ: dbSave() БЕЗ dbLoad() — вызов из внешнего процесса с пустой
+  // in-memory DB атомарно ВАЙПАЛ файл (direct_probe 16:37 стёр 32 аккаунта).
+  dbLoad()
   acc.status = 'registered'; acc.regConfirmed = true; acc.lastUsed = new Date().toISOString()
+  if (!DB.accounts.some(a => a === acc || (a.nick && a.nick === acc.nick))) DB.accounts.push(acc)
   dbSave()
 }
 function dbSetAnarchy(acc, n) { if (!acc) return; acc.anarchy = (n === null || n === undefined) ? null : Number(n); dbSave() }
@@ -4621,7 +5215,7 @@ function tgUiStop() { TG_UI.running = false }
 
 // ========================= SELFTEST (офлайн, без сервера и интернета) =========================
 async function selftest() {
-  console.log('=== SELFTEST v5.2.0: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
+  console.log('=== SELFTEST v5.3.0-r2: геометрия сборки + туннели/физканалы + решатель + база аккаунтов + слоты + TG-пульт (мок) ===')
   // самопроверка НЕ выходит в интернет: хост-модель Roboflow на это время выключаем,
   // иначе yoloRecognize сходил бы в облако вместо локального мок-сервера (и потратил кредиты)
   const rfReadyWas = RF.ready
@@ -5706,6 +6300,28 @@ async function selftest() {
       try { fs.rmSync(path.join(REC_ROOT || __dirname, d), { recursive: true, force: true }) } catch (e) {}
     }
   } else console.log('  (--debug: артефакты самопроверки оставлены в ' + path.join(REC_ROOT || __dirname, 'selftest_e2e') + ')')
+  console.log('--- v5.3.0-r2: порт сессии 9 + форензика сессии 10 ---')
+  {
+    const s9checks = [
+      { name: 'nbtText: \\uXXXX-разворот кириллицы (#8)', ok: nbtText({ text: '\\u0423\\u0441\\u043f\\u0435\\u0445' }) === 'Успех' },
+      { name: 'nbtText: text+extra (#8)', ok: nbtText({ text: 'привет', extra: [{ text: ' мир' }] }) === 'привет мир' },
+      { name: 'nbtChatText: player_chat {message} (#8)', ok: nbtChatText({ message: 'текст игрока' }) === 'текст игрока' },
+      { name: 'nbtChatText: system_chat {content,text+extra} (#8)', ok: nbtChatText({ content: { text: 'A', extra: ['B'] } }) === 'AB' },
+      { name: 'regOkWords: «Успешная регистрация!» распознаётся (#2)', ok: !!matchAny('[chat] [✾] Успешная регистрация! Приятной игры!', SOLVER.regOkWords) },
+      { name: 'PROTOCOL_VERSIONS[774] = 1.21.11 (#9)', ok: PROTOCOL_VERSIONS[774] === '1.21.11' },
+      { name: 'LOGIN_TIMEOUT_MS = 60с (v10e)', ok: LOGIN_TIMEOUT_MS === 60000 },
+      { name: 'versionNewer: 1.21.11>1.21.1, 26.2>1.21.11, обратно false (#9)', ok: versionNewer('1.21.11', '1.21.1') === true && versionNewer('1.21.1', '1.21.11') === false && versionNewer('26.2', '1.21.11') === true },
+      { name: 'isProtocolParseError: «read beyond the bounds» не фатальна (шаг 5)', ok: isProtocolParseError('Attempted to read beyond the bounds of the managed data') === true },
+      { name: 'configAckValidFor(1.21.11) = false — запись ack В CONFIG будет проглочена (run16-фикс: в play — проходит)', ok: configAckValidFor('1.21.11') === false },
+      { name: 'nbtText: NBT-обёртка списка в extra (kick-reason читается) (run16-фикс)', ok: nbtText({ type: 'compound', value: { extra: { type: 'list', value: [{ text: { type: 'string', value: 'DecoderException' } }] } } }) === 'DecoderException' },
+      { name: 'nbtChatText: compound с вложенным text (run16-фикс)', ok: nbtChatText({ type: 'compound', value: { text: { type: 'string', value: '\\u041a\\u0418\\u041a' } } }) === 'КИК' }
+    ]
+    for (const c of s9checks) {
+      if (!c.ok) fails++
+      console.log('  ' + (c.ok ? '✅' : '❌') + ' ' + c.name)
+    }
+  }
+
   console.log(fails ? '=== SELFTEST: ' + fails + ' ПРОВАЛОВ ===' : '=== SELFTEST: ВСЁ ОК ===')
   return fails === 0
 }
@@ -5879,9 +6495,18 @@ async function main() {
       const clean = cleanVersionName(vname) || protocolToVersion(vproto)
       const pl = st.json.players ? (', игроков ' + st.json.players.online + '/' + st.json.players.max) : ''
       step('🔎 сервер ответил за ' + st.ms + 'мс: «' + vname + '», protocol ' + vproto + (clean ? ' (= ' + clean + ')' : ' (версию по номеру не знаю)') + pl)
-      if (clean && clean !== MC.version) {
-        step('⚠️ в конфиге minecraft.version=' + MC.version + ' — ПЕРЕКЛЮЧАЮСЬ на версию сервера ' + clean + ': иначе будут «Parse error for play.toClient» и обрывы')
-        MC.version = clean
+      // (фикс #9) «BotFilter» в имени пинга = ФАСАД (protocol 767 устарел): версию НЕ понижаем.
+      // Переключаемся, только если версия сервера НОВЕЕ конфигной (1.21.11 > 1.21.1, 26.x > 1.21.x).
+      const facade = /botfilter/i.test(String(vname || ''))
+      if (facade) {
+        step('   «BotFilter» в имени пинга = фасад (protocol ' + vproto + ') — НЕ понижаю версию, остаюсь на minecraft.version=' + MC.version + ' (фикс #9)')
+      } else if (clean && clean !== MC.version) {
+        if (versionNewer(clean, MC.version)) {
+          step('⚠️ в конфиге minecraft.version=' + MC.version + ', сервер НОВЕЕ (' + clean + ') — ПЕРЕКЛЮЧАЮСЬ: иначе будут «Parse error for play.toClient» и обрывы')
+          MC.version = clean
+        } else {
+          step('   версия сервера ' + clean + ' НЕ новее конфигной (' + MC.version + ') — остаюсь на конфигной (фикс #9)')
+        }
       } else if (clean) {
         step('   версия совпадает с конфигом (' + MC.version + ') — ок')
       } else {
@@ -5933,7 +6558,7 @@ if (require.main === module) {
   })
 }
 module.exports = {
-  VERSION: '5.2.0',
+  VERSION: '5.3.0-r2',
   // палитра/PNG/геометрия (используют tools/*)
   PALETTE, SHADE_MULT, BASE_COLORS, LUM, palDist, rotQ, encodePng, colorPng, bwPng,
   clusterValues, detectWalls, wallMinFrames, buildGrid, viewpointHAsc, orientationCandidates, rotationCandidates,
@@ -5960,6 +6585,8 @@ module.exports = {
   // решатель/аккаунты/авторизация
   SOLVER, ACCOUNTS, buildAuthCommand, matchAny, randomNick, randomPass,
   connectAndSolve, waitVerdict, waitAuthResult, authPhase, solveCaptchaOnLive, writeResult,
+  // v5.3.0-r2 (порт сессии 9): нужно tools/live_*
+  MC, nbtText, nbtChatText, versionNewer, configAckValidFor, PROTOCOL_VERSIONS,
   // Telegram-пульт (транспорт + UI)
   TG_CFG, tgAllowed, tgApi, tgSend, tgEdit, tgDelete, tgAnswerCb, tgGetUpdates, tgLog, tgTransports, runTgTest,
   TG_UI, tgUiStart, tgUiStop, tgUiLoop, handleUpdate, onMessage, onCallback, startPersonal, rotatePersonal, sendMenu,
