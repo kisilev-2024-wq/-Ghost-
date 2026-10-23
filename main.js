@@ -87,6 +87,9 @@ try { mineflayer = require('mineflayer') } catch (e) { /* опционально
 // (#7) терпимый prismarine-nbt.simplify: битые записи codec 26.x роняли UNCAUGHT и
 // убивали процесс. Оригинал сохраняем — он нужен фильтру registry_data для ЧЕСТНОЙ
 // проверки записей (фильтр должен ЛОВИТЬ исключение на битой записи).
+// (сессия 10, чистка) служебные строки тюнинга — логировать ОДИН раз на процесс
+let GLOBAL_ACK_NOTE = false
+let GLOBAL_LADDER_NOTE = false
 let nbtSimplifyOrig = null
 try {
   const nbtLib = require('prismarine-nbt')
@@ -136,6 +139,7 @@ const STABLE_MS = 1500            // поток map_data должен затих
 const CAPTCHA_TIMEOUT_MS = 75000  // жёсткий лимит на подключение+сбор картинки
 const CONNECT_TIMEOUT_MS = 35000
 const LOGIN_TIMEOUT_MS = 60000   // (v10e) 30с→60с: прайм-тайм BotFilter/прокси тормозят (run10: 3× login timeout)
+const VERSIONSTR = '5.3.0-r2'    // (сессия 10) единая строка версии для баннеров/TG-текстов (были устаревшие v5.2.0)
 const MAX_ROTATIONS_ON_FAIL = 6   // сколько раз подряд крутить IP одному боту без успеха
 const MIN_TILES_DEFAULT = 6       // минимум плиток, чтобы считать стену собранной
 const MIN_TILES_FRACTION = 0.6    // или 60% от размера сетки
@@ -1844,7 +1848,7 @@ async function checkOneTunnel(T) {
 }
 
 async function runProxyCheck() {
-  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (v5.2.0) ===')
+  step('=== ДИАГНОСТИКА ПРОКСИ/ТУННЕЛЕЙ (' + VERSIONSTR + ') ===')
   step('модуль socks: ' + (SocksClient ? 'установлен' : 'НЕТ (используется встроенный SOCKS5-клиент)'))
   if (!TUNNELS.length) {
     step('❌ в config.json нет ни секции "tunnels", ни proxy.host — заход возможен только напрямую')
@@ -1948,6 +1952,14 @@ function nbtChatText (pk) {
     if (pk.value !== undefined) return nbtText(pk.value)
   }
   return nbtText(pk)
+}
+
+// (сессия 10, чистка/безопасность) маскировка команд с паролем в логах:
+// «/l T2ZJQkSTMp» → «/l •••» (пароль аккаунта не должен утекать в консоль/отчёты)
+function maskCmdInLog (t) {
+  const s = String(t == null ? '' : t).trim()
+  if (/^\/(reg|register|l|login)(\s|$)/i.test(s)) return s.split(/\s+/)[0] + ' •••'
+  return s.slice(0, 40)
 }
 
 // (фикс #9) сравнение версий: «1.21.11» новее «1.21.1»; «26.2» новее «1.21.11»
@@ -3193,10 +3205,10 @@ function connectAndSolve(tag, opt) {
             const st = (bot && bot._client) ? bot._client.state : 'play'
             if (st !== 'play') {
               col.chatQueue.push(String(text))
-              ev('💬 chat в очередь (state=' + st + '): «' + String(text).slice(0, 40) + '»')
+              ev('💬 chat в очередь (state=' + st + '): «' + maskCmdInLog(text) + '»')
               return true
             }
-            bot.chat(String(text)); ev('💬 chat → «' + String(text).slice(0, 40) + '»'); return true
+            bot.chat(String(text)); ev('💬 chat → «' + maskCmdInLog(text) + '»'); return true
           } catch (e) { ev('chat err: ' + e.message); return false }
         },
         isDead: () => !!col.dead,
@@ -3335,13 +3347,13 @@ function connectAndSolve(tag, opt) {
         'server_links', 'custom_report_details', 'reset_chat', 'clear_dialog', 'show_dialog', 'bundle_delimiter'])
       const SETTINGS_RU = { locale: 'ru_ru', viewDistance: 12, chatFlags: 0, chatColors: true, skinParts: 127, mainHand: 1, enableTextFiltering: false, enableServerListing: true }
       const CFG_ACK_OK = configAckValidFor(MC.version)
-      if (!CFG_ACK_OK) ev('🧹 протокол ' + MC.version + ': configuration_acknowledged нет в CONFIG-таблице (в 26.x он в PLAY-таблице, id 0x0f) — записи В НЕ-PLAY состояниях будут проглочены; валидный ack при переходе play→config проходит (run16-фикс)')
+      if (!CFG_ACK_OK && !GLOBAL_ACK_NOTE) { GLOBAL_ACK_NOTE = true; ev('🧹 протокол ' + MC.version + ': configuration_acknowledged нет в CONFIG-таблице (в 26.x он в PLAY-таблице, id 0x0f) — записи В НЕ-PLAY состояниях будут проглочены; валидный ack при переходе play→config проходит (run16-фикс)') }
 
       function flushChatQueue () {
         if (!col.chatQueue.length) return
         const q = col.chatQueue.splice(0, col.chatQueue.length)
         for (const t of q) {
-          try { bot.chat(t); ev('💬 chat (из очереди) → «' + String(t).slice(0, 40) + '»') } catch (e) { ev('flush chat err: ' + e.message) }
+          try { bot.chat(t); ev('💬 chat (из очереди) → «' + maskCmdInLog(t) + '»') } catch (e) { ev('flush chat err: ' + e.message) }
         }
       }
 
@@ -3357,8 +3369,13 @@ function connectAndSolve(tag, opt) {
               const old = protoDesc.get.call(cli)
               if (old !== v) {
                 let stack = ''
-                try { stack = String(new Error().stack || '').split('\n').slice(2, 5).map(s => s.trim()).join(' ← ') } catch (e2) {}
-                ev('🧭 state: ' + old + ' → ' + v + ' | ' + stack.slice(0, 220))
+                try {
+                  // (сессия 10, чистка) компактный стек: 2 кадра, только file:line (без D:\…\node_modules\…)
+                  stack = String(new Error().stack || '').split('\n').slice(2, 4)
+                    .map(s => s.trim().replace(/^at\s+/, '').replace(/[A-Za-z]:[^()]*[\\/]/g, '').replace(/\/(?:home|tmp|Users)[^()]*[\\/]/g, ''))
+                    .join(' ← ')
+                } catch (e2) {}
+                ev('🧭 state: ' + old + ' → ' + v + ' | ' + stack.slice(0, 150))
               }
               protoDesc.set.call(cli, v)
               if (v === 'configuration' && !col.cfg.lastStartAt) col.cfg.lastStartAt = Date.now()   // первичный вход (из login) — целитель вооружён
@@ -3654,7 +3671,7 @@ function connectAndSolve(tag, opt) {
         { at: 20000, name: 'finish_configuration (чистый зонд run18 — без форса play)', run: () => manualFinish('лестница-min') }
       ]
       const LADDER = (process.env.MC_CFG_LADDER === 'full') ? LADDER_FULL : LADDER_MIN
-      ev('🪜 режим лестницы: ' + (process.env.MC_CFG_LADDER === 'full' ? 'FULL (v10h, 5 шагов)' : 'MIN (чистый зонд: finish@20с)') + ' (переключается MC_CFG_LADDER=full)')
+      if (!GLOBAL_LADDER_NOTE) { GLOBAL_LADDER_NOTE = true; ev('🪜 режим лестницы: ' + (process.env.MC_CFG_LADDER === 'full' ? 'FULL (v10h, 5 шагов)' : 'MIN (чистый зонд: finish@20с)') + ' (переключается MC_CFG_LADDER=full)') }
       const healerT = setInterval(() => {
         try {
           if (col.dead) return
@@ -3839,9 +3856,19 @@ function connectAndSolve(tag, opt) {
       const onText = (t, src) => {
         const s = String(t || '')
         if (!s) return
+        // (сессия 10, чистка по логу владельца) ДЕДУП: одно сообщение приходит 2-4 раза
+        // из разных источников (raw system_chat/player_chat + mineflayer message/messagestr)
+        // — «промпт капчи #1..#13» вместо #1..#4. Считаем только первое вхождение (1.5с).
+        const dk = s.replace(/\s+/g, ' ').trim().slice(0, 140)
+        if (dk && col.lastTextKey === dk && Date.now() - (col.lastTextAt || 0) < 1500) return
+        col.lastTextKey = dk
+        col.lastTextAt = Date.now()
         col.chats.push('[' + src + '] ' + s)
         col.lastChatAt = Date.now()
-        if (PROMPT_RE.test(s) && /номер|цифр|капч|captcha|код|число/i.test(s)) { col.prompts++; ev('промпт капчи #' + col.prompts + ' (' + src + '): ' + s.slice(0, 80)) }
+        if (PROMPT_RE.test(s) && /номер|цифр|капч|captcha|код|число/i.test(s)) {
+          col.prompts++
+          if (col.prompts <= 2 || col.prompts % 10 === 0) ev('промпт капчи #' + col.prompts + ' (' + src + '): ' + s.slice(0, 80))
+        }
         // v5.2: капчи НЕТ — сервер сразу зовёт авторизоваться (BotFilter доверился IP/нику;
         // типично для аккаунта из базы, зарегистрированного с этого же IP). Запоминаем момент:
         // poll через 800мс уйдёт в живую фазу «no-captcha», а сессия — сразу в authPhase (/l).
@@ -4984,7 +5011,7 @@ function scheduleStatusEdit(S, force) {
   else if (!rec.timer) rec.timer = setTimeout(doEdit, wait)
 }
 
-const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v5.2.0\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
+const MENU_TEXT = '🎮 FunTime captcha-bot · пульт управления v' + VERSIONSTR + '\n\nКнопки ВНИЗУ ЭКРАНА (постоянно):\n' + BTN_ALGO + ' — готовые сценарии (пока заглушка)\n' + BTN_PERSONAL + ' — ваш постоянный аккаунт + личный туннель\n\nКоманды: /start меню · /status статус · /stop остановить · /cancel отмена смены анархии · /accounts база аккаунтов · /help справка'
 const ALGO_STUB_TEXT = '🧩 Алгоритмы — ЗАГЛУШКА (в разработке).\n\nКаркас уже готов и работает: сессии, слоты физических каналов (≤' + SOLVER.maxAccountsPerTunnel + ' аккаунтов), приоритет алгоритмов выше личных, база аккаунтов, пресет анархии (algo.anarchy), headless-пул (--bots).\n\nВ следующей итерации здесь появится: выбор/настройка сценария (последовательность действий после анархии) и кнопка запуска.'
 
 function personalPanelText(chatId) {
@@ -5112,7 +5139,7 @@ async function onMessage(chatId, messageId, text) {
     return
   }
   if (/^\/help(\b|$)/i.test(t)) {
-    await tgSend(chatId, '🎮 Пульт v5.2.0\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
+    await tgSend(chatId, '🎮 Пульт v' + VERSIONSTR + '\n\nЭкранные кнопки (внизу): «' + BTN_ALGO + '», «' + BTN_PERSONAL + '».\nВ личном заходе: ▶️ Запуск → статус-блок (1️⃣ заход / 2️⃣ HUB / 3️⃣ анархия N) → в HUB отправьте /anN → в анархии любой текст уходит в игровой чат (сообщения здесь удаляются).\n\nКоманды: /start · /status · /stop · /cancel · /accounts · /help', kbScreen())
     return
   }
 
@@ -5208,7 +5235,7 @@ function tgUiStart() {
   TG_UI.startedAt = Math.floor(Date.now() / 1000)
   step('📱 TELEGRAM-ПУЛЬТ: запущен (бот id ' + (TG_CFG.token ? TG_CFG.token.split(':')[0] : '?') + ', whitelist: ' + (TG_CFG.allowedChatIds.join(', ') || 'ПУСТО — никто не подключится') + ')')
   step('   кнопки «' + BTN_ALGO + '» и «' + BTN_PERSONAL + '» — на экране телефона (reply-клавиатура); отправьте /start в чат бота, если их не видно')
-  tgLog('пульт v5.2.0 запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
+  tgLog('пульт v' + VERSIONSTR + ' запущен; allowedChatIds=' + JSON.stringify(TG_CFG.allowedChatIds))
   tgUiLoop().catch(e => { tgLog('tgUiLoop fatal: ' + e.message); TG_UI.running = false })
 }
 function tgUiStop() { TG_UI.running = false }
@@ -6193,8 +6220,8 @@ async function selftest() {
     let kb = null; try { kb = JSON.parse((menuRec.params && menuRec.params.reply_markup) || 'null') } catch (e) {}
     const okKb = !!kb && Array.isArray(kb.keyboard) && kb.resize_keyboard === true &&
       kb.keyboard[0].length === 2 && kb.keyboard[0][0].text === BTN_ALGO && kb.keyboard[0][1].text === BTN_PERSONAL
-    caseOk('1. /start → приветствие v5.2.0 + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
-      okMenu && menuText.indexOf('пульт управления v5.2.0') >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
+    caseOk('1. /start → приветствие v' + VERSIONSTR + ' + ЭКРАННАЯ клавиатура (🧩 Алгоритмы | 👤 Личный заход, resize+persistent)',
+      okMenu && menuText.indexOf('пульт управления v' + VERSIONSTR) >= 0 && menuRec.params && menuRec.params.chat_id === 1 && okKb)
 
     // 2: нажатие экранной кнопки «🧩 Алгоритмы» (приходит текстом) → заглушка
     injMsg(1, 12, BTN_ALGO)
@@ -6380,7 +6407,7 @@ async function runCliPool(sessions) {
 function printSummary(sessions, t0) {
   const solved = sessions.filter(S => S.solved).length
   const online = sessions.filter(S => ['hub', 'anarchy'].indexOf(S.state) >= 0).length
-  const L = ['=== СВОДКА v5.2.0 ===']
+  const L = ['=== СВОДКА ' + VERSIONSTR + ' ===']
   L.push('сессий: ' + sessions.length + ' | решено капч: ' + solved + '/' + sessions.length + ' | в игре: ' + online + ' | время: ' + Math.round((Date.now() - t0) / 1000) + 'с')
   for (const l of sessionsSummary()) L.push(l)
   L.push('')
@@ -6431,7 +6458,7 @@ function printConfigSummary() {
 }
 
 async function main() {
-  step('=== СТАРТ v5.2.0 (авторешатель капчи FunTime + Telegram-пульт) ===')
+  step('=== СТАРТ v' + VERSIONSTR + ' (авторешатель капчи FunTime + Telegram-пульт) ===')
 
   if (CLI.selftest) { process.exit((await selftest()) ? 0 : 1) }
   if (CLI.tgTest) { const okTg = await runTgTest(); setTimeout(() => process.exit(okTg ? 0 : 1), 300); return }
@@ -6499,7 +6526,16 @@ async function main() {
       // Переключаемся, только если версия сервера НОВЕЕ конфигной (1.21.11 > 1.21.1, 26.x > 1.21.x).
       const facade = /botfilter/i.test(String(vname || ''))
       if (facade) {
-        step('   «BotFilter» в имени пинга = фасад (protocol ' + vproto + ') — НЕ понижаю версию, остаюсь на minecraft.version=' + MC.version + ' (фикс #9)')
+        // (сессия 10, по логу владельца 18:38) фасад «BotFilter 1.8.x-26.x» раскрывает
+        // поколение бэкенда: 26.x = рабочий клиент 1.21.11 (774). Со старым конфигом
+        // 1.21.1 капча/фасад проходят, но ПОСЛЕ передачи поток нечитаем
+        // («array size is abnormally large») и /reg, /l таймаутятся.
+        if (/26\./.test(String(vname || '')) && versionNewer('1.21.11', MC.version)) {
+          step('⚠️ фасад BotFilter c «26.x» = бэкенд поколения 26.x — ПОДНИМАЮ minecraft.version ' + MC.version + ' → 1.21.11 (иначе после передачи «array size is abnormally large» и таймауты /reg, /l; можно прописать версию в конфиге вручную)')
+          MC.version = '1.21.11'
+        } else {
+          step('   «BotFilter» в имени пинга = фасад (protocol ' + vproto + ') — НЕ понижаю версию, остаюсь на minecraft.version=' + MC.version + ' (фикс #9)')
+        }
       } else if (clean && clean !== MC.version) {
         if (versionNewer(clean, MC.version)) {
           step('⚠️ в конфиге minecraft.version=' + MC.version + ', сервер НОВЕЕ (' + clean + ') — ПЕРЕКЛЮЧАЮСЬ: иначе будут «Parse error for play.toClient» и обрывы')
