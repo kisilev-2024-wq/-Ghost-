@@ -1,5 +1,10 @@
 {
-  "minecraft": { "server": "connect.funtime.su", "port": 25565, "version": "1.21.1" },
+  "minecraft": {
+    "server": "connect.funtime.su",
+    "port": 25565,
+    "version": "1.21.11",
+    "autoVersion": true
+  },
   "proxy": {
     "host": "bproxy.site",
     "port": 23750,
@@ -8,16 +13,62 @@
     "type": 5,
     "changeIpUrl": "https://changeip.mobileproxy.space/?proxy_key=08a7964ab67274e7ceeb0f9f8f39c779",
     "waitAfterIpChangeSec": 12,
-    "altHosts": ["mproxy.site"]
+    "altHosts": [
+      "mproxy.site"
+    ],
+    "allowDirect": true,
+    "role": "algo"
   },
-  "accounts": { "nickPrefix": "Player", "countDefault": 1, "sessionMinutes": 10 },
+  "tunnels": [],
+  "accounts": {
+    "nickPrefix": "Player",
+    "count": 1,
+    "passwordLength": 10,
+    "regTemplate": "/reg {pass}",
+    "loginTemplate": "/l {pass}",
+    "staggerMs": 2500
+  },
+  "solver": {
+    "roundsPerBot": 5,
+    "triesPerJoin": 3,
+    "answerDelayMin": 400,
+    "answerDelayRnd": 500,
+    "verifyMs": 10000,
+    "regDelayMs": 1500,
+    "regVerifyMs": 9000,
+    "stayOnline": true,
+    "holdMinutes": 0,
+    "unknownIsSuccess": false,
+    "rotateOnFailStreak": 2,
+    "rotateOnNetFails": 2,
+    "rotateOnStart": false,
+    "maxAccountsPerTunnel": 5
+  },
+  "antiAfk": {
+    "enabled": true,
+    "everyMs": 45000,
+    "jitterMs": 15000
+  },
+  "anarchy": {
+    "ranges": [
+      [102, 112],
+      [202, 234],
+      [302, 323],
+      [502, 514],
+      [902, 904]
+    ],
+    "allowAny": false
+  },
   "telegram": {
-    "token": "8684910936:AAGweF83tqT_RKSzdyQLrbT9IZRbNX7YcgI",
-    "chatId": 5370523250,
+    "enabled": true,
+    "token": "8721400315:AAEiBnTIAEErXDuRO9T_vDlJe9Fn9pzIv4I",
     "apiProxy": "socks5h://5xBLgY:S8hzBU@45.130.129.70:8000",
-    "targetStreak": 10,
-    "streakSource": "auto",
-    "prefetch": 3
+    "preferSocks": true,
+    "useMcProxy": true,
+    "allowedChatIds": [
+      5370523250
+    ],
+    "pollTimeoutSec": 25
   },
   "roboflow": {
     "enabled": true,
@@ -33,18 +84,31 @@
     "retries": 3,
     "paceMs": 1200,
     "useSocks": true,
-    "autoLabel": false
+    "socksUrl": "socks5h://5xBLgY:S8hzBU@45.130.129.70:8000"
   },
   "yolo": {
     "enabled": true,
-    "urls": ["http://127.0.0.1:5000/recognize"],
+    "urls": [
+      "http://127.0.0.1:5000/recognize"
+    ],
     "field": "image",
     "timeoutMs": 6000
   },
-  "digits": { "expected": 5 },
-  "autostart": { "enabled": false },
+  "capture": {
+    "fast": false
+  },
+  "digits": {
+    "expected": 5
+  },
+  "log": {
+    "localTime": true
+  },
+  "autostart": {
+    "enabled": false
+  },
   "update": {
     "urlMain": "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/main.js",
     "urlConfig": "https://raw.githubusercontent.com/kisilev-2024-wq/-Ghost-/main/configuration"
-  }
+  },
+  "algo": null
 }
