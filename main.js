@@ -27,17 +27,49 @@
 //   node tools/an309_pair_direct.js [--an=309] [--deadline=3600] [--walk=5]
 //        [--every=60] [--text=1234] [--until-delivered=1] [--hold-after=90]
 //        [--dry]   (dry = только проверка конфига/IP, без входа)
+//
+// v2 (шаг 43): фикс «M.randomNick is not a function» — скрипт больше не берёт
+//   первый попавшийся main.js: кандидаты (./main.js, ../main.js, ./env/main.js,
+//   ../env/main.js) ПРОВЕРЯЮТСЯ на наличие connectAndSolve/solveCaptchaOnLive/
+//   nbtChatText; неподходящие (старые) отбрасываются с диагностикой; генераторы
+//   ников/паролей имеют локальный фолбэк; краш на старте = немедленный exit(1).
 // ============================================================================
 'use strict'
 const fs = require('fs')
 const pathMod = require('path')
 
-// main.js может лежать на уровень выше (скрипт в tools/) или рядом
-let M, MAIN_DIR
-for (const cand of ['../main.js', './main.js']) {
-  try { M = require(cand); MAIN_DIR = pathMod.resolve(__dirname, pathMod.dirname(cand)); break } catch (e) {}
+// Загрузка main.js с ВАЛИДАЦИЕЙ (фикс шага 43: рядом может лежать СТАРЫЙ main.js
+// без нужных экспортов — раньше скрипт брал его вслепую и падал на randomNick).
+// ОБЯЗАТЕЛЬНО: connectAndSolve, solveCaptchaOnLive, nbtChatText.
+// randomNick/randomPass — желательны (есть локальный фолбэк), currentIp/dbMarkRegistered — опциональны.
+const REQUIRED_FNS = ['connectAndSolve', 'solveCaptchaOnLive', 'nbtChatText']
+const CANDIDATES = ['./main.js', '../main.js', './env/main.js', '../env/main.js']
+let M = null, MAIN_DIR = null, MAIN_PATH = null
+const REJECTS = []
+for (const cand of CANDIDATES) {
+  let mod = null
+  try { mod = require(cand) } catch (e) {
+    REJECTS.push(cand + ': ' + ((e && e.code === 'MODULE_NOT_FOUND') ? 'нет файла' : 'ошибка загрузки: ' + String((e && e.message) || e).split('\n')[0].slice(0, 80)))
+    continue
+  }
+  let resolved = cand
+  try { resolved = require.resolve(cand) } catch (e) {}
+  const missing = REQUIRED_FNS.filter(fn => typeof mod[fn] !== 'function')
+  if (missing.length) {
+    REJECTS.push(cand + ' (' + resolved + '): НЕ ПОДХОДИТ — нет ' + missing.join(', ') + ((mod && mod.VERSION) ? ' [это v' + mod.VERSION + ']' : ' [версия неизвестна — вероятно, старый/чужой main.js]'))
+    continue
+  }
+  M = mod; MAIN_PATH = resolved; MAIN_DIR = pathMod.dirname(resolved)
+  console.log('✅ main.js: ' + resolved + ((M && M.VERSION) ? ' (v' + M.VERSION + ')' : ''))
+  break
 }
-if (!M) { console.error('❌ Не найден main.js — положите этот скрипт в папку tools/ рядом с main.js (или в одну папку с ним).'); process.exit(1) }
+if (!M) {
+  console.error('❌ Не найден ПОДХОДЯЩИЙ main.js (нужен v5.3.x с экспортами ' + REQUIRED_FNS.join('/') + ').')
+  console.error('   Пробовал:')
+  for (const r of REJECTS) console.error('     • ' + r)
+  console.error('   Решение: положите ЭТОТ скрипт в ту же папку, где лежит ваш рабочий main.js (D:\\captcha\\env), и запускайте оттуда.')
+  process.exit(1)
+}
 
 const argStr = (n, d) => { const a = process.argv.find(x => x.startsWith('--' + n + '=')); return a ? a.slice(n.length + 3) : d }
 const argNum = (n, d) => { const v = Number(argStr(n, String(d))); return Number.isFinite(v) && v >= 0 ? v : d }
@@ -76,10 +108,15 @@ const T0 = Date.now()
 const say = s => { const line = '[' + ((Date.now() - T0) / 1000).toFixed(1) + 's] ' + s; try { console.log(line) } catch (e) {} OUT.push(line); try { fs.writeFileSync(pathMod.join(REC, 'pair309.log'), OUT.join('\n') + '\n') } catch (e) {} }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
+let BOOT_OK = false   // фикс шага 43: краш ДО старта = немедленный выход (иначе процесс висел бы до дедлайна)
 process.on('uncaughtException', e => {
   const msg = String((e && e.message) || e)
   if (/EPIPE/.test(msg)) { try { process.stdout.write = () => true } catch (e2) {}; return }
   try { say('⚠️ uncaughtException: ' + msg.slice(0, 180)) } catch (e2) {}
+  if (!BOOT_OK) {
+    try { console.error('❌ КРАШ НА СТАРТЕ — выход (code 1). Полный стек: ' + String((e && e.stack) || e).slice(0, 500)) } catch (e2) {}
+    process.exit(1)
+  }
 })
 process.on('unhandledRejection', e => { try { say('⚠️ unhandledRejection: ' + String((e && e.message) || e).slice(0, 180)) } catch (e2) {} })
 
@@ -88,8 +125,29 @@ let finishFn = null
 const deadlineT = setTimeout(() => { HARD_STOP = true; say('⏰ ДЕДЛАЙН ' + DEADLINE_S + 'с'); try { if (finishFn) finishFn() } catch (e) {}; setTimeout(() => process.exit(0), 600) }, DEADLINE_S * 1000)
 
 // ---- случайные аккаунты (свежие → регистрация при входе) ----
-const W_ACC = { nick: M.randomNick('Player'), pass: M.randomPass(), fresh: true }
-const R_ACC = { nick: M.randomNick('Player'), pass: M.randomPass(), fresh: true }
+// Генераторы: из main.js, если есть; иначе локальные точные копии (фикс шага 43)
+const PASS_CHARS_L = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789'
+const NICK_USED_L = new Set()
+function localRandomNick(prefix) {
+  const p = String(prefix || 'Player').replace(/[^a-zA-Z0-9_]/g, '').slice(0, 10) || 'Player'
+  for (let i = 0; i < 500; i++) {
+    const n = (p + Math.floor(Math.random() * 900000 + 100000)).slice(0, 16)
+    if (!NICK_USED_L.has(n)) { NICK_USED_L.add(n); return n }
+  }
+  const n = (p + Date.now().toString(36)).slice(0, 16)
+  NICK_USED_L.add(n)
+  return n
+}
+function localRandomPass(len) {
+  const n = Math.max(6, Math.min(32, Number(len) || 10))
+  let s = ''
+  for (let i = 0; i < n; i++) s += PASS_CHARS_L[Math.floor(Math.random() * PASS_CHARS_L.length)]
+  return s
+}
+const randomNick = typeof M.randomNick === 'function' ? M.randomNick : localRandomNick
+const randomPass = typeof M.randomPass === 'function' ? M.randomPass : localRandomPass
+const W_ACC = { nick: randomNick('Player'), pass: randomPass(), fresh: true }
+const R_ACC = { nick: randomNick('Player'), pass: randomPass(), fresh: true }
 
 const STATE = {
   ip: '?', reader: null, writer: null,
@@ -97,6 +155,7 @@ const STATE = {
   walk: null, readerAmbient: 0, readerLines: [], readerSaw1234: 0,
   scoreboards: { R: [], W: [] }
 }
+BOOT_OK = true   // синхронная инициализация завершена без краша
 
 function attachBot(role, st) {
   const { live, bot, client } = st
@@ -170,9 +229,11 @@ async function enterInstance(role, acc, loginFirst) {
     say('[' + role + '] ✅ капча+авторизация («' + (res.ans && res.ans.digits) + '», ' + (res.auth && res.auth.ok ? res.auth.via : '?') + ')')
     if (acc.fresh && res.auth && res.auth.ok) {
       try {
-        M.dbMarkRegistered({ nick: acc.nick, pass: acc.pass, owner: 'algo', tunnel: 'algo', ip: STATE.ip, status: 'new', createdAt: new Date().toISOString(), lastUsed: new Date().toISOString(), regConfirmed: false, anarchy: null, note: 'pair309d', busy: false })
-        acc.fresh = false
+        if (typeof M.dbMarkRegistered === 'function') {
+          M.dbMarkRegistered({ nick: acc.nick, pass: acc.pass, owner: 'algo', tunnel: 'algo', ip: STATE.ip, status: 'new', createdAt: new Date().toISOString(), lastUsed: new Date().toISOString(), regConfirmed: false, anarchy: null, note: 'pair309d', busy: false })
+        }
       } catch (e) {}
+      acc.fresh = false   // регистрация подтверждена сервером — при ре-входе нужен /login, а не /register
     }
     // хаб грузится медленнее и имеет лимит простоя (~90с, кик «Вы не успели
     // войти в игру :()») — порог 120 чанков / 40с, пауза 5с
@@ -264,7 +325,7 @@ const saveT = setInterval(saveResult, 300000); saveT.unref && saveT.unref()
   say('    читатель ' + R_ACC.nick + ' (эфир) + писатель ' + W_ACC.nick + ' («' + CHAT_TEXT + '» каждые ' + WRITE_EVERY_S + 'с после ходьбы ' + WALK_BLOCKS + ' блоков)')
   say('    дедлайн ' + DEADLINE_S + 'с | стоп после доставки: ' + (UNTIL_DELIVERED ? 'да (+' + HOLD_AFTER_S + 'с на удержание)' : 'нет (пишет до дедлайна)'))
   say('⚠️ памятка: свежим аккаунтам сервер может отвечать «Вы ещё недостаточно наиграли» — это гейт наигрыша; скрипт продолжает попытки каждую минуту и сам зафиксирует момент, когда запись пройдёт.')
-  try { STATE.ip = await M.currentIp({ directOnly: true, quiet: true }) } catch (e) { STATE.ip = '?' }
+  try { STATE.ip = typeof M.currentIp === 'function' ? await M.currentIp({ directOnly: true, quiet: true }) : '?' } catch (e) { STATE.ip = '?' }
   say('🌐 ваш внешний IP = ' + STATE.ip)
   if (DRY) { say('--dry: проверка завершена, без входа на сервер.'); try { clearTimeout(deadlineT) } catch (e) {}; process.exit(0) }
   say('🕐 8с до первого коннекта…')
