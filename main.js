@@ -11,7 +11,7 @@
 const CFG = {
   BOT_TOKEN: "8196128553:AAFUxzJghI0dbixX2LFxGKK_pdJldATeZIg",
   PROXY: "socks5://BPqEoK:QHM9DK@45.153.20.220:10379",
-  PROXY_ALT_HOST: "2a0f:e441:769b:bbd2:1ad2:4497:ec6b:5164",
+  PROXY_ALT_HOST: "",           // IPv6 отключён: у тебя нет IPv6 (ENETUNREACH)
 
   ARCHIVE_DIR: "",              // пусто = Рабочий стол\TelegramArchive
   NOTIFY: true,                 // писать в личку о правках/удалениях
@@ -316,40 +316,61 @@ function httpRequest(urlStr, opts) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const port = Number(u.port || 443);
-    const collect = res => {
-      const chunks = [];
-      res.on("data", c => chunks.push(c));
-      res.on("error", reject);
-      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
-    };
-    const start = socket => {
-      const o = { hostname: u.hostname, port, path: u.pathname + u.search, method, headers,
-                  agent: false, family: 4, timeout };
-      if (socket) o.createConnection = () => socket;
-      const req = https.request(o, collect);
+    let settled = false;
+    const fail = e => { if (settled) return; settled = true; reject(e); };
+    const done = v => { if (settled) return; settled = true; resolve(v); };
+
+    const start = tlsSocket => {
+      const h = Object.assign({}, headers);
+      if (body != null) h["Content-Length"] = Buffer.byteLength(body);
+      const req = https.request({
+        hostname: u.hostname, port, path: u.pathname + u.search, method, headers: h,
+        agent: null,                          // null, НЕ false — иначе Node идёт мимо прокси
+        createConnection: () => tlsSocket,
+        timeout
+      }, res => {
+        const chunks = [];
+        res.on("data", c => chunks.push(c));
+        res.on("error", fail);
+        res.on("end", () => done({ status: res.statusCode, body: Buffer.concat(chunks) }));
+      });
       req.on("timeout", () => req.destroy(new Error("timeout " + timeout + "ms")));
-      req.on("error", reject);
-      if (body) req.write(body);
+      req.on("error", fail);
+      if (body != null) req.write(body);
       req.end();
     };
-    const wrapTls = socket => {
-      const t = tls.connect({ socket, servername: u.hostname });
-      t.on("error", reject);
-      start(t);
+
+    const wrapTls = raw => {
+      const t = tls.connect({ socket: raw, servername: u.hostname });
+      t.setTimeout(timeout, () => t.destroy(new Error("TLS timeout " + timeout + "ms")));
+      t.on("error", fail);
+      t.once("secureConnect", () => start(t));
     };
-    if (!PROXY) return start(null);
+
+    if (!PROXY) {
+      const raw = net.connect({ host: u.hostname, port, family: 4 });
+      raw.setTimeout(timeout, () => raw.destroy(new Error("connect timeout")));
+      raw.on("error", fail);
+      wrapTls(raw);
+      return;
+    }
+
     const pu = new URL(PROXY.includes("://") ? PROXY : "http://" + PROXY);
-    if (/^socks/i.test(pu.protocol)) { socksConnect(PROXY, u.hostname, port, 20000).then(wrapTls).catch(reject); return; }
+    if (/^socks/i.test(pu.protocol)) {
+      socksConnect(PROXY, u.hostname, port, 20000).then(wrapTls).catch(fail);
+      return;
+    }
+
     const ph = {};
     if (pu.username) ph["Proxy-Authorization"] = "Basic " + Buffer.from(decodeURIComponent(pu.username) + ":" + decodeURIComponent(pu.password)).toString("base64");
     const preq = http.request({ hostname: pu.hostname, port: Number(pu.port || 8080), method: "CONNECT",
-                                path: `${u.hostname}:${port}`, timeout: 20000, headers: ph });
+      path: `${u.hostname}:${port}`, timeout: 20000, headers: ph });
     preq.on("connect", (res, socket) => {
-      if (res.statusCode !== 200) { socket.destroy(); return reject(new Error("proxy CONNECT HTTP " + res.statusCode)); }
+      if (res.statusCode !== 200) { socket.destroy(); return fail(new Error("proxy CONNECT HTTP " + res.statusCode)); }
       wrapTls(socket);
     });
     preq.on("timeout", () => preq.destroy(new Error("proxy timeout")));
-    preq.on("error", reject);
+    preq.on("error", fail);
     preq.end();
   });
 }
