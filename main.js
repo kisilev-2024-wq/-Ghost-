@@ -9,7 +9,7 @@
 
 /* ================== НАСТРОЙКИ ================== */
 const CFG = {
-  BOT_TOKEN: "ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER",   // <-- сюда токен
+  BOT_TOKEN: "8196128553:AAFUxzJghI0dbixX2LFxGKK_pdJldATeZIg",   // <-- сюда токен
 
   ARCHIVE_DIR: "",              // пусто = Рабочий стол\TelegramArchive
   NOTIFY: true,                 // писать в личку о правках/удалениях
