@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* ============================================================
    TG BUSINESS ARCHIVER — один файл, без зависимостей (Node 18+)
-   Архив всех чатов через Telegram Business + лог правок/удалений
+   Архив всех чатов через «Автоматизация чатов» + лог правок/удалений
    Уведомления — в личку от имени бота
    Запуск: node bot.js
    ============================================================ */
@@ -9,7 +9,7 @@
 
 /* ================== НАСТРОЙКИ ================== */
 const CFG = {
-  BOT_TOKEN: "8196128553:AAFUxzJghI0dbixX2LFxGKK_pdJldATeZIg",   // <-- сюда токен
+  BOT_TOKEN: "8196128553:AAFUxzJghI0dbixX2LFxGKK_pdJldATeZIg",
 
   ARCHIVE_DIR: "",              // пусто = Рабочий стол\TelegramArchive
   NOTIFY: true,                 // писать в личку о правках/удалениях
@@ -33,6 +33,22 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const readline = require("readline");
+
+/* ---------- загрузка токена: token.txt -> CFG -> окружение ---------- */
+(function loadToken() {
+  const clean = s => String(s || "")
+    .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, "").trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/^https?:\/\/api\.telegram\.org\/bot/i, "")
+    .replace(/^bot(?=\d)/i, "")
+    .replace(/\s+/g, "");
+  const ok = t => /^\d{6,}:[A-Za-z0-9_-]{20,}$/.test(t);
+  const tf = path.join(__dirname, "token.txt");
+  const fromFile = fs.existsSync(tf) ? clean(fs.readFileSync(tf, "utf8")) : "";
+  const fromCfg = clean(CFG.BOT_TOKEN);
+  const fromEnv = clean(process.env.BOT_TOKEN);
+  CFG.BOT_TOKEN = [fromFile, fromCfg, fromEnv].find(ok) || fromCfg || fromFile || fromEnv;
+})();
 
 /* ---------- пути ---------- */
 function desktopDir() {
@@ -80,7 +96,7 @@ let saveTimer = null, listTimer = null;
 
 function saveState() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fs.promises.writeFile(P_STATE, JSON.stringify(state), "utf8").catch(() => {}), 800);
+  saveTimer = setTimeout(() => fsp.writeFile(P_STATE, JSON.stringify(state), "utf8").catch(() => {}), 800);
 }
 async function flushState() {
   clearTimeout(saveTimer); clearTimeout(listTimer);
@@ -132,7 +148,7 @@ async function rename(from, to) {
 }
 function rl(file) { return readline.createInterface({ input: fs.createReadStream(file, "utf8"), crlfDelay: Infinity }); }
 
-const idCache = new Map();  // chatId -> Set известных id (чтобы не дублировать при перезапуске)
+const idCache = new Map();
 async function loadIds(chatId) {
   const k = String(chatId);
   if (idCache.has(k)) return idCache.get(k);
@@ -167,7 +183,6 @@ async function appendEntry(chatId, e) {
   saveState(); scheduleList();
   return true;
 }
-// один проход по файлу на весь пакет правок/удалений
 async function rewriteBatch(chatId, wanted, transform) {
   const file = chatFile(chatId);
   if (!fs.existsSync(file)) return [];
@@ -258,8 +273,7 @@ function changeText(ev, forFile) {
   const link = linkOf(ev.chat, ev.id);
   const L = [];
   L.push(forFile ? "=".repeat(72) : (ev.type === "edit" ? "✏️ ИЗМЕНЕНО" : "🗑 УДАЛЕНО"));
-  if (forFile) L.push(`[${ev.type === "edit" ? "ИЗМЕНЕНИЕ" : "УДАЛЕНИЕ"}] Зафиксировано: ${fmtTime(ev.changeTs)}`);
-  else L.push(`Зафиксировано: ${fmtTime(ev.changeTs)}`);
+  L.push(`Зафиксировано: ${fmtTime(ev.changeTs)}`);
   L.push(`Чат: ${ev.chatTitle} (id ${ev.chat.id}, ${ev.chat.type || "private"})`);
   L.push(`Автор: ${ev.author || "—"}`);
   L.push(`Сообщение #${ev.id} от ${fmtTime(ev.ts)}`);
@@ -334,7 +348,7 @@ function serviceText(m) {
   if (m.channel_chat_created) return "[служебное] создан канал";
   if (m.migrate_to_chat_id) return `[служебное] чат переехал в ${m.migrate_to_chat_id}`;
   if (m.migrate_from_chat_id) return `[служебное] чат переехал из ${m.migrate_from_chat_id}`;
-  if (m.message_auto_delete_timer_changed) return `[служебное] автoудаление: ${m.message_auto_delete_timer_changed.message_auto_delete_time}с`;
+  if (m.message_auto_delete_timer_changed) return `[служебное] автоудаление: ${m.message_auto_delete_timer_changed.message_auto_delete_time}с`;
   if (m.video_chat_started) return "[служебное] начат видеочат";
   if (m.video_chat_ended) return "[служебное] видеочат завершён";
   if (m.video_chat_scheduled) return "[служебное] видеочат запланирован";
@@ -384,12 +398,12 @@ async function onConnection(bc) {
   if (bc.user_chat_id) { state.notifyChatId = bc.user_chat_id; addExclude(bc.user_chat_id); }
   saveState();
   if (bc.is_enabled) {
-    console.log(`\n✅ Бизнес-подключение: @${bc.user?.username || bc.user?.id}`);
+    console.log(`\n✅ Подключение (Автоматизация чатов): @${bc.user?.username || bc.user?.id}`);
     console.log(`Уведомления → личка (chat ${bc.user_chat_id}). Архив: ${ROOT}\n`);
     notify(`✅ Слежение включено.\nАрхив: ${ROOT}\nСюда будут приходить правки и удаления (было/стало + время).`);
   } else {
-    console.log("\n⚠️ Подключение отключено в настройках Business.\n");
-    notify("⚠️ Бизнес-подключение отключено — слежение на паузе.");
+    console.log("\n⚠️ Подключение отключено в «Автоматизации чатов».\n");
+    notify("⚠️ Подключение отключено — слежение на паузе.");
   }
 }
 async function onMessage(msg, business) {
@@ -401,7 +415,7 @@ async function onMessage(msg, business) {
       if (msg.from?.id) state.ownerIds = uniq([...state.ownerIds, msg.from.id]);
       addExclude(chat.id);
       await api("sendMessage", { chat_id: chat.id,
-        text: `Архиватор на связи.\nПапка: ${ROOT}\nПодключи меня: Настройки → Telegram Business → Чат-боты → @${state.bot?.username}` }).catch(() => {});
+        text: `Архиватор на связи.\nПапка: ${ROOT}\nПодключи меня: Настройки → Информация → Автоматизация чатов → @${state.bot?.username}` }).catch(() => {});
     }
     return;
   }
@@ -423,7 +437,7 @@ async function onEdit(msg, business) {
   }));
   if (!found.length) { await appendEntry(chat.id, e); return; }
   const i = found[0].info;
-  if (oneLine(i.before) === oneLine(e.text)) return;   // правка без изменения текста (например, превью)
+  if (oneLine(i.before) === oneLine(e.text)) return;
   await report({ type: "edit", chat, chatTitle: state.chats[String(chat.id)].title, id: e.id,
     ts: i.ts, author: i.author, before: i.before, after: e.text, changeTs: editTs, own: isOwnId(msg.from?.id) });
 }
@@ -442,9 +456,7 @@ async function onDeleted(payload) {
              info: { id: p.id, ts: p.ts, author: p.author, before: p.text } };
   });
   const marked = new Set(found.filter(f => f.info).map(f => f.info.id));
-  const events = found.filter(f => f.info).map(f => ({
-    type: "delete", chat, chatTitle: title, changeTs: when, ...f.info
-  }));
+  const events = found.filter(f => f.info).map(f => ({ type: "delete", chat, chatTitle: title, changeTs: when, ...f.info }));
   for (const id of ids) {
     if (marked.has(id) || found.some(f => f.p.id === id)) continue;
     events.push({ type: "delete", chat, chatTitle: title, id, ts: 0, author: "—",
@@ -456,7 +468,6 @@ async function onDeleted(payload) {
     console.log(`🗑 ${title}: пакет из ${events.length} удалений`);
   } else for (const ev of events) await report(ev);
 }
-
 async function handleUpdate(u) {
   if (u.business_connection) return onConnection(u.business_connection);
   if (u.business_message) return onMessage(u.business_message, true);
@@ -478,7 +489,7 @@ async function poll() {
     try {
       updates = await api("getUpdates", { offset: state.offset, timeout: CFG.POLL_TIMEOUT, allowed_updates: allowed });
     } catch (e) {
-      if (e.code === 409) { console.log("! 409 Conflict: уже запущена другая копия бота или стоит webhook. Останови её."); await sleep(15000); continue; }
+      if (e.code === 409) { console.log("! 409 Conflict: запущена другая копия бота или стоит webhook. Останови её."); await sleep(15000); continue; }
       log("getUpdates:", e.message); await sleep(3000); continue;
     }
     for (const u of updates) {
@@ -507,16 +518,35 @@ state.json  — служебное, не удалять
 Удалённый текст сохраняется. Переносы строк заменены на ⏎.
 `, "utf8");
 
-  if (!/^\d+:[\w-]{30,}$/.test(CFG.BOT_TOKEN)) { console.log("Впиши BOT_TOKEN в начало bot.js (токен от @BotFather)"); process.exit(1); }
+  console.log("Файл скрипта:", __filename);
+  console.log("Токен:", CFG.BOT_TOKEN ? `${CFG.BOT_TOKEN.slice(0, 6)}…${CFG.BOT_TOKEN.slice(-4)} (длина ${CFG.BOT_TOKEN.length})` : "(пусто)");
+
+  if (!/^\d{6,}:[A-Za-z0-9_-]{20,}$/.test(CFG.BOT_TOKEN)) {
+    console.log("\nТокен не распознан. Нужен вид: 123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    console.log("Проверь, что сохранил именно этот файл, и что он не называется bot.js.txt");
+    process.exit(1);
+  }
+
   await api("deleteWebhook", { drop_pending_updates: false });
-  const me = await api("getMe");
+  let me;
+  try { me = await api("getMe"); }
+  catch (e) {
+    console.log("\nTelegram не принял токен:", e.message);
+    console.log("Сверь токен в @BotFather → /mybots → твой бот → API Token.");
+    process.exit(1);
+  }
+
   state.bot = { id: me.id, username: me.username };
-  for (const c of Object.values(state.connections)) { if (c.userChatId) addExclude(c.userChatId); if (c.user) state.ownerIds = uniq([...state.ownerIds, c.user]); }
+  for (const c of Object.values(state.connections)) {
+    if (c.userChatId) addExclude(c.userChatId);
+    if (c.user) state.ownerIds = uniq([...state.ownerIds, c.user]);
+  }
+  if (state.notifyChatId == null && state.ownerIds.length) state.notifyChatId = Number(state.ownerIds[0]);
   saveState();
 
-  console.log(`Бот @${me.username} запущен.`);
+  console.log(`\nБот @${me.username} запущен.`);
   console.log(`Архив: ${ROOT}`);
-  console.log(`Подключение: Telegram → Настройки → Telegram Business → Чат-боты → @${me.username} (доступ ко всем чатам).`);
+  console.log(`Подключение: Настройки → Информация → Автоматизация чатов → @${me.username} (доступ ко всем чатам).`);
   console.log("Если уже подключён — просто работает. Ctrl+C — выход.\n");
   await writeList();
   poll();
