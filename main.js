@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /* ============================================================
    TG ARCHIVER — один файл, без зависимостей (Node 16+)
-   Архив всех чатов через "Автоматизация чатов" + лог правок/удалений
-   Уведомления — в личку от имени бота. SOCKS5/HTTP прокси.
-   Запуск: node main.js
+   Архив чатов через "Автоматизация чатов" + правки/удаления
+   + импорт старой истории из экспорта Telegram Desktop
+   Запуск:      node main.js
+   Импорт:      node main.js --import "C:\path\result.json"
    ============================================================ */
 "use strict";
 
@@ -11,18 +12,19 @@
 const CFG = {
   BOT_TOKEN: "8196128553:AAFUxzJghI0dbixX2LFxGKK_pdJldATeZIg",
   PROXY: "socks5://BPqEoK:QHM9DK@45.153.20.220:10379",
-  PROXY_ALT_HOST: "",           // IPv6 отключён: у тебя нет IPv6 (ENETUNREACH)
+  PROXY_ALT_HOST: "",
 
   ARCHIVE_DIR: "",              // пусто = Рабочий стол\TelegramArchive
-  NOTIFY: true,                 // писать в личку о правках/удалениях
-  NOTIFY_OWN: false,            // сообщать и о ТВОИХ правках/удалениях
-  GREET_ON_START: true,         // отвечать на /start
-  LOG_REGULAR_CHATS: true,      // логировать и группы, где бот состоит обычным способом
-  EXCLUDE_CHAT_IDS: [],         // доп. исключения: ["123456789"]
+  NOTIFY: true,
+  NOTIFY_OWN: false,
+  GREET_ON_START: true,
+  LOG_REGULAR_CHATS: true,
+  EXCLUDE_CHAT_IDS: [],
 
-  DOWNLOAD_FILES: true,         // качать документы/голосовые/аудио/стикеры
-  MAX_DOWNLOAD_MB: 20,          // лимит Bot API на скачивание
-  SKIP_MEDIA: ["photo", "video", "animation", "video_note"], // только заглушка + ссылка
+  DOWNLOAD_FILES: true,
+  MAX_DOWNLOAD_MB: 20,
+  SKIP_MEDIA: ["photo", "video", "animation", "video_note"],
+  IMPORT_COPY_FILES: true,      // при импорте копировать документы из папки экспорта
 
   POLL_TIMEOUT: 25,
   NOTIFY_PAUSE_MS: 1200,
@@ -35,8 +37,9 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const readline = require("readline");
+const ARGS = process.argv.slice(2);
 
-/* ---------- токен: token.txt -> CFG -> окружение ---------- */
+/* ---------- токен ---------- */
 (function loadToken() {
   const clean = s => String(s || "")
     .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, "").trim()
@@ -114,7 +117,7 @@ const isExcluded = id => {
 const isOwnId = id => id != null && state.ownerIds.includes(String(id));
 const isOwnAuthor = a => state.ownerIds.some(id => String(a || "").includes(`id:${id})`));
 
-/* ---------- формат строки: [дата время] {#id} [метки]\tАвтор\tтекст ---------- */
+/* ---------- формат: [дата время] {#id} [метки]\tАвтор\tтекст ---------- */
 function buildLine(e) {
   let h = `[${fmtTime(e.ts)}] {#${e.id}}`;
   for (const t of e.flags || []) h += ` [${oneLine(t)}]`;
@@ -310,7 +313,6 @@ async function socksConnect(proxyUrl, host, port, timeout) {
   }
   throw last || new Error("SOCKS5: не удалось подключиться");
 }
-
 function httpRequest(urlStr, opts) {
   const { method = "GET", headers = {}, body = null, timeout = 60000 } = opts || {};
   return new Promise((resolve, reject) => {
@@ -319,15 +321,12 @@ function httpRequest(urlStr, opts) {
     let settled = false;
     const fail = e => { if (settled) return; settled = true; reject(e); };
     const done = v => { if (settled) return; settled = true; resolve(v); };
-
     const start = tlsSocket => {
       const h = Object.assign({}, headers);
       if (body != null) h["Content-Length"] = Buffer.byteLength(body);
       const req = https.request({
         hostname: u.hostname, port, path: u.pathname + u.search, method, headers: h,
-        agent: null,                          // null, НЕ false — иначе Node идёт мимо прокси
-        createConnection: () => tlsSocket,
-        timeout
+        agent: null, createConnection: () => tlsSocket, timeout
       }, res => {
         const chunks = [];
         res.on("data", c => chunks.push(c));
@@ -339,14 +338,12 @@ function httpRequest(urlStr, opts) {
       if (body != null) req.write(body);
       req.end();
     };
-
     const wrapTls = raw => {
       const t = tls.connect({ socket: raw, servername: u.hostname });
       t.setTimeout(timeout, () => t.destroy(new Error("TLS timeout " + timeout + "ms")));
       t.on("error", fail);
       t.once("secureConnect", () => start(t));
     };
-
     if (!PROXY) {
       const raw = net.connect({ host: u.hostname, port, family: 4 });
       raw.setTimeout(timeout, () => raw.destroy(new Error("connect timeout")));
@@ -354,13 +351,11 @@ function httpRequest(urlStr, opts) {
       wrapTls(raw);
       return;
     }
-
     const pu = new URL(PROXY.includes("://") ? PROXY : "http://" + PROXY);
     if (/^socks/i.test(pu.protocol)) {
       socksConnect(PROXY, u.hostname, port, 20000).then(wrapTls).catch(fail);
       return;
     }
-
     const ph = {};
     if (pu.username) ph["Proxy-Authorization"] = "Basic " + Buffer.from(decodeURIComponent(pu.username) + ":" + decodeURIComponent(pu.password)).toString("base64");
     const preq = http.request({ hostname: pu.hostname, port: Number(pu.port || 8080), method: "CONNECT",
@@ -374,7 +369,6 @@ function httpRequest(urlStr, opts) {
     preq.end();
   });
 }
-
 async function api(method, params = {}, attempt = 0) {
   let j;
   try {
@@ -456,7 +450,7 @@ async function report(ev) {
   } catch (e) { log("report:", e.message); }
 }
 
-/* ---------- разбор сообщения ---------- */
+/* ---------- разбор сообщения Bot API ---------- */
 function linkOf(chat, msgId) {
   const id = String(chat.id);
   if (chat.username) return `https://t.me/${chat.username}/${msgId}`;
@@ -553,33 +547,255 @@ async function buildEntry(msg, chat, download) {
            editTs: msg.edit_date || 0, delTs: 0 };
 }
 
+/* ---------- импорт истории из экспорта Telegram Desktop (JSON) ---------- */
+function flatText(t) {
+  if (t == null) return "";
+  if (typeof t === "string") return t;
+  if (Array.isArray(t)) return t.map(x => typeof x === "string" ? x : ((x && x.text) || "")).join("");
+  return String(t);
+}
+function expChatId(c) {
+  const raw = String(c.id), t = String(c.type || "");
+  if (raw.startsWith("-")) return raw;
+  if (/supergroup|channel/.test(t)) return "-100" + raw;
+  if (/group/.test(t)) return "-" + raw;
+  return raw;
+}
+function expType(t) {
+  t = String(t || "");
+  if (/channel/.test(t)) return "channel";
+  if (/supergroup/.test(t)) return "supergroup";
+  if (/group/.test(t)) return "group";
+  return "private";
+}
+function expDate(m) {
+  if (m.date_unixtime) return Number(m.date_unixtime);
+  const s = String(m.date || "");
+  const mm = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(s);
+  return mm ? Math.floor(new Date(+mm[1], +mm[2] - 1, +mm[3], +mm[4], +mm[5], +mm[6]).getTime() / 1000) : nowSec();
+}
+function expMedia(m) {
+  const mt = String(m.media_type || ""), size = Number(m.file_size || 0), name = m.file_name || null;
+  const bad = v => !v || /File not included/i.test(String(v));
+  const file = !bad(m.file) ? String(m.file) : (!bad(m.photo) ? String(m.photo) : null);
+  if (m.photo || mt === "photo") return { kind: "photo", label: "Фото", size, file, name };
+  if (mt === "video_file") return { kind: "video", label: `Видео ${dur(m.duration_seconds)}`, size, file, name };
+  if (mt === "animation") return { kind: "animation", label: "GIF", size, file, name };
+  if (mt === "video_message") return { kind: "video_note", label: `Видеосообщение ${dur(m.duration_seconds)}`, size, file, name };
+  if (mt === "voice_message") return { kind: "voice", label: `Голосовое ${dur(m.duration_seconds)}`, size, file, name: name || `voice_${m.id}.ogg` };
+  if (mt === "audio_file") return { kind: "audio", label: `Аудио ${[m.performer, m.title].filter(Boolean).join(" - ")} ${dur(m.duration_seconds)}`.trim(), size, file, name };
+  if (mt === "sticker") return { kind: "sticker", label: `Стикер ${m.sticker_emoji || ""}`.trim(), size, file, name };
+  if (m.location_information) return { kind: "location", label: `Геолокация ${m.location_information.latitude},${m.location_information.longitude}`, size: 0, file: null };
+  if (m.contact_information) return { kind: "contact", label: `Контакт ${m.contact_information.first_name || ""} ${m.contact_information.phone_number || ""}`.trim(), size: 0, file: null };
+  if (m.poll) return { kind: "poll", label: `Опрос: ${flatText(m.poll.question)}`, size: 0, file: null };
+  if (file || name) return { kind: "document", label: `Документ ${name || ""}`.trim(), size, file, name };
+  return null;
+}
+const EXP_ACTIONS = {
+  create_group: () => "создал группу",
+  create_channel: () => "создал канал",
+  invite_members: a => "добавил участников: " + (a.members || []).join(", "),
+  remove_members: a => "удалил участника: " + (a.members || []).join(", "),
+  join_group_by_link: () => "вошёл по ссылке",
+  edit_group_title: a => `переименовал чат → «${a.title}»`,
+  edit_group_photo: () => "сменил фото чата",
+  delete_group_photo: () => "удалил фото чата",
+  pin_message: a => `закрепил сообщение #${a.message_id}`,
+  migrate_to_supergroup: a => `группа преобразована в супергруппу (id ${a.channel_id || ""})`,
+  migrate_from_group: a => `супергруппа создана из группы «${a.title}»`,
+  clear_history: () => "очистил историю",
+  phone_call: () => "звонок",
+  payment_sent: a => `платёж ${a.amount} ${a.currency}`,
+  score_in_game: a => `набрал ${a.score} очков`
+};
+function expService(m) {
+  const f = EXP_ACTIONS[m.action];
+  let d = "";
+  try { d = f ? f(m) : String(m.action || ""); } catch (e) { d = String(m.action || ""); }
+  return "[служебное] " + d;
+}
+function expAuthor(m) {
+  const name = cleanName(m.from || m.actor || "неизвестно");
+  const raw = String(m.from_id || m.actor_id || "");
+  const num = raw.replace(/^[a-z]+/i, "");
+  if (!num) return name;
+  return raw.startsWith("channel") ? `${name} (chat:${num})` : `${name} (id:${num})`;
+}
+async function expEntry(m, chatId, username, baseDir) {
+  const flags = [];
+  if (m.forwarded_from) flags.push("переслано от " + cleanName(m.forwarded_from));
+  if (m.saved_from) flags.push("сохранено из " + cleanName(m.saved_from));
+  if (m.reply_to_message_id) flags.push(`ответ #${m.reply_to_message_id}`);
+  if (m.via_bot) flags.push("через бота");
+  flags.push("импорт");
+
+  let text = m.type === "service" ? expService(m) : flatText(m.text);
+  const mi = expMedia(m);
+  if (mi) {
+    let part = `[${mi.label}${mi.size ? ", " + humanSize(mi.size) : ""}]`;
+    const skip = CFG.SKIP_MEDIA.includes(mi.kind);
+    const big = mi.size > CFG.MAX_DOWNLOAD_MB * 1024 * 1024;
+    let copied = false;
+    if (mi.file && CFG.IMPORT_COPY_FILES && !skip && !big && baseDir) {
+      try {
+        const src = path.resolve(baseDir, mi.file);
+        if (fs.existsSync(src)) {
+          const fname = `${m.id}_${fileSafe(mi.name || mi.kind)}`;
+          const dst = path.join(D_FILES, String(chatId), fname);
+          await fsp.mkdir(path.dirname(dst), { recursive: true });
+          await fsp.copyFile(src, dst);
+          part += ` -> files/${chatId}/${fname}`;
+          copied = true;
+        }
+      } catch (e) { }
+    }
+    if (!copied) part += big ? " (больше лимита, только ссылка)" : " (файл не переносился)";
+    const link = linkOf({ id: chatId, username }, m.id);
+    if (link) part += ` ${link}`;
+    text = text ? `${part} — ${text}` : part;
+  }
+  if (!text) text = "[пустое/неподдерживаемое сообщение]";
+  const editTs = m.edited_unixtime ? Number(m.edited_unixtime) : (m.edited ? expDate({ date: m.edited }) : 0);
+  return { id: Number(m.id), ts: expDate(m), author: expAuthor(m), flags, text, editTs, delTs: 0 };
+}
+async function importChat(c, baseDir) {
+  const type = String(c.type || "");
+  if (type === "saved_messages") return null;
+  const id = expChatId(c);
+  if (isExcluded(id)) return null;
+  const meta = { id, type: expType(type), title: cleanName(c.name || ("id" + id)), username: c.username || null };
+  ensureChat(meta);
+  const file = chatFile(id), map = new Map();
+  if (fs.existsSync(file)) {
+    for await (const l of rl(file)) { const p = parseLine(l); if (p) map.set(p.id, { id: p.id, ts: p.ts, line: l }); }
+  }
+  let added = 0, dup = 0;
+  for (const m of (c.messages || [])) {
+    if (!m || (m.type !== "message" && m.type !== "service")) continue;
+    const mid = Number(m.id);
+    if (!mid) continue;
+    if (map.has(mid)) { dup++; continue; }
+    const e = await expEntry(m, id, meta.username, baseDir);
+    map.set(mid, { id: mid, ts: e.ts, line: buildLine(e) });
+    added++;
+  }
+  const arr = [...map.values()].sort((a, b) => (a.ts - b.ts) || (a.id - b.id));
+  const tmp = file + ".tmp";
+  await fsp.writeFile(tmp, arr.map(x => x.line).join("\n") + (arr.length ? "\n" : ""), "utf8");
+  await rename(tmp, file);
+  idCache.delete(String(id));
+  const st = state.chats[String(id)];
+  st.count = arr.length;
+  st.lastTs = arr.length ? arr[arr.length - 1].ts : st.lastTs;
+  saveState();
+  return { id, title: meta.title, added, dup, total: arr.length };
+}
+async function importExport(target) {
+  const stt = await fsp.stat(target);
+  const files = [];
+  if (stt.isDirectory()) {
+    const walk = async (dir, depth) => {
+      for (const ent of await fsp.readdir(dir, { withFileTypes: true })) {
+        const p = path.join(dir, ent.name);
+        if (ent.isFile() && /\.json$/i.test(ent.name)) files.push(p);
+        else if (ent.isDirectory() && depth < 2) await walk(p, depth + 1);
+      }
+    };
+    await walk(target, 0);
+  } else files.push(target);
+
+  let totalAdded = 0, chats = 0;
+  for (const f of files) {
+    const size = (await fsp.stat(f)).size;
+    if (size > 300 * 1024 * 1024)
+      console.log(`! ${path.basename(f)} — ${Math.round(size / 1048576)} МБ. Если упадёт по памяти: node --max-old-space-size=4096 main.js --import "..."`);
+    let data;
+    try { data = JSON.parse(await fsp.readFile(f, "utf8")); }
+    catch (e) { console.log("пропуск", path.basename(f), "—", e.message); continue; }
+    const list = data && data.chats && data.chats.list;
+    if (!Array.isArray(list)) { console.log("пропуск (нет chats.list):", path.basename(f)); continue; }
+    console.log(`\nФайл ${path.basename(f)}: чатов ${list.length}`);
+    for (const c of list) {
+      try {
+        const r = await importChat(c, path.dirname(f));
+        if (r) { chats++; totalAdded += r.added; console.log(`  ${r.title}: +${r.added}, пропущено дублей ${r.dup}, всего ${r.total}`); }
+      } catch (e) { console.log("  ошибка чата:", e.message); }
+    }
+  }
+  await writeList(); await flushState();
+  console.log(`\nИмпорт завершён: чатов ${chats}, добавлено сообщений ${totalAdded}`);
+  console.log(`Архив: ${ROOT}`);
+}
+
 /* ---------- обработчики ---------- */
-async function onConnection(bc) {
+const connTry = new Map();
+async function ensureConnection(id, force) {
+  if (!id) return null;
+  const known = state.connections[id];
+  if (!force && known && known.userChatId && known.isEnabled) return known;
+  const last = connTry.get(id) || 0;
+  if (!force && Date.now() - last < 60000) return known || null;
+  connTry.set(id, Date.now());
+  try {
+    const bc = await api("getBusinessConnection", { business_connection_id: id });
+    if (bc && bc.id) { await onConnection(bc, true); return state.connections[bc.id]; }
+  } catch (e) { log("getBusinessConnection:", e.message); }
+  return known || null;
+}
+function statusText() {
+  const cs = Object.values(state.chats);
+  const msgs = cs.reduce((s, c) => s + c.count, 0);
+  const list = Object.entries(state.connections);
+  const L = [];
+  if (!list.length) {
+    L.push("Статус: НЕ ПОДКЛЮЧЁН — событие подключения не приходило.");
+    L.push("");
+    L.push("Что сделать:");
+    L.push("1) Telegram -> Настройки -> Информация -> Автоматизация чатов");
+    L.push(`2) Если @${state.bot && state.bot.username} уже в списке — отключи и подключи заново, доступ ко всем чатам.`);
+    L.push("3) Либо просто напиши что-нибудь в любой чат — бот подхватит подключение сам.");
+  } else {
+    for (const [id, c] of list) {
+      L.push(`Статус: ${c.isEnabled ? "ПОДКЛЮЧЁН" : "ПОДКЛЮЧЕНИЕ ОТКЛЮЧЕНО"} (@${c.username || c.user})`);
+      L.push(`connection: ${id}`);
+      L.push(`личка для уведомлений: ${c.userChatId}`);
+    }
+  }
+  L.push("");
+  L.push(`Архив: ${ROOT}`);
+  L.push(`Чатов: ${cs.length}, сообщений: ${msgs}`);
+  L.push(`Уведомления: ${CFG.NOTIFY ? "вкл" : "выкл"}, получатель: ${state.notifyChatId || "не задан"}`);
+  L.push("");
+  L.push('Старая история: node main.js --import "путь\\result.json" (экспорт из Telegram Desktop, формат JSON)');
+  return L.join("\n");
+}
+async function sendStatus(chatId) {
+  for (const id of Object.keys(state.connections)) await ensureConnection(id, true);
+  await api("sendMessage", { chat_id: chatId, text: statusText(), disable_web_page_preview: true })
+    .catch(e => log("status:", e.message));
+}
+async function onConnection(bc, quiet) {
   state.connections[bc.id] = { user: bc.user && bc.user.id, username: bc.user && bc.user.username,
     userChatId: bc.user_chat_id, isEnabled: bc.is_enabled, canReply: bc.can_reply, date: bc.date };
   if (bc.user && bc.user.id) state.ownerIds = uniq([...state.ownerIds, bc.user.id]);
   if (bc.user_chat_id) { state.notifyChatId = bc.user_chat_id; addExclude(bc.user_chat_id); }
   saveState();
   if (bc.is_enabled) {
-    console.log(`\n[OK] Подключение (Автоматизация чатов): @${(bc.user && (bc.user.username || bc.user.id)) || "?"}`);
-    console.log(`Уведомления -> личка (chat ${bc.user_chat_id}). Архив: ${ROOT}\n`);
-    notify(`Слежение включено.\nАрхив: ${ROOT}\nСюда будут приходить правки и удаления (было/стало + время).`);
+    console.log(`[OK] Подключение: @${(bc.user && (bc.user.username || bc.user.id)) || "?"} -> личка ${bc.user_chat_id}`);
+    if (!quiet) notify(`Слежение включено.\nАрхив: ${ROOT}\nСюда будут приходить правки и удаления (было/стало + время).`);
   } else {
-    console.log("\n[!] Подключение отключено в Автоматизации чатов.\n");
-    notify("Подключение отключено — слежение на паузе.");
+    console.log("[!] Подключение отключено в Автоматизации чатов.");
+    if (!quiet) notify("Подключение отключено — слежение на паузе.");
   }
 }
 async function onMessage(msg, business) {
   if (!msg || !msg.chat) return;
   const chat = msg.chat;
-  if (chat.type === "private" && /^\/start\b/.test(msg.text || "")) {
+  if (chat.type === "private" && /^\/(start|status)\b/.test(msg.text || "")) {
     state.notifyChatId = chat.id;
     if (msg.from && msg.from.id) state.ownerIds = uniq([...state.ownerIds, msg.from.id]);
     addExclude(chat.id);
-    if (CFG.GREET_ON_START) {
-      await api("sendMessage", { chat_id: chat.id,
-        text: `Архиватор на связи.\nПапка: ${ROOT}\nПодключи меня: Настройки -> Информация -> Автоматизация чатов -> @${state.bot && state.bot.username}` }).catch(() => {});
-    }
+    if (CFG.GREET_ON_START) await sendStatus(chat.id);
     return;
   }
   if (isExcluded(chat.id)) return;
@@ -635,13 +851,14 @@ async function onDeleted(payload) {
 }
 async function handleUpdate(u) {
   if (u.business_connection) return onConnection(u.business_connection);
-  if (u.business_message) return onMessage(u.business_message, true);
-  if (u.edited_business_message) return onEdit(u.edited_business_message, true);
-  if (u.deleted_business_messages) return onDeleted(u.deleted_business_messages);
+  if (u.business_message) { await ensureConnection(u.business_message.business_connection_id); return onMessage(u.business_message, true); }
+  if (u.edited_business_message) { await ensureConnection(u.edited_business_message.business_connection_id); return onEdit(u.edited_business_message, true); }
+  if (u.deleted_business_messages) { await ensureConnection(u.deleted_business_messages.business_connection_id); return onDeleted(u.deleted_business_messages); }
   if (u.message) return onMessage(u.message, false);
   if (u.edited_message) return onEdit(u.edited_message, false);
   if (u.channel_post) return onMessage(u.channel_post, false);
   if (u.edited_channel_post) return onEdit(u.edited_channel_post, false);
+  log("неизвестный апдейт:", Object.keys(u).filter(k => k !== "update_id").join(","));
 }
 
 /* ---------- цикл ---------- */
@@ -674,19 +891,33 @@ async function poll() {
 `chats.txt   — список всех чатов
 changes.txt — журнал правок и удалений (было/стало + время)
 chats\\<id>_<имя>.txt — история чата: одна строка = одно сообщение
-files\\<id>\\ — скачанные документы/голосовые/аудио/стикеры
+files\\<id>\\ — документы/голосовые/аудио/стикеры
 state.json  — служебное, не удалять
 
 Формат строки (разделитель — табуляция):
 [дата время] {#id} [метки]  Автор  текст
-Метки: ИЗМЕНЕНО / УДАЛЕНО / переслано / ответ #id
+Метки: ИЗМЕНЕНО / УДАЛЕНО / переслано / ответ #id / импорт
 Удалённый текст сохраняется. Переносы строк заменены на " / ".
+
+Старая история до запуска бота берётся из экспорта Telegram Desktop:
+  node main.js --import "C:\\...\\result.json"
 `, "utf8");
 
   console.log("Файл скрипта:", __filename);
+  console.log("Архив:", ROOT);
+
+  const ii = ARGS.indexOf("--import");
+  if (ii >= 0) {
+    const target = ARGS[ii + 1];
+    if (!target) { console.log('Укажи путь: node main.js --import "C:\\...\\result.json"'); process.exit(1); }
+    if (!fs.existsSync(target)) { console.log("Путь не найден:", target); process.exit(1); }
+    console.log("Режим ИМПОРТА (бот не запускается):", target);
+    await importExport(target);
+    process.exit(0);
+  }
+
   console.log("Токен:", CFG.BOT_TOKEN ? `${CFG.BOT_TOKEN.slice(0, 6)}...${CFG.BOT_TOKEN.slice(-4)} (длина ${CFG.BOT_TOKEN.length})` : "(пусто)");
   console.log("Прокси:", PROXY ? PROXY.replace(/\/\/[^@]*@/, "//***:***@") : "нет (напрямую)");
-
   if (!/^\d{6,}:[A-Za-z0-9_-]{20,}$/.test(CFG.BOT_TOKEN)) {
     console.log("\nТокен не распознан. Нужен вид: 123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
     process.exit(1);
@@ -710,9 +941,8 @@ state.json  — служебное, не удалять
   saveState();
 
   console.log(`\nБот @${me.username} запущен.`);
-  console.log(`Архив: ${ROOT}`);
   console.log(`Подключение: Настройки -> Информация -> Автоматизация чатов -> @${me.username}`);
-  console.log("Если уже подключён — отключи и подключи заново, чтобы пришло событие. Ctrl+C — выход.\n");
+  console.log("Команды в личке: /status — реальный статус. Ctrl+C — выход.\n");
   await writeList();
   poll();
 })().catch(e => { console.error("Фатально:", errInfo(e)); process.exit(1); });
